@@ -1,0 +1,12 @@
+{
+  "name": "trading-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/server.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}

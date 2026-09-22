@@ -1,0 +1,108 @@
+// Focused security helpers shared by Express routes and LLM proxy code.
+// Importers/callers: server.js, llmClient.js.
+// User instruction: "improve keamanan dari hacker" — security headers,
+// safe upstream URL validation, error redaction, and bounded IP rate limits.
+import net from 'node:net';
+
+const PRIVATE_OR_METADATA_HOSTS = new Set([
+  'metadata.google.internal',
+  'metadata',
+  'instance-data.ec2.internal',
+]);
+
+export function securityHeaders(req, res, next) {
+  res.set('Content-Security-Policy', [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    'font-src https://fonts.gstatic.com',
+    'img-src \'self\' data: https:',
+    "connect-src 'self' https: wss: http://localhost:* http://127.0.0.1:*",
+    "frame-ancestors 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    "object-src 'none'",
+  ].join('; '));
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('X-Frame-Options', 'DENY');
+  res.set('Referrer-Policy', 'same-origin');
+  res.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  if (req.secure || req.headers['x-forwarded-proto'] === 'https') {
+    res.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+}
+
+/** Redact bearer tokens and common API-key prefixes before logs/errors. */
+export function redact(value) {
+  return String(value ?? '')
+    .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, 'Bearer [REDACTED]')
+    .replace(/\b(?:sk|key|token|secret)[-_]?[A-Za-z0-9_-]{8,}\b/gi, '[REDACTED]');
+}
+
+/** Keep upstream details useful without returning credentials/long internals. */
+export function sanitizeError(value) {
+  return redact(value)
+    .replace(/https?:\/\/[^\s)]+/gi, (url) => {
+      try { return new URL(url).origin; } catch { return '[upstream]'; }
+    })
+    .replace(/[\r\n]+/g, ' ')
+    .slice(0, 200);
+}
+
+function hostnameIsBlocked(hostname) {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (PRIVATE_OR_METADATA_HOSTS.has(host) || host.endsWith('.internal')) return true;
+  const ipVersion = net.isIP(host);
+  if (ipVersion === 4) {
+    const [a, b] = host.split('.').map(Number);
+    return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+  }
+  if (ipVersion === 6) {
+    return host === '::1' || host === '::' || host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd');
+  }
+  return false;
+}
+
+/**
+ * Validate a user-supplied OpenAI-compatible endpoint. Localhost is allowed
+ * for the configured local 9router/Ollama setup; cloud metadata/private IPs
+ * and embedded credentials are not.
+ */
+export function isSafeBaseUrl(value) {
+  if (!value || typeof value !== 'string') return false;
+  try {
+    const url = new URL(value);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return false;
+    if (hostnameIsBlocked(url.hostname)) return false;
+    return Boolean(url.hostname) && url.pathname.length < 512;
+  } catch {
+    return false;
+  }
+}
+
+/** Small in-memory limiter with periodic stale-entry pruning. */
+export function ipRateLimit({ max, windowMs }) {
+  const entries = new Map();
+  const prune = setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of entries) if (now > entry.resetAt) entries.delete(key);
+  }, Math.max(windowMs, 60_000));
+  prune.unref?.();
+  return (req, res, next) => {
+    const key = String(req.ip || req.socket?.remoteAddress || 'unknown');
+    const now = Date.now();
+    let entry = entries.get(key);
+    if (!entry || now > entry.resetAt) {
+      entry = { count: 0, resetAt: now + windowMs };
+      entries.set(key, entry);
+    }
+    entry.count++;
+    if (entry.count > max) {
+      res.set('Retry-After', String(Math.ceil((entry.resetAt - now) / 1000)));
+      return res.status(429).json({ error: 'Terlalu banyak permintaan. Coba lagi nanti.' });
+    }
+    next();
+  };
+}

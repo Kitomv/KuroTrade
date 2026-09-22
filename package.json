@@ -1,0 +1,20 @@
+{
+  "name": "trading-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DexScreener AI Trading Dashboard — workspace orchestrator",
+  "bin": {
+    "trading-start": "./start.js"
+  },
+  "scripts": {
+    "start-all": "npx concurrently -n backend,frontend -c yellow,cyan \"npm run start:backend\" \"npm run start:frontend\"",
+    "start:backend": "npm --prefix backend run start",
+    "start:frontend": "npm --prefix frontend run dev",
+    "install:all": "npm --prefix backend install && npm --prefix frontend install",
+    "build": "npm --prefix frontend run build"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.4"
+  }
+}

@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# User data (credentials + per-user trading state)
+backend/data/
+
+# Build output
+frontend/dist/
+
+# TS build info
+*.tsbuildinfo
+
+# Logs / env
+*.log
+.env
+.env.*

@@ -30,6 +30,10 @@ import { verifyUser, createSession, getUser, destroySession, seedAdminFromEnv,
   changePassword, destroyOtherSessions, listUsers as listAuthUsers, getUserById, adminSetPassword, deleteUser } from './auth.js';
 import { flushAll, cleanupTempFiles } from './persistence.js';
 import { securityHeaders, redact, sanitizeError, ipRateLimit, isSafeBaseUrl } from './security.js';
+import {
+  generateHotWallet, importHotWallet, getHotWalletPublicInfo, getMasterKey,
+  executeIntentWithHotWallet, isEmergencyPaused, setEmergencyPaused, resolveTokenDecimals,
+} from './hotWallet.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -440,6 +444,102 @@ app.post('/api/real/auto', async (req, res) => {
   const { setRealAuto } = await import('./realIntent.js');
   const { realAuto } = req.body ?? {};
   res.json(setRealAuto(req.userId, Boolean(realAuto)));
+});
+
+// --- Hot Wallet Management & Auto-Execute (new) ---
+// All protected by auth + IP rate limit already applied to /api/real/* above.
+
+// Check status only (public metadata: no secrets)
+app.get('/api/real/hot-wallet/status', async (req, res) => {
+  try {
+    const { getHotWalletPublicInfo } = await import('./hotWallet.js');
+    const info = getHotWalletPublicInfo(req.userId);
+    res.json(info);
+  } catch (e) {
+    res.status(500).json({ error: sanitizeError(e.message) });
+  }
+});
+
+// Generate new hot wallet for userId (private key encrypted at server, never exposed)
+app.post('/api/real/hot-wallet/generate', async (req, res) => {
+  try {
+    const { generateHotWallet } = await import('./hotWallet.js');
+    const masterKey = getMasterKey();
+    const result = generateHotWallet(req.userId, masterKey);
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    if (String(e.message).includes('MASTER_ENCRYPTION_KEY')) {
+      return res.status(500).json({ error: 'MASTER_ENCRYPTION_KEY belum diset di .env' });
+    }
+    res.status(500).json({ error: sanitizeError(e.message) });
+  }
+});
+
+// Import existing secret key (must be 64-byte Uint8Array Ed25519 format)
+app.post('/api/real/hot-wallet/import', async (req, res) => {
+  try {
+    const { importHotWallet } = await import('./hotWallet.js');
+    const { secretKey } = req.body ?? {};
+    if (!secretKey || !Array.isArray(secretKey)) {
+      return res.status(400).json({ error: 'secretKey harus array of numbers (64 byte Ed25519)' });
+    }
+    if (secretKey.length !== 64) {
+      return res.status(400).json({ error: 'secretKey harus 64 byte (Uint8Array Ed25519 keypair)' });
+    }
+    const masterKey = getMasterKey();
+    const result = importHotWallet(req.userId, Uint8Array.from(secretKey), masterKey);
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ error: sanitizeError(e.message) });
+  }
+});
+
+// Execute a pending intent directly on-chain using hot wallet (bypasses Phantom sign)
+app.post('/api/real/hot-wallet/execute-intent', async (req, res) => {
+  try {
+    const { executeIntentWithHotWallet } = await import('./hotWallet.js');
+    const { intentId } = req.body ?? {};
+    if (!intentId) return res.status(400).json({ error: 'intentId required' });
+    const { getRealIntent } = await import('./realIntent.js');
+    const intent = getRealIntent(req.userId, intentId);
+    if (!intent) return res.status(404).json({ error: 'Intent tidak ditemukan untuk user ini' });
+    if (intent.status !== 'open') {
+      return res.status(400).json({ error: `Intent must be 'open'; current=${intent.status}` });
+    }
+    const masterKey = getMasterKey();
+    const result = await executeIntentWithHotWallet(req.userId, intent, {
+      masterKey,
+      getTokenDecimalsFn: resolveTokenDecimals, // shared decimals resolver for SELL
+    });
+    // Mark as done since we've executed it
+    const { setRealIntentStatus } = await import('./realIntent.js');
+    setRealIntentStatus(req.userId, intentId, 'done');
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ error: sanitizeError(e.message) });
+  }
+});
+
+// Auto-execute toggle: when enabled, autopilot intents auto-execute via hot wallet
+app.get('/api/real/hot-wallet/auto', async (req, res) => {
+  res.json({ autoEnabled: Boolean(process.env.HOT_WALLET_AUTO_ENABLED) === true });
+});
+app.post('/api/real/hot-wallet/auto', async (req, res) => {
+  const { autoEnabled } = req.body ?? {};
+  process.env.HOT_WALLET_AUTO_ENABLED = String(Boolean(autoEnabled)).toLowerCase();
+  res.json({ ok: true, autoEnabled: process.env.HOT_WALLET_AUTO_ENABLED === 'true' });
+});
+
+// Emergency pause switch: globally disable all hot-wallet auto-execution
+app.get('/api/real/hot-wallet/emergency-pause', async (req, res) => {
+  const { isEmergencyPaused } = await import('./hotWallet.js');
+  res.json({ paused: isEmergencyPaused() });
+});
+app.post('/api/real/hot-wallet/emergency-pause', async (req, res) => {
+  const { paused } = req.body ?? {};
+  const { setEmergencyPaused } = await import('./hotWallet.js');
+  setEmergencyPaused(Boolean(paused));
+  res.json({ ok: true, paused: Boolean(paused) });
 });
 
 // --- Per-user rate limits for heavy AI endpoints ---

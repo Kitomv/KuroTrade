@@ -569,4 +569,47 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ realAuto }),
     }),
+
+  // --- Hot Wallet (server-side signing for 24/7 autopilot) ---
+  /** Public metadata only — never returns the private key. */
+  hotWalletStatus: () =>
+    req<{ exists: boolean; publicKey: string | null; createdAt?: number; updatedAt?: number }>(
+      '/api/real/hot-wallet/status',
+    ),
+  hotWalletGenerate: () =>
+    req<{ ok: boolean; publicKey: string; createdAt: number }>('/api/real/hot-wallet/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }),
+  hotWalletImport: (secretKey: number[]) =>
+    req<{ ok: boolean; publicKey: string; createdAt: number }>('/api/real/hot-wallet/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ secretKey }),
+    }),
+  /** Execute one open intent server-side (no Phantom popup). */
+  hotWalletExecuteIntent: (intentId: string) =>
+    req<{ ok: boolean; signature: string; userPublicKey: string; inAmount?: string; outAmount?: string }>(
+      '/api/real/hot-wallet/execute-intent',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ intentId }),
+      },
+    ),
+  hotWalletAuto: () => req<{ autoEnabled: boolean }>('/api/real/hot-wallet/auto'),
+  setHotWalletAuto: (autoEnabled: boolean) =>
+    req<{ ok: boolean; autoEnabled: boolean }>('/api/real/hot-wallet/auto', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ autoEnabled }),
+    }),
+  hotWalletEmergencyPause: () => req<{ paused: boolean }>('/api/real/hot-wallet/emergency-pause'),
+  setHotWalletEmergencyPause: (paused: boolean) =>
+    req<{ ok: boolean; paused: boolean }>('/api/real/hot-wallet/emergency-pause', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paused }),
+    }),
 };

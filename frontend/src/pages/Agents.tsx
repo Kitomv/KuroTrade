@@ -8,6 +8,7 @@ import { Modal } from '../components/Modal';
 import { useToast } from '../components/ToastProvider';
 import { useConfirm } from '../components/ConfirmDialog';
 import { StaleBadge } from '../components/StaleBadge';
+import { HotWalletPanel } from '../components/HotWalletPanel';
 
 const logTags = ['ALL', 'BUY', 'TP', 'SELL', 'SL', 'WARN', 'SCAN', 'ROTATE', 'CONFIG'] as const;
 type LogTag = (typeof logTags)[number];
@@ -1231,6 +1232,12 @@ export function Agents() {
           </div>
         </div>
       )}
+
+      {/* Hot Wallet: server-side signing so the autopilot can act without a
+          Phantom popup per order (24/7). */}
+      <div style={{ marginBottom: 24 }}>
+        <HotWalletPanel />
+      </div>
 
       {/* Top AI Signals Market Scanner */}
       <div className="card">

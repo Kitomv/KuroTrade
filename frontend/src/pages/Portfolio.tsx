@@ -10,6 +10,7 @@ import { StaleBadge } from '../components/StaleBadge';
 import { useRealWallet } from '../components/RealWalletContext';
 import { RealTradePanel, PendingIntents } from '../components/RealTradePanel';
 import { RealWalletBalance } from '../components/RealWalletBalance';
+import { HotWalletPanel } from '../components/HotWalletPanel';
 
 export interface PortfolioData {
   wallet: Wallet;
@@ -199,6 +200,8 @@ export function Portfolio() {
         <RealTradePanel />
         <RealWalletBalance />
         <PendingIntents />
+        {/* Server-side signing for 24/7 autopilot (no Phantom popup per order). */}
+        <HotWalletPanel />
       </>
     );
   }

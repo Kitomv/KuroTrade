@@ -21,6 +21,9 @@ function stateFor(userId) {
   const state = {
     realMode: Boolean(saved.realMode),
     realAuto: Boolean(saved.realAuto && saved.realMode),
+    // Hot-wallet auto: the server signs + broadcasts with the encrypted
+    // keystore, so no Phantom popup is needed. Only meaningful in real mode.
+    hotWalletAuto: Boolean(saved.hotWalletAuto && saved.realMode),
     boundWallet: typeof saved.boundWallet === 'string' ? saved.boundWallet : null,
     bindNonce: typeof saved.bindNonce === 'object' && typeof saved.bindNonce?.value === 'string' ? saved.bindNonce : null,
     intents: Array.isArray(saved.realIntents) ? saved.realIntents : [],
@@ -57,6 +60,7 @@ registerStateProvider((userId) => {
   return {
     realMode: Boolean(state.realMode),
     realAuto: Boolean(state.realAuto && state.realMode),
+    hotWalletAuto: Boolean(state.hotWalletAuto && state.realMode),
     boundWallet: state.boundWallet,
     bindNonce: state.bindNonce,
     realIntents: intents.slice(-100),
@@ -207,6 +211,19 @@ export function setRealIntentStatus(userId, intentId, status, claimToken = null)
   state.intents = intents;
   touch(userId);
   return intent;
+}
+
+/** Set hot-wallet auto: server signs + broadcasts intents without Phantom. */
+export function setHotWalletAuto(userId, enabled) {
+  const state = stateFor(userId);
+  state.hotWalletAuto = Boolean(enabled && state.realMode);
+  touch(userId);
+  return { ok: true, hotWalletAuto: state.hotWalletAuto };
+}
+
+/** Get hot-wallet auto status. */
+export function isHotWalletAuto(userId) {
+  return stateFor(userId).hotWalletAuto;
 }
 
 export { buildBindMessage };

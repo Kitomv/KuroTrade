@@ -19,7 +19,7 @@ export function Overview({ refreshWatchlist, onNavigateTab }: Props) {
   const toast = useToast();
 
   const overview = usePolling(() => api.overview(), 10_000, []);
-  const aiSignalsP = usePolling(() => api.agentSignals(3), 20_000, []);
+  const aiSignalsP = usePolling(() => api.agentSignals(3), 5_000, []);
   const data = overview.data;
   const aiSignals = aiSignalsP.data;
 
@@ -95,7 +95,7 @@ export function Overview({ refreshWatchlist, onNavigateTab }: Props) {
             </span>
             <StaleBadge stale={overview.stale || aiSignalsP.stale} />
           </div>
-          <p>Radar pasar terdesentralisasi multi-chain — update otomatis setiap 10 detik.</p>
+          <p>Radar pasar terdesentralisasi multi-chain — market data 10s, AI radar 5s (hanya saat Auto-Pilot aktif). Polling berhenti otomatis saat tab tersembunyi.</p>
         </div>
 
         {/* Chain selector pills */}

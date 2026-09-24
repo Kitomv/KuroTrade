@@ -59,7 +59,10 @@ app.use((req, res, next) => {
 // the SPA gate handles auth client-side; blocking assets would blank the app.
 const PUBLIC_PATHS = new Set(['/api/login', '/api/health']);
 app.use((req, res, next) => {
-  if (req.method === 'OPTIONS' || !req.path.startsWith('/api/') || PUBLIC_PATHS.has(req.path)) return next();
+  // Express path matching is case-insensitive, so /API/admin/users reaches the
+  // same route as /api/admin/users. Compare lowercased, or the guard is bypassed.
+  const p = req.path.toLowerCase();
+  if (req.method === 'OPTIONS' || !p.startsWith('/api/') || PUBLIC_PATHS.has(p)) return next();
   const auth = req.headers.authorization ?? '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
   const userId = getUser(token);
@@ -687,9 +690,10 @@ app.post('/api/agents/analyze', rateLimit('analyze', 6), wrap(async (req, res) =
   res.json(report);
 }));
 
-app.get('/api/agents/signals', rateLimit('signals', 10), wrap(async (req, res) => {
+app.get('/api/agents/signals', rateLimit('signals', 30), wrap(async (req, res) => {
   const limit = Math.min(20, Math.max(1, Number(req.query.limit) || 10));
-  const signals = await scanMarketSignals(req.userId, limit);
+  // Radar's LLM scans only run when autopilot is enabled. The explicit /analyze route is unaffected.
+  const signals = await scanMarketSignals(req.userId, limit, { allowStale: true, autopilotEnabled: getAutopilot(req.userId).enabled });
   res.json(signals);
 }));
 
@@ -796,7 +800,9 @@ setInterval(async () => {
         updatePositionPrices(userId, priceMap);
         const filled = checkLimitOrders(userId, priceMap);
         if (filled.length > 0) console.log(`[limit-matcher] ${userId}: ${filled.length} order(s) filled`);
-      } catch {}
+      } catch (e) {
+        console.warn(`[limit-matcher] ${userId}: ${sanitizeError(e?.message ?? e)}`);
+      }
     }
   } catch (e) {
     // silent — will retry next interval
@@ -815,7 +821,7 @@ setInterval(async () => {
         const res = await runAutopilotTick(userId);
         if (res?.executed) console.log(`[autopilot] ${userId}: ${res.log ?? 'Executed trade'}`);
       } catch (e) {
-        // silent
+        console.warn(`[autopilot] ${userId}: ${sanitizeError(e?.message ?? e)}`);
       }
     }
   } finally {

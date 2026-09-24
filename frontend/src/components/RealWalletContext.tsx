@@ -53,6 +53,7 @@ export function RealWalletProvider({ children }: { children: React.ReactNode }) 
   const runningRef = useRef(false);                 // one swap in flight
   const skippedRef = useRef<Set<string>>(new Set()); // Phantom-rejected ids, skip for auto
   const attemptsRef = useRef<Map<string, number>>(new Map()); // per-intent retry counter (session only)
+  const cooldownRef = useRef<Map<string, number>>(new Map()); // intentId -> next-allowed ts (ms)
   const pubKeyStr = publicKey?.toBase58() ?? null;
   const isBound = Boolean(pubKeyStr && boundWallet === pubKeyStr);
   const insecure = isInsecureOrigin();
@@ -162,6 +163,7 @@ export function RealWalletProvider({ children }: { children: React.ReactNode }) 
       await connection.confirmTransaction(sig, 'confirmed');
       await api.realIntentStatus(intent.id, 'done', claimToken);
       attemptsRef.current.delete(intent.id);
+      cooldownRef.current.delete(intent.id);
     } catch (e: any) {
       const msg = String(e?.message ?? e);
       if (msg.includes('User rejected') || msg.includes('user rejected')) {
@@ -180,6 +182,10 @@ export function RealWalletProvider({ children }: { children: React.ReactNode }) 
         const n = (attemptsRef.current.get(intent.id) ?? 0) + 1;
         attemptsRef.current.set(intent.id, n);
         if (n >= 3) skippedRef.current.add(intent.id);
+        // Back off between retries: the intent is reopened as 'open' below, and
+        // without this the auto-execute effect re-fires immediately (openIntents
+        // is a fresh array) → a sub-second claim/reopen burst hammering the API.
+        cooldownRef.current.set(intent.id, Date.now() + Math.min(30_000, 2_000 * 2 ** (n - 1)));
         if (claimed) { try { await api.realIntentStatus(intent.id, 'open', claimToken); } catch {} }
       }
       setApproveError(msg.slice(0, 200));
@@ -195,6 +201,7 @@ export function RealWalletProvider({ children }: { children: React.ReactNode }) 
       await api.realIntentStatus(intent.id, 'cancelled');
       skippedRef.current.delete(intent.id);
       attemptsRef.current.delete(intent.id);
+      cooldownRef.current.delete(intent.id);
       await refreshIntents();
     } catch {}
   }, [refreshIntents]);
@@ -203,9 +210,14 @@ export function RealWalletProvider({ children }: { children: React.ReactNode }) 
 
   // Auto-execute loop: only when real mode + auto + bound + secure origin. Runs
   // here (not in a page component) so it survives navigation and panel closes.
+  // Honors the per-intent backoff so a deterministically-failing intent can't
+  // spin the claim/reopen cycle at sub-second speed.
   useEffect(() => {
     if (!realMode || !realAuto || insecure || runningRef.current || !isBound) return;
-    const next = openIntents.filter((i) => !skippedRef.current.has(i.id)).sort((a, b) => a.createdAt - b.createdAt)[0];
+    const now = Date.now();
+    const next = openIntents
+      .filter((i) => !skippedRef.current.has(i.id) && (cooldownRef.current.get(i.id) ?? 0) <= now)
+      .sort((a, b) => a.createdAt - b.createdAt)[0];
     if (next) approveIntent(next);
   }, [realMode, realAuto, insecure, isBound, openIntents, approveIntent]);
 

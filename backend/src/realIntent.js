@@ -8,7 +8,7 @@
 import { randomBytes, randomUUID } from 'crypto';
 import { loadUserState, touch, registerStateProvider } from './persistence.js';
 import { buildBindMessage, verifyEd25519 } from './ed25519.js';
-import { reducePositionAmount, addMirroredPosition } from './wallet.js';
+import { reducePositionAmount, addMirroredPosition, updatePositionMetadata } from './wallet.js';
 
 const INTENT_TTL_MS = 30 * 60 * 1000;
 const CLAIM_TTL_MS = 10 * 60 * 1000;
@@ -183,6 +183,12 @@ export function setRealIntentStatus(userId, intentId, status, claimToken = null)
     // prevents repeated real exits and lets the guardian protect real buys.
     if (intent.side === 'sell') {
       reducePositionAmount(userId, intent.tokenAddress, intent.estTokens);
+      // A confirmed TP1 (50% partial) arms the moonbag TP2. Doing this here —
+      // not at emit time — means a user-cancelled TP1 never triggers a full
+      // moonbag sell of a position that was never partially exited.
+      if (intent.source === 'TP1') {
+        updatePositionMetadata(userId, intent.tokenAddress, { tp1Hit: true });
+      }
     } else if (intent.side === 'buy') {
       // Jupiter's quote output is not persisted on the intent. `estTokens` is
       // the conservative model estimate, used only for guardian bookkeeping;

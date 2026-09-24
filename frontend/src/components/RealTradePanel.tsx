@@ -2,7 +2,7 @@
 // signs it. Private keys never leave the wallet.
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useWallet, useConnection } from '@solana/wallet-adapter-react';
-import { VersionedTransaction } from '@solana/web3.js';
+import { VersionedTransaction, PublicKey } from '@solana/web3.js';
 import { api, Market, RealIntent } from '../api/client';
 import { IconAlert, IconArrowDown, IconArrowUp, IconCheck, IconZap } from './Icons';
 import { WalletButton } from './WalletButton';
@@ -12,6 +12,8 @@ import { SOL_MINT, LAMPORTS_PER_SOL, isInsecureOrigin, solscanTxUrl } from '../l
 
 // `buffer` polyfill (vite alias) — provide the type so tsc accepts it.
 declare const Buffer: { from(data: string, encoding: 'base64'): Uint8Array };
+
+const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 
 type QuoteResult = {
   inAmount: string;
@@ -39,9 +41,42 @@ export function RealTradePanel() {
   const [swapping, setSwapping] = useState(false);
   const [err, setErr] = useState('');
   const [success, setSuccess] = useState<{ sig: string } | null>(null);
+  // SELL quotes need mint decimals to convert human token units → atomic units.
+  // Without this the panel quoted `amt` as already-atomic, selling 10^decimals
+  // times less than the user typed (1e-9 of a 9-decimal token).
+  const [decimals, setDecimals] = useState<number | null>(null);
+  const [held, setHeld] = useState<number | null>(null);
 
   const runningRef = useRef(false); // single-flight: one Phantom popup at a time
   const insecure = isInsecureOrigin();
+
+  // Resolve mint decimals + on-chain balance so SELL can be validated and
+  // converted before quoting (mirrors RealTradeForm's resolution order).
+  useEffect(() => {
+    if (!token) { setDecimals(null); setHeld(null); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const info = await connection.getParsedAccountInfo(new PublicKey(token.tokenAddress));
+        const d = (info.value?.data as any)?.parsed?.info?.decimals;
+        if (!cancelled) setDecimals(Number.isFinite(Number(d)) ? Number(d) : null);
+      } catch {
+        if (!cancelled) setDecimals(null);
+      }
+      if (!publicKey) { if (!cancelled) setHeld(null); return; }
+      try {
+        const accounts = await connection.getParsedTokenAccountsByOwner(publicKey, { programId: TOKEN_PROGRAM_ID });
+        const match = accounts.value.find(
+          (a) => String((a.account.data as any)?.parsed?.info?.mint) === token.tokenAddress,
+        );
+        const ui = Number((match?.account.data as any)?.parsed?.info?.tokenAmount?.uiAmount) || 0;
+        if (!cancelled) setHeld(ui);
+      } catch {
+        if (!cancelled) setHeld(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [token, publicKey, connection]);
 
   const searchToken = async () => {
     if (!query.trim()) return;
@@ -66,15 +101,21 @@ export function RealTradePanel() {
     if (!token) { setErr('Pilih token dulu'); return; }
     const amt = parseFloat(amount);
     if (isNaN(amt) || amt <= 0) { setErr('Jumlah tidak valid'); return; }
+    if (side === 'sell') {
+      if (held !== null && amt > held) { setErr(`Saldo token tidak cukup (punya ${held}).`); return; }
+      if (decimals === null) { setErr('Desimal token belum terbaca — coba lagi sebentar.'); return; }
+    }
     setQuoting(true);
     setErr('');
     setQuote(null);
     try {
       const inputMint = side === 'buy' ? SOL_MINT : token.tokenAddress;
       const outputMint = side === 'buy' ? token.tokenAddress : SOL_MINT;
-      // BUY: amount in SOL → lamports. SELL: user enters raw token units (decimals
-      // vary per token; the UI labels it as "satuan terkecil").
-      const rawAmount = side === 'buy' ? Math.floor(amt * LAMPORTS_PER_SOL) : Math.floor(amt);
+      // BUY: SOL → lamports. SELL: human token units → atomic units (matches
+      // RealTradeForm; the server's intent path also speaks human units).
+      const rawAmount = side === 'buy'
+        ? Math.floor(amt * LAMPORTS_PER_SOL)
+        : Math.floor(amt * Math.pow(10, decimals ?? 0));
       const q = await api.realQuote({ inputMint, outputMint, amount: rawAmount, slippageBps: Math.round(slippagePct * 100) });
       setQuote(q);
     } catch (e: any) {
@@ -193,9 +234,9 @@ export function RealTradePanel() {
           <div className="grid-2-1" style={{ marginBottom: 12 }}>
             <div>
               <label style={{ display: 'block', fontSize: 12, color: 'var(--muted)', marginBottom: 6, fontWeight: 600 }}>
-                {side === 'buy' ? 'JUMLAH SOL' : 'JUMLAH TOKEN (satuan terkecil)'}
+                {side === 'buy' ? 'JUMLAH SOL' : 'JUMLAH TOKEN'}
               </label>
-              <input type="number" step="any" className="input" style={{ width: '100%' }} placeholder={side === 'buy' ? '0.05' : '1000000'} value={amount} onChange={(e) => { setAmount(e.target.value); setQuote(null); }} />
+              <input type="number" step="any" className="input" style={{ width: '100%' }} placeholder={side === 'buy' ? '0.05' : '1000'} value={amount} onChange={(e) => { setAmount(e.target.value); setQuote(null); }} />
             </div>
             <div>
               <label style={{ display: 'block', fontSize: 12, color: 'var(--muted)', marginBottom: 6, fontWeight: 600 }}>SLIPPAGE %</label>

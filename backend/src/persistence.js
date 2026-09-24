@@ -64,7 +64,9 @@ export function loadUserState(userId) {
 export function touch(userId) {
   const existing = pending.get(userId);
   if (existing) clearTimeout(existing);
-  pending.set(userId, setTimeout(() => flushUser(userId), SAVE_DEBOUNCE_MS));
+  const timer = setTimeout(() => flushUser(userId), SAVE_DEBOUNCE_MS);
+  timer.unref?.(); // don't hold the event loop open on a pending save
+  pending.set(userId, timer);
 }
 
 function flushUser(userId) {

@@ -342,8 +342,8 @@ export function Chart() {
               </tr>
             </thead>
             <tbody>
-              {points.slice(-15).reverse().map((p, i) => (
-                <tr key={i}>
+              {points.slice(-15).reverse().map((p) => (
+                <tr key={p.ts}>
                   <td>{new Date(p.ts).toLocaleTimeString()}</td>
                   <td className="num" style={{ fontFamily: 'var(--font-heading)' }}>
                     {fmt.usd(p.priceUsd)}

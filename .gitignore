@@ -4,6 +4,9 @@ node_modules/
 # User data (credentials + per-user trading state)
 backend/data/
 
+# Local project backup — contains .env + data/ with real credentials
+Backup/
+
 # Build output
 frontend/dist/
 
@@ -14,3 +17,4 @@ frontend/dist/
 *.log
 .env
 .env.*
+!.env.example

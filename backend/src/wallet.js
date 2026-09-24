@@ -401,7 +401,10 @@ export function executeMarketOrder(userId, { side, tokenAddress, chainId, symbol
     if (!existing) throw new Error('Tidak ada posisi untuk token ini di portfolio');
     const curAmount = Number(existing.amount) || 0;
     // SELL: tokenAmount is required; usdAmount is derived.
-    const numTokens = finitePositive(requestedTokens, 'tokenAmount', MAX_TOKEN_AMOUNT);
+    // Assign the OUTER numTokens (never re-declare) — the order record below
+    // reads it, and a shadowing `const` left it undefined so every SELL order
+    // was written with amount=undefined and then dropped by sanitizeOrder.
+    numTokens = finitePositive(requestedTokens, 'tokenAmount', MAX_TOKEN_AMOUNT);
     if (!Number.isFinite(numTokens) || numTokens <= 0 || numTokens > curAmount + 1e-6) {
       throw new Error(`Jumlah token dijual tidak valid (maks ${curAmount})`);
     }
@@ -524,7 +527,7 @@ export function checkLimitOrders(userId, currentPrices) {
   const filled = [];
   for (const order of [...w.orders]) {
     if (order.status !== 'open') continue;
-    const currentPrice = currentPrices.get(order.tokenAddress);
+    const currentPrice = currentPrices.get(order.tokenAddress.toLowerCase());
     if (currentPrice == null) continue;
     const numPrice = Number(currentPrice) || 0;
     // A bad upstream tick must not fill an order at an absurd price.

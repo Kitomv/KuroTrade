@@ -71,27 +71,27 @@ export function Trade({ prefill }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prefill?.nonce]);
 
-  const handleUsdChange = (val: string) => {
+  const handleUsdChange = useCallback((val: string) => {
     setAmountUsd(val);
     const num = parseFloat(val);
-    const price = orderType === 'limit' && parseFloat(targetPrice) > 0 ? parseFloat(targetPrice) : liveToken?.priceUsd;
+    const price = orderType === 'limit' && targetPrice ? parseFloat(targetPrice) : liveToken?.priceUsd;
     if (!isNaN(num) && price && price > 0) {
       setAmountTokens((num / price).toFixed(6));
     } else {
       setAmountTokens('');
     }
-  };
+  }, [orderType, targetPrice, liveToken?.priceUsd]);
 
-  const handleTokensChange = (val: string) => {
+  const handleTokensChange = useCallback((val: string) => {
     setAmountTokens(val);
     const num = parseFloat(val);
-    const price = orderType === 'limit' && parseFloat(targetPrice) > 0 ? parseFloat(targetPrice) : liveToken?.priceUsd;
+    const price = orderType === 'limit' && targetPrice ? parseFloat(targetPrice) : liveToken?.priceUsd;
     if (!isNaN(num) && price && price > 0) {
       setAmountUsd((num * price).toFixed(2));
     } else {
       setAmountUsd('');
     }
-  };
+  }, [orderType, targetPrice, liveToken?.priceUsd]);
 
   const handlePercentage = (pct: number) => {
     if (side === 'buy') {

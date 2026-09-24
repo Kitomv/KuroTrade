@@ -28,7 +28,7 @@ export function Agents() {
   // Fast polling for Real-Time Auto-Pilot Terminal & Guardian (relaxed to 4s to cut CPU/network load)
   const autopilotP = usePolling(() => api.getAutopilot(), 4_000, []);
   const watchlistP = usePolling(() => api.watchlist(), 10_000, []);
-  const scannedP = usePolling(() => api.agentSignals(6), 8_000, []);
+  const scannedP = usePolling(() => api.agentSignals(6), 5_000, []);
   const llmP = usePolling(() => api.getLLMConfig(), 10_000, []);
   const autopilot = autopilotP.data;
   const watchlist = watchlistP.data;
@@ -1234,9 +1234,11 @@ export function Agents() {
 
       {/* Top AI Signals Market Scanner */}
       <div className="card">
-        <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--border)', fontWeight: 600, fontSize: 14, display: 'flex', justifyContent: 'space-between' }}>
+        <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--border)', fontWeight: 600, fontSize: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <span>Market AI Radar (Top Scanned Tokens)</span>
-          <span style={{ fontSize: 12, color: 'var(--muted)' }}>Live Refresh 8s</span>
+          <span style={{ fontSize: 12, color: 'var(--muted)' }}>
+            {autopilot?.enabled ? 'Live Refresh 5s' : 'Auto-Pilot OFF — radar berhenti (tidak ada token LLM terpakai)'}
+          </span>
         </div>
         <div className="table-wrap">
           <table>

@@ -454,17 +454,31 @@ Risk: Max $${risk.maxUsdPosition} USDC, TP: $${risk.takeProfitPrice.toFixed(6)} 
 // Scan results embed per-user sizing (recommendedUsd from the caller's balance),
 // so the cache and in-flight dedup must be keyed by userId — a shared cache
 // would leak one user's position sizing to another.
-const scanCacheByUser = new Map(); // userId -> { at, reports }
+const scanCacheByUser = new Map(); // userId -> { at, reports, limit }
 const scanInFlightByUser = new Map(); // userId -> promise
-const SCAN_CACHE_TTL = 10_000;
+const SCAN_CACHE_TTL = 5_000;
 
-export async function scanMarketSignals(userId, limit = 10) {
+export async function scanMarketSignals(userId, limit = 10, opts = {}) {
+  const st0 = stateFor(userId);
   const cached = scanCacheByUser.get(userId);
-  if (cached && Date.now() - cached.at < SCAN_CACHE_TTL) return cached.reports;
+  // The cache is shared by callers with different depths (Overview asks for 3,
+  // the Agents radar for 6), so a scan that collected fewer candidates than the
+  // caller wants must not be served as if it were complete.
+  const cacheUsable = cached && cached.limit >= limit;
+  // Token-spend gate: the radar's LLM scans belong to autopilot. With autopilot
+  // OFF, an open Overview/Agents tab polling every 5s must NOT keep buying
+  // Bull/Bear/Lead calls — serve the last scan (or nothing) and never start a
+  // new one. The explicit Analyze button (analyzeToken) is unaffected.
+  if (!(opts.autopilotEnabled ?? st0.enabled === true)) {
+    return cacheUsable ? cached.reports.slice(0, limit) : [];
+  }
+  if (cacheUsable && Date.now() - cached.at < SCAN_CACHE_TTL) return cached.reports.slice(0, limit);
   const inFlight = scanInFlightByUser.get(userId);
-  if (inFlight) return inFlight;
+  if (inFlight) {
+    if (opts.allowStale && cacheUsable) return cached.reports.slice(0, limit);
+    return (await inFlight).slice(0, limit);
+  }
   const promise = (async () => {
-    const st0 = stateFor(userId);
     const concurrency = Math.min(6, Math.max(1, st0.scanConcurrency ?? 3));
     const reports = [];
     const checked = new Set();
@@ -545,12 +559,20 @@ export async function scanMarketSignals(userId, limit = 10) {
     // Persist signalHistory + slCooldowns + autopilot config via saveUserState
     saveUserState(userId);
 
-    scanCacheByUser.set(userId, { at: Date.now(), reports: sorted });
+    scanCacheByUser.set(userId, { at: Date.now(), reports: sorted, limit });
     return sorted;
   })().finally(() => {
     scanInFlightByUser.delete(userId);
   });
   scanInFlightByUser.set(userId, promise);
+  // Stale-while-revalidate: the radar poll opts in and gets the last good scan
+  // instantly while the fresh one runs in the background. A scan takes ~8s
+  // (two rounds of LLM calls), and blocking every cache miss on it is exactly
+  // what made the 5s poll feel like an 8s refresh.
+  if (opts.allowStale && cached) {
+    promise.catch(() => {}); // background failure must not become an unhandled rejection
+    return cached.reports.slice(0, limit);
+  }
   return promise;
 }
 
@@ -690,11 +712,11 @@ export async function runAutopilotTick(userId) {
         // Real-wallet mode: emit a pending intent for user approval instead of
         // trading virtual money. Autopilot becomes semi-auto (user taps Approve).
         if (isRealMode(userId)) {
-          // Dedup: don't re-emit an open sell intent for the same token while
-          // one is already pending — prevents intent spam on every 5s tick.
-          const existingOpen = getRealIntents(userId).some(
-            (i) => i.status === 'open' && i.tokenAddress === pos.tokenAddress && i.side === 'sell'
-          );
+          // Dedup: don't re-emit while a sell intent for this token is pending
+          // OR in flight. 'active' means claimed and mid-execution — emitting a
+          // second intent there queues a duplicate that auto-execute would run
+          // again → double-sell of real tokens.
+          const existingOpen = hasPendingSellIntent(userId, pos.tokenAddress);
           if (existingOpen) return { intent: null, skipped: true, executed: false };
           const intent = addRealIntent(userId, {
             symbol: pos.symbol,
@@ -750,23 +772,23 @@ export async function runAutopilotTick(userId) {
         const halfPnlUsd = pnlUsd * 0.5;
         // Real-wallet mode: emit an intent for the user (or auto-approve flow).
         if (isRealMode(userId)) {
-          // Dedup: an open sell intent for this token already covers the exit.
-          const existingOpen = getRealIntents(userId).some(
-            (i) => i.status === 'open' && i.tokenAddress === pos.tokenAddress && i.side === 'sell'
-          );
+          // Dedup: an open/active sell intent for this token already covers it.
+          const existingOpen = hasPendingSellIntent(userId, pos.tokenAddress);
           if (!existingOpen) {
             const intent = addRealIntent(userId, {
               symbol: pos.symbol,
               tokenAddress: pos.tokenAddress,
               chainId: pos.chainId,
               side: 'sell',
-              source: 'TP',
+              source: 'TP1', // distinct from TP2/trailing so the done-handler knows
               amountUsd: Math.round(halfTokens * curPrice * 100) / 100,
               estTokens: halfTokens,
               intentPrice: curPrice,
             });
             addLog(userId, 'TP', `☝️ [PARTIAL TP 50% REAL] ${pos.symbol} → intent ${intent.id} menunggu approve @ $${curPrice} (+${pnlPct.toFixed(1)}%)`, intent);
-            updatePositionMetadata(userId, pos.tokenAddress, { tp1Hit: true });
+            // Do NOT set tp1Hit here: the user may cancel this intent, and a
+            // cancelled TP must not arm the moonbag TP2 full-sell path. It is
+            // set server-side only when the TP1 intent is confirmed (done).
           }
           // NEVER execute a virtual trade while real mode is on. No `continue`
           // here, so the stop-loss / trailing / defensive checks below still run
@@ -1089,6 +1111,20 @@ function setSlCooldown(userId, tokenAddress) {
   saveUserState(userId);
 }
 
+/**
+ * True when a SELL intent for this token is still in flight — 'open' (awaiting
+ * approval) OR 'active' (claimed, mid-execution). Checking only 'open' lets a
+ * duplicate queue while the first is being signed, and auto-execute would then
+ * run both → double-sell of real tokens.
+ */
+function hasPendingSellIntent(userId, tokenAddress) {
+  return getRealIntents(userId).some(
+    (i) => (i.status === 'open' || i.status === 'active')
+      && i.tokenAddress === tokenAddress
+      && i.side === 'sell',
+  );
+}
+
 /** Record a strong signal the scout could not act on (dedup 10 min per token). */
 function recordNearMiss(userId, s, reason) {
   const st = stateFor(userId);
@@ -1132,8 +1168,9 @@ async function rotateStagnant(userId, markets = new Map()) {
     try {
       // Real-wallet mode: emit an intent (rotation hasn't really sold yet).
       if (isRealMode(userId)) {
-        // Don't re-emit while an open sell intent for this token is pending.
-        const dup = getRealIntents(userId).some((i) => i.status === 'open' && i.tokenAddress === pos.tokenAddress && i.side === 'sell');
+        // Don't re-emit while a sell intent for this token is pending
+        // (open OR active — rotation shouldn't double-queue a sell).
+        const dup = hasPendingSellIntent(userId, pos.tokenAddress);
         if (dup) return null;
         const intent = addRealIntent(userId, {
           symbol: pos.symbol,

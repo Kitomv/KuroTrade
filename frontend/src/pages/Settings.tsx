@@ -9,7 +9,7 @@
 // log out masukin menu pengaturan".
 import { useState } from 'react';
 import { Modal } from '../components/Modal';
-import { HotWalletPanel } from '../components/HotWalletPanel';
+import { MultiChainWalletPanel } from '../components/MultiChainWalletPanel';
 import { useRealWallet } from '../components/RealWalletContext';
 import { useConfirm } from '../components/ConfirmDialog';
 import { useToast } from '../components/ToastProvider';
@@ -91,9 +91,9 @@ export function Settings({ username, role, onChangePassword, onLogout }: Props) 
         </div>
       </div>
 
-      {/* Hot Wallet — moved off the trading pages */}
+      {/* Hot Wallet — Multi-chain tab switcher (Solana / Base) */}
       <div style={{ marginBottom: 24 }}>
-        <HotWalletPanel />
+        <MultiChainWalletPanel />
       </div>
 
       {/* Status ringkas */}

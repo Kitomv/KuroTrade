@@ -339,9 +339,11 @@ export function PendingIntents({ compact = false }: { compact?: boolean }) {
                 </td>
                 <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                   <button className="btn primary" style={{ marginRight: 4, minHeight: 30, padding: '3px 10px', fontSize: 11 }} disabled={approvingId === i.id} onClick={() => approveIntent(i)}>
-                    {approvingId === i.id ? 'Menunggu…' : 'Approve'}
+                    {approvingId === i.id ? <><span className="spinner" aria-hidden /> Menunggu…</> : 'Approve'}
                   </button>
-                  <button className="btn icon" style={{ minHeight: 30, padding: 3, fontSize: 11 }} disabled={approvingId === i.id} onClick={() => cancelIntent(i)}>Batal</button>
+                  <button className="btn icon" style={{ minHeight: 30, padding: 3, fontSize: 11 }} disabled={approvingId === i.id} onClick={() => cancelIntent(i)}>
+                    {approvingId === i.id ? <><span className="spinner" aria-hidden /> Batal…</> : 'Batal'}
+                  </button>
                 </td>
               </tr>
               );

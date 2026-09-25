@@ -37,7 +37,7 @@ const DEFAULT_AUTOPILOT = () => ({
   enableLeadSynthesis: true, // 3rd LLM call that writes the verdict prose
   lastScanAt: null,
   nextScanInSeconds: 15,
-  stats: { totalScans: 0, totalTrades: 0, profitableTrades: 0, totalProfitUsd: 0, winRate: 0 },
+  stats: { totalScans: 0, totalTrades: 0, profitableTrades: 0, totalProfitUsd: 0, winRate: 0, autoExecutedTrades: 0 },
   logs: [],
   guardedPositions: [],
   pnlHistory: [],
@@ -75,6 +75,11 @@ async function mapLimit(items, limit, fn) {
   return out;
 }
 
+// In-memory retry throttle for stranded hot-wallet auto-executions:
+// intentId -> nextAllowedRetryTimestamp (avoids hammering on a permanent failure).
+const hotWalletRetryThrottles = new Map();
+const HOT_WALLET_RETRY_INTERVAL_MS = 30_000;
+
 /**
  * When hot-wallet auto is ON, sign + broadcast the intent immediately on the
  * server instead of leaving it for a browser claim (that is the whole point of
@@ -84,6 +89,12 @@ async function mapLimit(items, limit, fn) {
  */
 async function maybeAutoExecuteHotWallet(userId, intent) {
   if (!intent || !isHotWalletAuto(userId)) return null;
+
+  // Throttle retries of a failed intent so a permanent failure (e.g. no liquidity)
+  // does not hammer Jupiter every 5s tick.
+  const nextAllowed = hotWalletRetryThrottles.get(intent.id) ?? 0;
+  if (Date.now() < nextAllowed) return null;
+
   try {
     const { executeIntentWithHotWallet, resolveTokenDecimals } = await import('./hotWallet.js');
     const result = await executeIntentWithHotWallet(userId, intent, {
@@ -94,8 +105,10 @@ async function maybeAutoExecuteHotWallet(userId, intent) {
     // the next autopilot tick from re-executing the SAME trade → double spend.
     // resolveIntentAsDone(..., { force: true }) closes unconditionally and
     // applies the same ledger side-effects as the claim-based path.
+    let intentClosed = false;
     try {
       resolveIntentAsDone(userId, intent.id, { force: true });
+      intentClosed = true;
     } catch (closeErr) {
       // If force-close ALSO fails, we have a critical bug: the swap is on-chain
       // but we cannot mark it done. Log loudly and pause this user's autopilot.
@@ -105,13 +118,77 @@ async function maybeAutoExecuteHotWallet(userId, intent) {
         closeError: String(closeErr.message ?? closeErr).slice(0, 160),
       });
     }
+    // Only clear the retry throttle once the intent is actually CLOSED. The swap
+    // is already on-chain, so if the close failed the intent is still 'open' and
+    // the tick's retry sweep will pick it up again — with the throttle cleared
+    // it would re-execute immediately and buy/sell the same trade a second time.
+    // Leaving the throttle in place bounds that to one retry per 30s window.
+    if (intentClosed) hotWalletRetryThrottles.delete(intent.id);
     addLog(userId, 'BUY', `⚡ [HOT WALLET] ${intent.symbol} ${intent.side.toUpperCase()} tereksekusi otomatis — ${result.signature.slice(0, 12)}…`, {
       intentId: intent.id,
       signature: result.signature,
     });
+    // `stats.totalTrades` counts completed ROUND TRIPS (it increments at the
+    // sell exit, where PnL is known). The "Auto-Trades Dieksekusi" tile is about
+    // orders actually broadcast, so a hot-wallet BUY — which fires here and never
+    // touches the exit path — would never move that counter. Track executions
+    // separately so the tile matches the on-chain activity feed.
+    const st = stateFor(userId);
+    st.stats.autoExecutedTrades = (st.stats.autoExecutedTrades ?? 0) + 1;
+
+    // Correct the mirrored cost basis to the REAL fill. resolveIntentAsDone
+    // mirrors the position at `intent.estTokens` / `intent.intentPrice` — both
+    // model estimates from scan time. The wallet actually received
+    // `filledOutputAmount` tokens for `amountSol`, and on a volatile memecoin
+    // those differ materially. Every later PnL, win-rate and SL/TP threshold is
+    // derived from avgBuyPrice, so an uncorrected estimate silently corrupts all
+    // of them (the "PnL hot wallet tidak sync" symptom).
+    if (intent.side === 'buy') {
+      try {
+        const filledTokens = Number(result.filledOutputAmount);
+        const spentSol = Number(intent.amountSol) / 1e9;
+        if (Number.isFinite(filledTokens) && filledTokens > 0 && Number.isFinite(spentSol) && spentSol > 0) {
+          const { getSolUsdPrice } = await import('./dexscreener.js');
+          const solUsd = await getSolUsdPrice().catch(() => null);
+          const realPrice = Number.isFinite(solUsd) && solUsd > 0
+            ? (spentSol * solUsd) / filledTokens
+            : null;
+          if (realPrice && realPrice > 0) {
+            const { getPositions, updatePositionMetadata } = await import('./wallet.js');
+            const mirrored = getPositions(userId).find(
+              (p) => p.tokenAddress.toLowerCase() === intent.tokenAddress.toLowerCase(),
+            );
+            // Only the AMOUNT is corrected here. Rewriting totalCost would fight
+            // addMirroredPosition's own bookkeeping; instead scale the average
+            // price so amount × avgBuyPrice equals the real USD spent.
+            if (mirrored) {
+              updatePositionMetadata(userId, intent.tokenAddress, {
+                amount: filledTokens,
+                avgBuyPrice: realPrice,
+                totalCost: filledTokens * realPrice,
+              });
+              addLog(userId, 'BUY', `📊 [HOT WALLET] ${intent.symbol} cost basis dikoreksi ke fill nyata: ${filledTokens} @ $${realPrice}`, {
+                intentId: intent.id,
+                estimatedTokens: intent.estTokens,
+                filledTokens,
+                estimatedPrice: intent.intentPrice,
+                realPrice,
+              });
+            }
+          }
+        }
+      } catch (e) {
+        // Never fail an executed trade over a bookkeeping correction.
+        addLog(userId, 'WARN', `Koreksi cost basis ${intent.symbol} gagal: ${String(e?.message ?? e).slice(0, 120)}`);
+      }
+    }
+
+    saveUserState(userId);
     return result;
   } catch (e) {
-    addLog(userId, 'WARN', `⚠️ [HOT WALLET] ${intent.symbol ?? ''} gagal eksekusi otomatis: ${String(e?.message ?? e).slice(0, 160)}`, {
+    // Throttled: don't retry this specific intent for 30s.
+    hotWalletRetryThrottles.set(intent.id, Date.now() + HOT_WALLET_RETRY_INTERVAL_MS);
+    addLog(userId, 'WARN', `⚠️ [HOT WALLET] ${intent.symbol ?? ''} gagal eksekusi otomatis: ${String(e?.message ?? e).slice(0, 160)} (retry dalam 30s)`, {
       intentId: intent.id,
     });
     return null;
@@ -123,18 +200,69 @@ function stateFor(userId) {
   return autopilotStates.get(userId);
 }
 
+/**
+ * Record a REALIZED round trip into the cumulative stats.
+ *
+ * Every exit path funnels through here: guardian SL/TP/trailing, the TP1 partial,
+ * and a MANUAL sell from the Portfolio page. They used to each inline the same
+ * three lines, but only the guardian paths were instrumented — a manual hot
+ * wallet sell executed real funds and still showed 0 trades / 0 profit / 0% win
+ * rate, because the sell-position route resolves the intent server-side without
+ * re-entering the agent loop.
+ *
+ * Idempotent per round trip: callers pass a `key` (the intent id) so a retried
+ * exit cannot double-count the same PnL.
+ */
+export function recordRealized(userId, { pnlUsd, intentId = null, key = null } = {}) {
+  const st = autopilotStates.get(userId);
+  if (!st) return;
+  if (!st.stats) st.stats = { ...DEFAULT_AUTOPILOT().stats };
+  // Validate BEFORE claiming the dedup slot. Burning the key on a NaN PnL would
+  // make a later, correct record for the same exit a silent no-op — the round
+  // trip would be dropped from the totals instead of just being unrecorded once.
+  const pnl = Number(pnlUsd);
+  if (!Number.isFinite(pnl)) return;
+  // Dedup: the same intent must never be counted twice, even if the exit is
+  // retried (throttle retry sweep, manual retry after a failed send).
+  if (key) {
+    if (!Array.isArray(st.recordedExits)) st.recordedExits = [];
+    if (st.recordedExits.includes(key)) return;
+    st.recordedExits.unshift(key);
+    if (st.recordedExits.length > 200) st.recordedExits.length = 200;
+  }
+  st.stats.totalTrades++;
+  if (pnl > 0) st.stats.profitableTrades++;
+  st.stats.totalProfitUsd += pnl;
+  st.stats.winRate = st.stats.totalTrades > 0
+    ? Math.round((st.stats.profitableTrades / st.stats.totalTrades) * 100)
+    : 0;
+  if (intentId) st.lastRealizedIntentId = intentId;
+  saveUserState(userId);
+}
+
 /** Load a user's persisted autopilot config on startup. */
 export function initAutopilot(userId) {
   const saved = loadUserState(userId);
   if (saved?.autopilot) {
     const base = DEFAULT_AUTOPILOT();
+    // Merge persisted slice on top of defaults. Stats only merge when present
+    // (older saves lack them) so totals don't reset to 0 unexpectedly — but
+    // once persisted they survive restarts, keeping "Auto-Trades Dieksekusi" /
+    // "Profit Auto-Pilot Realized" in sync with on-chain hot-wallet activity.
     Object.assign(base, saved.autopilot);
+    if (!saved.autopilot.stats) base.stats = DEFAULT_AUTOPILOT().stats;
+    // A save from before the executions counter existed has `stats` but no
+    // `autoExecutedTrades`; back-fill 0 instead of leaving it undefined.
+    if (typeof base.stats.autoExecutedTrades !== 'number') base.stats.autoExecutedTrades = 0;
+    if (!Array.isArray(saved.autopilot.pnlHistory)) base.pnlHistory = [];
     autopilotStates.set(userId, base);
   }
 }
 
-// Autopilot slice provider — persisted config only (stats/logs/pnlHistory are
-// session-local to keep files small and avoid writing on every tick).
+// Autopilot slice provider — persists config AND cumulative stats + pnlHistory
+// so "Auto-Trades Dieksekusi" and "Profit Auto-Pilot Realized" survive restarts
+// and stay in sync with hot-wallet on-chain activity (was config-only; stats
+// reset to 0 every boot, making realized PnL look like it desynced).
 registerStateProvider((userId) => {
   const st = autopilotStates.get(userId);
   if (!st) return null;
@@ -142,7 +270,7 @@ registerStateProvider((userId) => {
     enabled, riskLevel, minConfidence, takeProfitPct, stopLossPct, trailingStopPct,
     trailingTriggerPct, moonbagX, maxOpenPositions, rotateAfterHours, maxExposurePct, agentMode,
     llmTemperature, llmTimeoutMs, scanConcurrency, enableLeadSynthesis,
-    signalHistory, slCooldowns, memory, nearMisses,
+    signalHistory, slCooldowns, memory, nearMisses, stats, pnlHistory, recordedExits,
   } = st;
   return {
     autopilot: {
@@ -153,6 +281,12 @@ registerStateProvider((userId) => {
       slCooldowns,
       memory: (memory ?? []).slice(0, 50),
       nearMisses: (nearMisses ?? []).slice(0, 30),
+      stats: st.stats ?? { totalScans: 0, totalTrades: 0, profitableTrades: 0, totalProfitUsd: 0, winRate: 0, autoExecutedTrades: 0 },
+      pnlHistory: (st.pnlHistory ?? []).slice(-120),
+      // Dedup keys for realized-PnL accounting. Persisted so a restart cannot
+      // re-count an exit that was already recorded (the retry sweep and a manual
+      // retry both re-resolve the same intent).
+      recordedExits: (recordedExits ?? []).slice(0, 200),
     },
   };
 });
@@ -263,19 +397,26 @@ function runBearThesis(market, tech) {
   };
 }
 
-function runRiskAssessment(market, tech, bull, bear, walletBalance) {
+function runRiskAssessment(market, tech, bull, bear, walletBalance, riskLevel = 'medium') {
   let approved = true;
   let rejectionReason = null;
-  let maxAllocationPct = 0.20;
+  // Per-user Guardian risk level drives per-trade sizing. This is the knob the
+  // user sets in the Agents UI (Low/Medium/High); it must actually size trades
+  // or the setting is cosmetic. Hot-wallet trades are additionally clamped by
+  // HOT_WALLET_MAX_USD_PER_TRADE (a hard safety ceiling in checkTradeSize), so
+  // the two settings compose: riskLevel sets the target, env sets the ceiling.
+  const ALLOCATION_BY_RISK = { low: 0.10, medium: 0.20, high: 0.35 };
+  let maxAllocationPct = ALLOCATION_BY_RISK[riskLevel] ?? ALLOCATION_BY_RISK.medium;
 
   if (tech.liquidityUsd < 5000) { approved = false; rejectionReason = 'Likuiditas pool di bawah batas aman minimum $5,000 USD.'; }
-  else if (bear.score > 75) { approved = false; rejectionReason = 'Skor risiko Bearish melebihi batas toleransi (>75%).'; }
+  else if (bear.score > 75) { approved = false; rejectionReason = 'Skor risiko Bearish melampaui batas toleransi (>75%).'; }
 
-  if (tech.liquidityUsd < 20000) maxAllocationPct = 0.10;
-  else if (bull.score > 70 && bear.score < 40) maxAllocationPct = 0.30;
+  // Extra caution for thinner pools: cap the allocation even on High risk.
+  if (tech.liquidityUsd < 20000) maxAllocationPct = Math.min(maxAllocationPct, 0.10);
 
   const currentPrice = tech.priceUsd > 0 ? tech.priceUsd : 0.000001;
-  const maxUsdPosition = Math.max(1, Math.round((walletBalance * maxAllocationPct) * 100) / 100);
+  const safeBalance = Number.isFinite(Number(walletBalance)) && Number(walletBalance) > 0 ? Number(walletBalance) : 100;
+  const maxUsdPosition = Math.max(1, Math.round((safeBalance * maxAllocationPct) * 100) / 100);
 
   const stopLossPct = 7;
   const targetProfitPct = 15;
@@ -297,14 +438,18 @@ function runRiskAssessment(market, tech, bull, bear, walletBalance) {
 // Deterministic pre-filter for the scan — rejects tokens that would waste
 // LLM calls. Uses the same hard gates as `runRiskAssessment` but without
 // per-user sizing (those are independent of the token's intrinsic quality).
+// Multi-chain: accept Solana + any chain the EVM hot wallet can execute.
+const SUPPORTED_CHAINS = new Set([
+  'solana',               // Jupiter executor
+  'ethereum', 'base',     // 1inch EVM executor
+  'arbitrum', 'bsc', 'optimism', 'polygon', 'avalanche',
+]);
 function passesPreFilter(market) {
   if (!market || !market.priceUsd) return false;
-  // Solana-only. The execution layer (hot wallet via @solana/web3.js + Jupiter)
-  // cannot trade any other chain, so an EVM token that reaches the radar becomes
-  // an intent that can never execute — it stays 'open' forever and blocks the
-  // buy-dedup for that token. DexScreener returns pairs from every chain it
-  // indexes (SINU/OC were 'ethereum'), so gate here, before any LLM spend.
-  if (market.chainId !== 'solana') return false;
+  // An intent for a chain the execution layer cannot fill stays 'open' forever
+  // and blocks buy-dedup. DexScreener indexes many chains; accept only those
+  // the hot wallet can actually trade.
+  if (!SUPPORTED_CHAINS.has(market.chainId)) return false;
   const liq = Number(market.liquidityUsd) || 0;
   if (liq < 10000) return false;              // hard gate in runRiskAssessment
   const vol = Number(market.volume24h) || 0;
@@ -424,7 +569,7 @@ Vol/Liq Ratio: ${tech.volToLiqRatio}x`.trim();
     }
   }
 
-  const risk = runRiskAssessment(market, tech, bull, bear, wallet.balance);
+  const risk = runRiskAssessment(market, tech, bull, bear, wallet.balance, st.riskLevel ?? 'medium');
   risk.stopLossPct = st.stopLossPct ?? 7;
   risk.targetProfitPct = st.takeProfitPct ?? 15;
   risk.stopLossPrice = (tech.priceUsd || 1) * (1 - risk.stopLossPct / 100);
@@ -555,7 +700,14 @@ export async function scanMarketSignals(userId, limit = 10, opts = {}) {
     }
 
     if (addrs.length < limit) {
-      const popularQueries = ['SOL', 'PEPE', 'BONK', 'AERO', 'ETH', 'DOGE', 'RAY'];
+      // Seed with multi-chain queries so the radar surfaces non-Solana pools.
+      // One list per chain family; the pre-filter (SUPPORTED_CHAINS) still
+      // gates which of these can actually reach a Bull/Bear call.
+      const popularQueries = ['SOL', 'PEPE', 'BONK', 'AERO', 'ETH', 'DOGE', 'RAY',
+        // EVM chain searches (same query returns the chain's own pairs)
+        'USDC', 'WETH', 'WBTC', 'LINK', 'UNI', 'AAVE', 'MKR',
+        'BRETT', 'TOSHI', 'DEGEN', 'FARTCOIN', 'MOODENG', // Base memes
+      ];
       for (const q of popularQueries) {
         if (addrs.length >= limit * 2) break;
         try {
@@ -719,14 +871,77 @@ export async function runAutopilotTick(userId) {
   const positions = getPositions(userId);
   const wallet = getWallet(userId);
 
-  st.pnlHistory.push({ ts: Date.now(), totalValue: Math.round(wallet.totalValue * 100) / 100 });
-  if (st.pnlHistory.length > 60) st.pnlHistory.shift();
+  // Equity curve must track the ACTIVE wallet, not always the virtual one.
+  //   - Real mode + hot wallet → on-chain value (SOL + SPL holdings, in USD).
+  //   - Otherwise → the virtual paper ledger (historical behaviour).
+  const tickTs = Date.now();
+  let recordedReal = false;
+  if (isRealMode(userId)) {
+    try {
+      const { getHotWalletTotalValue } = await import('./hotWallet.js');
+      const realTotal = await getHotWalletTotalValue(userId);
+      if (Number.isFinite(realTotal)) {
+        st.pnlHistory.push({ ts: tickTs, totalValue: Math.round(realTotal * 100) / 100 });
+        if (st.pnlHistory.length > 60) st.pnlHistory.shift();
+        recordedReal = true;
+      }
+    } catch {
+      // fall through to virtual value — equity curve must never break a tick
+    }
+  }
+
+  if (!recordedReal) {
+    st.pnlHistory.push({ ts: tickTs, totalValue: Math.round(wallet.totalValue * 100) / 100 });
+    if (st.pnlHistory.length > 60) st.pnlHistory.shift();
+  }
 
   // Batch-fetch all position prices once per tick (was 1 HTTP call per position).
   const markets = await dexscreener.tokens(positions.map((p) => p.tokenAddress)).catch(() => new Map());
 
   // Fill in pending signal outcomes (1h/24h price checks) — cheap, batched.
   await updateSignalOutcomes(userId).catch(() => {});
+
+  // Retry sweep: an intent whose first auto-execute FAILED stays 'open', and
+  // the scout's hasPendingBuyIntent() then refuses to emit a replacement — so
+  // the token is blocked forever and the autopilot silently stops trading it.
+  // Re-attempt any stranded open intent here (30s throttle per intent, inside
+  // maybeAutoExecuteHotWallet) so a transient RPC/Jupiter failure self-heals.
+  if (isHotWalletAuto(userId)) {
+    try {
+      for (const pending of getRealIntents(userId)) {
+        if (pending.status !== 'open') continue;
+        // Prune SELL intents that can NEVER succeed: the hot wallet provably
+        // holds none of the token. Retrying these is pointless — the condition
+        // is permanent, not transient — and worse, the open intent blocks
+        // hasPendingSellIntent() for that token, so the guardian can never emit
+        // a fresh exit and the log fills with the same warning every 30s.
+        // This is the "phantom position" case: a virtual-mode position mirrored
+        // into the ledger while the hot wallet never actually held the token.
+        if (pending.side === 'sell') {
+          const { getHotWalletTokenAmount } = await import('./hotWallet.js');
+          const held = await getHotWalletTokenAmount(userId, pending.tokenAddress).catch(() => null);
+          if (held === 0n) {
+            addLog(userId, 'WARN', `🧹 Intent SELL ${pending.symbol ?? pending.tokenAddress} di-prune — hot wallet tidak memegang token ini (posisi phantom). Posisi virtual dibersihkan.`, {
+              intentId: pending.id,
+              tokenAddress: pending.tokenAddress,
+            });
+            // Cancel the intent, then drop the phantom position so the guardian
+            // stops guarding something that cannot be sold.
+            try { setRealIntentStatus(userId, pending.id, 'cancelled'); } catch {}
+            try {
+              const { reducePositionAmount } = await import('./wallet.js');
+              reducePositionAmount(userId, pending.tokenAddress, Number.MAX_SAFE_INTEGER);
+            } catch {}
+            hotWalletRetryThrottles.delete(pending.id);
+            continue;
+          }
+        }
+        await maybeAutoExecuteHotWallet(userId, pending);
+      }
+    } catch (e) {
+      addLog(userId, 'WARN', `Retry sweep hot-wallet gagal: ${String(e?.message ?? e).slice(0, 120)}`);
+    }
+  }
 
   for (const pos of positions) {
     try {
@@ -783,6 +998,37 @@ export async function runAutopilotTick(userId) {
           // Hot-wallet auto: exits (SL/TP/trailing) are the most time-critical
           // path — execute server-side now instead of waiting for a claim.
           const hotExec = await maybeAutoExecuteHotWallet(userId, intent);
+          // Real exit only counts toward stats/memory when it ACTUALLY executed
+          // on-chain (hotExec truthy). A throttled/failed attempt leaves the
+          // intent open for retry — counting it now would overcount realized PnL.
+          if (hotExec) {
+            // Decision memory mirrors the virtual path.
+            if (!st.memory) st.memory = [];
+            const regime = marketRegime(tech);
+            const holdMs = pos.openedAt ? Date.now() - Number(pos.openedAt) : 0;
+            st.memory.unshift({
+              ts: Date.now(),
+              symbol: pos.symbol,
+              signal: tag,
+              confidence: pnlPct >= 0 ? 100 : 0,
+              entryPrice: avgPrice,
+              outcomePct: Number(((cur - avgPrice) / avgPrice * 100).toFixed(1)),
+              regime,
+              chainId: pos.chainId,
+              liquidityUsd: tech.liquidityUsd,
+              volume24h: tech.volume24h,
+              fdv: tech.fdv,
+              buyRatio: tech.buyRatio,
+              volToLiqRatio: tech.volToLiqRatio,
+              exitReason: tag,
+              holdMs,
+            });
+            if (st.memory.length > 50) st.memory.length = 50;
+            recordRealized(userId, { pnlUsd, intentId: intent.id, key: intent.id });
+            addLog(userId, tag, `✅ [${tag} REAL] ${pos.symbol} closed — PnL ${pnlUsd >= 0 ? '+' : ''}$${pnlUsd.toFixed(2)} (${pnlPct.toFixed(1)}%)`, { intentId: intent.id, pnlUsd });
+          } else {
+            addLog(userId, tag, `☝️ [${tag} REAL] ${pos.symbol} intent dipending (eksekusi belum jalan / throttled)`);
+          }
           return { intent, executed: true, hotExec };
         }
 
@@ -790,10 +1036,7 @@ export async function runAutopilotTick(userId) {
           side: 'sell', tokenAddress: pos.tokenAddress, chainId: pos.chainId,
           symbol: pos.symbol, name: pos.name, tokenAmount: pos.amount, currentPrice: cur,
         });
-        st.stats.totalTrades++;
-        if (pnlUsd > 0) st.stats.profitableTrades++;
-        st.stats.totalProfitUsd += pnlUsd;
-        st.stats.winRate = Math.round((st.stats.profitableTrades / st.stats.totalTrades) * 100);
+        recordRealized(userId, { pnlUsd });
         // Decision memory: enriched entry with market context, exit reason, hold time.
         if (!st.memory) st.memory = [];
         const regime = marketRegime(tech);
@@ -842,7 +1085,12 @@ export async function runAutopilotTick(userId) {
             addLog(userId, 'TP', `☝️ [PARTIAL TP 50% REAL] ${pos.symbol} → intent ${intent.id} menunggu approve @ $${curPrice} (+${pnlPct.toFixed(1)}%)`, intent);
             // Hot-wallet auto: execute the partial TP server-side now.
             const hotExec = await maybeAutoExecuteHotWallet(userId, intent);
-            if (hotExec) updatePositionMetadata(userId, pos.tokenAddress, { tp1Hit: true });
+            if (hotExec) {
+              // Partial TP executed on-chain — record PnL so stats stay in sync
+              // with the virtual path below. halfPnlUsd = 50% of realized pnl.
+              recordRealized(userId, { pnlUsd: halfPnlUsd, intentId: intent.id, key: `${intent.id}:tp1` });
+              updatePositionMetadata(userId, pos.tokenAddress, { tp1Hit: true });
+            }
             // Do NOT set tp1Hit here: the user may cancel this intent, and a
             // cancelled TP must not arm the moonbag TP2 full-sell path. It is
             // set server-side only when the TP1 intent is confirmed (done).
@@ -855,10 +1103,7 @@ export async function runAutopilotTick(userId) {
             side: 'sell', tokenAddress: pos.tokenAddress, chainId: pos.chainId,
             symbol: pos.symbol, name: pos.name, tokenAmount: halfTokens, currentPrice: curPrice,
           });
-          st.stats.totalTrades++;
-          if (halfPnlUsd > 0) st.stats.profitableTrades++;
-          st.stats.totalProfitUsd += halfPnlUsd;
-          st.stats.winRate = Math.round((st.stats.profitableTrades / st.stats.totalTrades) * 100);
+          recordRealized(userId, { pnlUsd: halfPnlUsd, intentId: intent.id, key: `${intent.id}:tp1` });
           addLog(userId, 'TP', `🎯 [PARTIAL TP 50%] Amankan 50% profit ${pos.symbol} @ $${curPrice} (+${pnlPct.toFixed(1)}% | +$${halfPnlUsd.toFixed(2)} USDC). Sisa 50% jadi Moonbag Runner!`, order);
           updatePositionMetadata(userId, pos.tokenAddress, { tp1Hit: true });
           continue;
@@ -915,16 +1160,65 @@ export async function runAutopilotTick(userId) {
       return { executed: false, reason: 'MAX_POSITIONS' };
     }
   }
-  if (wallet.balance < 5) {
-    addLog(userId, 'SCAN', `Saldo virtual $${wallet.balance.toFixed(2)} USDC < $5. Menunggu posisi take-profit.`);
+  // --- Real-mode aware balance/exposure gates ---------------------------------
+  // In real mode, sizing/scout gates must read the HOT WALLET's on-chain value,
+  // not the virtual paper ledger — otherwise a drained hot wallet keeps getting
+  // buy intents that fail, or an over-exposed hot wallet is let through because
+  // the virtual balance never falls.
+  let realTotalUsd = null;
+  if (isRealMode(userId)) {
+    try {
+      const { getHotWalletTotalValue } = await import('./hotWallet.js');
+      const total = await getHotWalletTotalValue(userId);
+      if (Number.isFinite(total)) realTotalUsd = total;
+    } catch {
+      // keep null → gates fall back to virtual (never break the tick)
+    }
+  }
+
+  // LOW_BALANCE: below MIN_TRADEABLE_USD there is nothing worth buying into and
+  // no room to cover fees, so stop scouting and let TP/SL drain the book. Real
+  // mode reads the hot wallet's on-chain USD value (SOL + SPL); virtual mode
+  // reads the paper ledger. The gas reserve itself is enforced in
+  // executeIntentWithHotWallet (HOT_WALLET_FEE_RESERVE_LAMPORTS), not here.
+  const MIN_TRADEABLE_USD = 5;
+  const totalForBalance = isRealMode(userId) && realTotalUsd !== null ? realTotalUsd : wallet.balance;
+  if (totalForBalance < MIN_TRADEABLE_USD) {
+    const prefix = isRealMode(userId) ? 'Nilai hot wallet' : 'Saldo virtual';
+    addLog(userId, 'SCAN', `${prefix} $${totalForBalance.toFixed(2)} < $${MIN_TRADEABLE_USD}. Menunggu take-profit / isi ulang.`);
     st.status = 'IDLE';
     return { executed: false, reason: 'LOW_BALANCE' };
   }
-  // Max exposure: positions + reserved must stay under maxExposurePct of totalValue.
+
+  // EXPOSURE_LIMIT: what fraction of the book is already at risk, as a % of
+  // total value. BOTH sides must come from the same source or the ratio is
+  // meaningless: the real-mode numerator used to be the VIRTUAL ledger's
+  // position value while the denominator was the hot wallet's on-chain total.
+  // A real hot-wallet BUY never debits virtual cash, so the two diverged and the
+  // gate reported e.g. 145% exposure on a $9.87 wallet — permanently blocking
+  // every new buy on a wallet that was in fact mostly idle.
+  //
+  // Real mode: numerator = on-chain SPL value (SOL is undeployed cash/gas, not
+  // exposure), denominator = on-chain total (SOL + SPL). Virtual mode: both
+  // from the paper ledger, positions + reserved cash over total.
   const maxExposurePct = st.maxExposurePct ?? 80;
-  const exposure = wallet.totalPositionValue + (wallet.reservedUsd ?? 0);
-  if (wallet.totalValue > 0 && (exposure / wallet.totalValue) * 100 >= maxExposurePct) {
-    addLog(userId, 'SCAN', `Exposure limit ${maxExposurePct}% tercapai (${Math.round((exposure / wallet.totalValue) * 100)}%). Skip scout.`);
+  let exposure;
+  let totalForExposure;
+  if (isRealMode(userId) && realTotalUsd !== null) {
+    try {
+      const { getHotWalletTokenValue } = await import('./hotWallet.js');
+      const tokenUsd = await getHotWalletTokenValue(userId);
+      exposure = Number.isFinite(tokenUsd) ? tokenUsd : wallet.totalPositionValue;
+    } catch {
+      exposure = wallet.totalPositionValue;
+    }
+    totalForExposure = realTotalUsd;
+  } else {
+    exposure = wallet.totalPositionValue + (wallet.reservedUsd ?? 0);
+    totalForExposure = wallet.totalValue;
+  }
+  if (totalForExposure > 0 && (exposure / totalForExposure) * 100 >= maxExposurePct) {
+    addLog(userId, 'SCAN', `Exposure limit ${maxExposurePct}% tercapai (${Math.round((exposure / totalForExposure) * 100)}% dari $${totalForExposure.toFixed(2)}). Skip scout.`);
     st.status = 'IDLE';
     return { executed: false, reason: 'EXPOSURE_LIMIT' };
   }
@@ -955,7 +1249,12 @@ export async function runAutopilotTick(userId) {
     if (topBuy) {
       const { token, verdict } = topBuy;
       const tier = verdict.signal === 'STRONG_BUY' ? 1 : 0.5; // BUY → 50% size
-      const usdAmount = Math.round(verdict.recommendedUsd * tier * 100) / 100;
+      // Guard: a scan result with a missing/NaN recommendedUsd (stale cache entry,
+      // a report built before the balance was known) must not propagate NaN into
+      // the affordability check — it surfaced as "$undefined (BAD_AMOUNT) — skip".
+      const rawUsd = Number(verdict.recommendedUsd);
+      const baseUsd = Number.isFinite(rawUsd) && rawUsd > 0 ? rawUsd : 10;
+      const usdAmount = Math.round(baseUsd * tier * 100) / 100;
 
       // Real-wallet mode: emit intent for the user to approve in Phantom.
       if (isRealMode(userId)) {

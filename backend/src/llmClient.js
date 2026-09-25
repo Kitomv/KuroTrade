@@ -57,9 +57,16 @@ function ensureLoaded(userId) {
 }
 
 // Persistence provider — llmClient writes its slice into the per-user JSON.
+// CRITICAL: never stub a user's config with `defaultConfigs` here. This provider
+// runs on EVERY flush, and returning defaultConfigs for a user who has saved
+// entries (but whose map wasn't hydrated yet) would overwrite their on-disk
+// stack with the env default → "LLM config reset after restart". hydrate first;
+// only publish a slice when the user actually has one.
 registerStateProvider((userId) => {
-  const cfg = userId && userConfigs.has(userId) ? userConfigs.get(userId) : defaultConfigs;
-  return { llmConfigs: cfg };
+  if (!userId) return null;
+  ensureLoaded(userId);
+  if (!userConfigs.has(userId)) return null; // no per-user config → don't write one
+  return { llmConfigs: userConfigs.get(userId) };
 });
 
 export function getLLMConfig(userId = null) {

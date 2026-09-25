@@ -351,7 +351,7 @@ export function HotWalletPanel({ compact = false }: { compact?: boolean }) {
             title="Tarik SOL dari hot wallet kembali ke wallet Phantom yang di-bind"
           >
             <IconArrowDown size={13} />
-            {busy === 'withdraw' ? 'Menarik…' : 'Tarik ke Phantom'}
+            {busy === 'withdraw' ? <><span className="spinner" aria-hidden /> Menarik…</> : 'Tarik ke Phantom'}
           </button>
         </div>
       )}
@@ -376,7 +376,7 @@ export function HotWalletPanel({ compact = false }: { compact?: boolean }) {
               disabled={busy !== null}
               onClick={handleGenerate}
             >
-              {busy === 'generate' ? 'Membuat…' : 'Buat Hot Wallet'}
+              {busy === 'generate' ? <><span className="spinner" aria-hidden /> Membuat…</> : 'Buat Hot Wallet'}
             </button>
             <button
               type="button"
@@ -386,7 +386,7 @@ export function HotWalletPanel({ compact = false }: { compact?: boolean }) {
               onClick={handleImport}
               title="Pakai private key milikmu sendiri (dari Phantom) — kamu tetap pegang kuncinya"
             >
-              {busy === 'import' ? 'Mengimpor…' : 'Import Private Key'}
+              {busy === 'import' ? <><span className="spinner" aria-hidden /> Mengimpor…</> : 'Import Private Key'}
             </button>
           </>
         )}

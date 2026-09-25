@@ -19,21 +19,77 @@ const KEYS_FILE = () => process.env.EVM_WALLET_KEYS_FILE || join(DATA_DIR, 'evmw
 const ENCRYPTION_KEY_SIZE_BYTES = 32;
 const NONCE_SIZE_BYTES = 12;
 
-// --- Chain config (Base first; extend the map to add ETH/Arb/BSC later) ---
+// --- Chain config — EVM family shares ONE wallet/key across all chains.
+// The keystore maps by userId (not chain), so the same 0x address signs on
+// every chain below; only the RPC/gas-native/1inch chainId differ.
 const CHAINS = {
   base: {
     chainId: 8453,
     rpc: () => process.env.BACKEND_BASE_RPC || 'https://mainnet.base.org',
     native: 'ETH',
     explorer: 'https://basescan.org/tx/',
-    // 1inch aggregator needs an API key (free tier): INCH_API_KEY.
-    inch: {
-      base: 'https://api.1inch.dev/swap/v6.0/8453',
-      key: () => process.env.INCH_API_KEY || '',
-    },
+    inch: { base: 'https://api.1inch.dev/swap/v6.0/8453', key: () => process.env.INCH_API_KEY || '' },
+    erc20Abi: ['function approve(address spender, uint256 amount) returns (bool)', 'function allowance(address owner, address spender) view returns (uint256)', 'function decimals() view returns (uint8)', 'function balanceOf(address) view returns (uint256)'],
+  },
+  ethereum: {
+    chainId: 1,
+    rpc: () => process.env.BACKEND_ETH_RPC || 'https://eth.llamarpc.com',
+    native: 'ETH',
+    explorer: 'https://etherscan.io/tx/',
+    inch: { base: 'https://api.1inch.dev/swap/v6.0/1', key: () => process.env.INCH_API_KEY || '' },
+    erc20Abi: ['function approve(address spender, uint256 amount) returns (bool)', 'function allowance(address owner, address spender) view returns (uint256)', 'function decimals() view returns (uint8)', 'function balanceOf(address) view returns (uint256)'],
+  },
+  arbitrum: {
+    chainId: 42161,
+    rpc: () => process.env.BACKEND_ARBITRUM_RPC || 'https://arb1.arbitrum.io/rpc',
+    native: 'ETH',
+    explorer: 'https://arbiscan.io/tx/',
+    inch: { base: 'https://api.1inch.dev/swap/v6.0/42161', key: () => process.env.INCH_API_KEY || '' },
+    erc20Abi: ['function approve(address spender, uint256 amount) returns (bool)', 'function allowance(address owner, address spender) view returns (uint256)', 'function decimals() view returns (uint8)', 'function balanceOf(address) view returns (uint256)'],
+  },
+  bsc: {
+    chainId: 56,
+    rpc: () => process.env.BACKEND_BSC_RPC || 'https://bsc-dataseed.bnbchain.org',
+    native: 'BNB',
+    explorer: 'https://bscscan.com/tx/',
+    inch: { base: 'https://api.1inch.dev/swap/v6.0/56', key: () => process.env.INCH_API_KEY || '' },
+    erc20Abi: ['function approve(address spender, uint256 amount) returns (bool)', 'function allowance(address owner, address spender) view returns (uint256)', 'function decimals() view returns (uint8)', 'function balanceOf(address) view returns (uint256)'],
+  },
+  optimism: {
+    chainId: 10,
+    rpc: () => process.env.BACKEND_OPTIMISM_RPC || 'https://mainnet.optimism.io',
+    native: 'ETH',
+    explorer: 'https://optimistic.etherscan.io/tx/',
+    inch: { base: 'https://api.1inch.dev/swap/v6.0/10', key: () => process.env.INCH_API_KEY || '' },
+    erc20Abi: ['function approve(address spender, uint256 amount) returns (bool)', 'function allowance(address owner, address spender) view returns (uint256)', 'function decimals() view returns (uint8)', 'function balanceOf(address) view returns (uint256)'],
+  },
+  polygon: {
+    chainId: 137,
+    rpc: () => process.env.BACKEND_POLYGON_RPC || 'https://polygon-rpc.com',
+    native: 'POL',
+    explorer: 'https://polygonscan.com/tx/',
+    inch: { base: 'https://api.1inch.dev/swap/v6.0/137', key: () => process.env.INCH_API_KEY || '' },
+    erc20Abi: ['function approve(address spender, uint256 amount) returns (bool)', 'function allowance(address owner, address spender) view returns (uint256)', 'function decimals() view returns (uint8)', 'function balanceOf(address) view returns (uint256)'],
+  },
+  avalanche: {
+    chainId: 43114,
+    rpc: () => process.env.BACKEND_AVALANCHE_RPC || 'https://api.avax.network/ext/bc/C/rpc',
+    native: 'AVAX',
+    explorer: 'https://snowtrace.io/tx/',
+    inch: { base: 'https://api.1inch.dev/swap/v6.0/43114', key: () => process.env.INCH_API_KEY || '' },
     erc20Abi: ['function approve(address spender, uint256 amount) returns (bool)', 'function allowance(address owner, address spender) view returns (uint256)', 'function decimals() view returns (uint8)', 'function balanceOf(address) view returns (uint256)'],
   },
 };
+
+/** List supported EVM chains (for the UI selector). */
+export function listEvmChains() {
+  return Object.entries(CHAINS).map(([key, cfg]) => ({
+    key,
+    chainId: cfg.chainId,
+    native: cfg.native,
+    explorer: cfg.explorer,
+  }));
+}
 
 /** Get the EVM provider for a chain. */
 export function getProvider(chain = 'base') {

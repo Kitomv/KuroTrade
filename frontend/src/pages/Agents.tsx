@@ -96,7 +96,15 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
     }
   }, [autopilot]);
 
-  const visibleLogs = (autopilot?.logs ?? []).filter((l) => tagFilter === 'ALL' || l.tag === tagFilter);
+  // Oldest first, newest at the BOTTOM — like a real terminal/console. The
+  // backend unshifts (newest at index 0) and caps the buffer with pop(), so
+  // array order alone is not a stable sort: mixed-age entries can arrive out of
+  // order after a restart. Sort by ts ascending explicitly, which also keeps
+  // `logsEndRef` anchored to the newest line (it is the last child).
+  const visibleLogs = (autopilot?.logs ?? [])
+    .filter((l) => tagFilter === 'ALL' || l.tag === tagFilter)
+    .slice()
+    .sort((a, b) => a.ts - b.ts);
 
   // Real wallet mode + auto-approve status (15s poll; Portfolio toggle reflects
   // within 15s). Paused while hidden — this page already polls 4 other
@@ -348,7 +356,7 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
     lastScanAt: null,
     guardedPositionsCount: 0,
     guardedPositions: [],
-    stats: { totalScans: 0, totalTrades: 0, profitableTrades: 0, totalProfitUsd: 0, winRate: 0 },
+    stats: { totalScans: 0, totalTrades: 0, profitableTrades: 0, totalProfitUsd: 0, winRate: 0, autoExecutedTrades: 0 },
     logs: [],
   };
 
@@ -718,15 +726,25 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
       <div className="kpi-grid">
         <div className="card kpi">
           <div className="label">Auto-Trades Dieksekusi</div>
-          <div className="value">{ap.stats?.totalTrades ?? 0} Order</div>
-          <div className="sub">Win Rate: {ap.stats?.winRate ?? 0}% ({ap.stats?.profitableTrades ?? 0} menang)</div>
+          <div className="value">
+            {realMode
+              ? (ap.stats?.autoExecutedTrades ?? 0)
+              : (ap.stats?.totalTrades ?? 0)} Order
+          </div>
+          <div className="sub">
+            {realMode
+              ? `${ap.stats?.autoExecutedTrades ?? 0} broadcast hot wallet (BUY+SELL)`
+              : `${ap.stats?.totalTrades ?? 0} round trip selesai`}
+          </div>
         </div>
         <div className="card kpi">
-          <div className="label">Profit Auto-Pilot Realized</div>
+          <div className="label">Profit Realized</div>
           <div className="value" style={{ color: (ap.stats?.totalProfitUsd ?? 0) >= 0 ? 'var(--up)' : 'var(--down)' }}>
             {(ap.stats?.totalProfitUsd ?? 0) >= 0 ? '+' : ''}{fmt.usd(ap.stats?.totalProfitUsd ?? 0)}
           </div>
-          <div className="sub">Net profit dari Auto TP / SL</div>
+          <div className="sub">
+            Win Rate {ap.stats?.winRate ?? 0}% · {ap.stats?.profitableTrades ?? 0}/{ap.stats?.totalTrades ?? 0} menang
+          </div>
         </div>
         <div className="card kpi">
           <div className="label">Position Guardian Status</div>

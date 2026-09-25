@@ -238,6 +238,9 @@ export interface AutopilotStats {
   profitableTrades: number;
   totalProfitUsd: number;
   winRate: number;
+  /** Orders actually broadcast by the hot wallet (BUY + SELL). Distinct from
+   *  `totalTrades`, which counts completed round trips so PnL is known. */
+  autoExecutedTrades: number;
 }
 
 export interface SignalHistoryEntry {
@@ -595,6 +598,11 @@ export const api = {
     }),
   hotWalletBalance: () =>
     req<{ exists: boolean; publicKey: string | null; balanceSol: number }>('/api/real/hot-wallet/balance'),
+  /** Full on-chain portfolio snapshot (SOL + SPL holdings priced live).
+   *  `totalUsd` is computed server-side — the client must not re-derive the SOL
+   *  leg from /api/overview, whose `markets` list does not always contain SOL. */
+  hotWalletPortfolio: () =>
+    req<{ exists: boolean; address: string; solHeld: number; tokenCount: number; totalUsd: number | null; tokens: { mint: string; symbol: string; name: string | null; uiAmount: number; decimals: number; priceUsd: number | null; valueUsd: number | null }[] }>('/api/real/hot-wallet/portfolio'),
   hotWalletWithdraw: (amountSol: number) =>
     req<{ ok: boolean; signature: string; lamports: number; to: string; network: string }>('/api/real/hot-wallet/withdraw', {
       method: 'POST',
@@ -607,6 +615,13 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({}),
+    }),
+  /** Manual exit of an open position via the hot wallet (server-side sell). */
+  hotWalletSellPosition: (tokenAddress: string) =>
+    req<{ ok: boolean; intentId: string; signature: string; userPublicKey: string }>('/api/real/hot-wallet/sell-position', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tokenAddress }),
     }),
   hotWalletImport: (secretKey: number[]) =>
     req<{ ok: boolean; publicKey: string; createdAt: number }>('/api/real/hot-wallet/import', {

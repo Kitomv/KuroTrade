@@ -19,6 +19,7 @@ import { ToastProvider } from './components/ToastProvider';
 import { ConfirmProvider } from './components/ConfirmDialog';
 import { WalletModeBanner } from './components/WalletModeBanner';
 import { HotWalletProvider } from './components/HotWalletContext';
+import { EvmWalletProvider } from './components/EvmWalletContext';
 import { EmergencyPauseBanner } from './components/EmergencyPauseBanner';
 import React, { Suspense, lazy } from 'react';
 
@@ -88,6 +89,7 @@ export function App() {
                 {/* Hot-wallet state is shell-level: the panel (Portfolio/Agents)
                     and the global emergency-pause banner share one poll. */}
                 <HotWalletProvider>
+                <EvmWalletProvider>
                 <div className={`shell${navOpen ? '' : ' nav-collapsed'}`}>
                   <Sidebar
                     page={page}
@@ -127,6 +129,7 @@ export function App() {
                     {page === 'settings' && <Settings username={username} role={role} onChangePassword={async (cur, next) => { await AUTH.changePassword(cur, next); }} onLogout={handleLogout} />}
                   </main>
                 </div>
+                </EvmWalletProvider>
                 </HotWalletProvider>
               </WalletProviderGate>
             </Suspense>

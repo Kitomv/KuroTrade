@@ -495,6 +495,24 @@ app.get('/api/real/hot-wallet/balance', async (req, res) => {
   }
 });
 
+// Full on-chain portfolio snapshot of the hot wallet (SOL + each SPL holding
+// with live price). Backs the Portfolio page when hot-wallet mode is active.
+app.get('/api/real/hot-wallet/portfolio', async (req, res) => {
+  try {
+    const { getHotWalletPortfolio, getHotWalletTotalValue } = await import('./hotWallet.js');
+    const snap = await getHotWalletPortfolio(req.userId);
+    if (!snap) return res.status(404).json({ error: 'Hot wallet belum dibuat' });
+    // Value the wallet server-side (SOL + SPL) instead of making the client
+    // re-derive the SOL leg from /api/overview's `markets` list — that list is
+    // watchlist + a few hardcoded tokens, so SOL is often absent and the page's
+    // "Total Nilai Hot Wallet" tile rendered as "—" with no explanation.
+    const totalUsd = await getHotWalletTotalValue(req.userId).catch(() => null);
+    res.json({ ...snap, totalUsd });
+  } catch (e) {
+    res.status(500).json({ error: sanitizeError(e.message) });
+  }
+});
+
 // Withdraw SOL from the hot wallet back to the user's BOUND Phantom wallet.
 /** Withdraw all SOL except a small fee buffer. Server-side computation avoids
  * client truncation issues (front-end sends 4-decimal balance, backend floors
@@ -524,6 +542,81 @@ app.post('/api/real/hot-wallet/withdraw-all', async (req, res) => {
 
     const result = await withdrawFromHotWallet(req.userId, sendable, { masterKey });
     res.json(result);
+  } catch (e) {
+    res.status(400).json({ error: sanitizeError(e.message) });
+  }
+});
+
+// Manual exit: user-initiated sell of an open position via the hot wallet.
+// If a sell intent for this token already exists in 'open' state (e.g. a
+// throttled autopilot exit that hasn't cleared), re-attempt THAT intent instead
+// of 409-ing — the user's explicit sell click is exactly the retry that should
+// push it through. Only 'active' (claimed by another session mid-execution) is
+// a real conflict.
+app.post('/api/real/hot-wallet/sell-position', async (req, res) => {
+  try {
+    const { tokenAddress } = req.body ?? {};
+    if (!tokenAddress || typeof tokenAddress !== 'string') {
+      return res.status(400).json({ error: 'tokenAddress required' });
+    }
+    const { getPositions } = await import('./wallet.js');
+    const pos = getPositions(req.userId).find(
+      (p) => p.tokenAddress.toLowerCase() === tokenAddress.toLowerCase(),
+    );
+    const { getRealIntents, getRealIntent, addRealIntent } = await import('./realIntent.js');
+    const pendingSell = getRealIntents(req.userId).find(
+      (i) => i.side === 'sell'
+        && i.tokenAddress === pos?.tokenAddress
+        && (i.status === 'open' || i.status === 'active'),
+    );
+    if (pendingSell?.status === 'active') {
+      return res.status(409).json({ error: 'Sell intent sedang dieksekusi sesi lain — tunggu selesai' });
+    }
+
+    const { getHotWalletPublicInfo, executeIntentWithHotWallet, resolveTokenDecimals } = await import('./hotWallet.js');
+    if (!getHotWalletPublicInfo(req.userId).exists) {
+      return res.status(400).json({ error: 'Hot wallet belum dibuat' });
+    }
+
+    // Reuse a pending 'open' sell intent (retry), else create a fresh MANUAL one.
+    let intent = pendingSell && pendingSell.status === 'open' ? pendingSell : null;
+    if (!intent) {
+      if (!pos) return res.status(404).json({ error: 'Posisi tidak ditemukan di portfolio' });
+      if (!(Number(pos.amount) > 0)) return res.status(400).json({ error: 'Jumlah posisi tidak valid' });
+      intent = addRealIntent(req.userId, {
+        symbol: pos.symbol,
+        tokenAddress: pos.tokenAddress,
+        chainId: pos.chainId,
+        side: 'sell',
+        source: 'MANUAL',
+        amountUsd: Math.round(Number(pos.amount) * (Number(pos.currentPrice) || Number(pos.avgBuyPrice)) * 100) / 100,
+        estTokens: Number(pos.amount),
+        intentPrice: Number(pos.currentPrice) || Number(pos.avgBuyPrice),
+      });
+    }
+
+    const { resolveIntentAsDone } = await import('./realIntent.js');
+    // Capture the cost basis BEFORE the sell: resolveIntentAsDone reduces (or
+    // deletes) the mirrored position, after which the entry is unrecoverable.
+    const costUsd = (Number(pos?.amount) || 0) * (Number(pos?.avgBuyPrice) || 0);
+    const result = await executeIntentWithHotWallet(req.userId, intent, {
+      getTokenDecimalsFn: resolveTokenDecimals,
+    });
+    try { resolveIntentAsDone(req.userId, intent.id, { force: true }); } catch {}
+    // A manual sell is a real round trip, so it must reach the same stats the
+    // guardian's SL/TP exits write. recordRealized is keyed on the intent id, so
+    // a guardian tick that later records the SAME exit is a no-op — that dedup
+    // is what makes it safe for both paths to call.
+    try {
+      const { getSolUsdPrice } = await import('./dexscreener.js');
+      const { recordRealized } = await import('./aiAgent.js');
+      const solUsd = await getSolUsdPrice();
+      const proceedsUsd = (Number(result.filledOutputAmount) || 0) * (Number(solUsd) || 0);
+      recordRealized(req.userId, { pnlUsd: proceedsUsd - costUsd, intentId: intent.id, key: intent.id });
+    } catch (e) {
+      console.warn(`[sell-position] stats recording failed: ${e.message}`);
+    }
+    res.json({ ok: true, intentId: intent.id, ...result });
   } catch (e) {
     res.status(400).json({ error: sanitizeError(e.message) });
   }
@@ -656,7 +749,13 @@ app.post('/api/real/hot-wallet/emergency-pause', requireAdmin, async (req, res) 
 
 // --- EVM (Base) hot wallet — Multi-chain trading, MANUAL execution only ---
 // Shared master key + per-user AES-GCM keystore, separate from the SOL hot wallet.
-const VALID_CHAINS = new Set(['base']);
+const VALID_CHAINS = new Set(['base', 'ethereum', 'arbitrum', 'bsc', 'optimism', 'polygon', 'avalanche']);
+
+// List supported EVM chains (drives the chain selector in the UI).
+app.get('/api/real/evm/chains', async (_req, res) => {
+  const { listEvmChains } = await import('./evmWallet.js');
+  res.json({ chains: listEvmChains() });
+});
 
 app.get('/api/real/evm/status', async (req, res) => {
   const { getEvmWalletStatus } = await import('./evmWallet.js');
@@ -836,6 +935,17 @@ app.get('/api/overview', wrap(async (req, res) => {
   const wallet = getWallet(req.userId);
   const positions = getPositions(req.userId);
 
+  // Hot wallet total (SOL + SPL), valued server-side. The Portfolio page used
+  // to derive the SOL leg itself by scanning `markets` for the SOL mint — but
+  // `markets` is watchlist + a few hardcoded hot tokens, and SOL is not
+  // guaranteed to be in it, so the total rendered as "—". getHotWalletTotalValue
+  // already prices the wallet correctly, so reuse it.
+  let hotWalletTotalUsd = null;
+  try {
+    const { getHotWalletTotalValue } = await import('./hotWallet.js');
+    hotWalletTotalUsd = await getHotWalletTotalValue(req.userId, { markets: wlMarkets });
+  } catch {}
+
   res.json({
     watchedTokens: entries.length,
     chainsActive: chains.size,
@@ -849,6 +959,7 @@ app.get('/api/overview', wrap(async (req, res) => {
       balance: wallet.balance,
       totalValue: wallet.totalValue,
       openPositionsCount: positions.length,
+      hotWalletTotalUsd,
     },
   });
 }));

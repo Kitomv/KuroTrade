@@ -8,7 +8,9 @@ import { useToast } from '../components/ToastProvider';
 import { useConfirm } from '../components/ConfirmDialog';
 import { StaleBadge } from '../components/StaleBadge';
 import { useRealWallet } from '../components/RealWalletContext';
+import { useHotWallet } from '../components/HotWalletContext';
 import { RealWalletPortfolio } from '../components/RealWalletPortfolio';
+import { HotWalletPortfolio } from '../components/HotWalletPortfolio';
 import { PendingIntents } from '../components/RealTradePanel';
 
 export interface PortfolioData {
@@ -22,6 +24,8 @@ export interface PortfolioData {
 
 export function Portfolio() {
   const { realMode, realAuto, connected, isBound } = useRealWallet();
+  const { status: hotStatus } = useHotWallet();
+  const hotExists = Boolean(hotStatus?.exists);
   // The summary is the same in both modes — keep polling the virtual ledger so
   // the page never goes blank when real mode is switched on.
   const p = usePolling<PortfolioData | undefined>(() => api.portfolio(), 2_500, []);
@@ -179,7 +183,8 @@ export function Portfolio() {
           <p>Detail wallet on-chain (dana asli). Ganti ke virtual lewat panel Real Wallet di sidebar.</p>
         </div>
 
-        <RealWalletPortfolio />
+        {/* Hot wallet active → show ITS on-chain books (server-side), never Phantom. */}
+        {hotExists ? <HotWalletPortfolio /> : <RealWalletPortfolio />}
         <PendingIntents />
       </>
     );

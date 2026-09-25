@@ -43,6 +43,11 @@ export const IconChartLine = (x: IconProps) => <Icon {...x}>
   {p('M6 20v-6')}
 </Icon>;
 
+export const IconCopy = (x: IconProps) => <Icon {...x}>
+  <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+  {p('M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1')}
+</Icon>;
+
 export const IconZap = (x: IconProps) => <Icon {...x}>
   {p('M7 16V4M7 4L4 7.5M7 4l3.5 3.5')}
   {p('M17 8v12M17 20l3-3M17 20l-3-3')}

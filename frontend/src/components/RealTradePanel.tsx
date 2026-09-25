@@ -308,15 +308,35 @@ export function PendingIntents({ compact = false }: { compact?: boolean }) {
       <div className="table-wrap">
         <table>
           <thead>
-            <tr><th>Token</th><th>Arah</th><th className="num">Harga</th><th className="num">Jumlah</th><th></th></tr>
+            <tr><th>Token</th><th>Arah</th><th className="num">Harga</th><th className="num">Jumlah</th><th>Confidence AI</th><th></th></tr>
           </thead>
           <tbody>
-            {openIntents.map((i) => (
+            {openIntents.map((i) => {
+              // Agent/LLM provenance: a BUY must show WHY it is proposed.
+              // Sells are exits (SL/TP/rotate) — they carry no buy confidence.
+              const isBuy = i.side === 'buy';
+              const conf = i.confidence;
+              const confTone = conf === undefined ? 'flat' : conf >= 80 ? 'up' : conf >= 70 ? 'flat' : 'down';
+              return (
               <tr key={i.id}>
                 <td><strong>{i.symbol}</strong><div className="chip" style={{ fontSize: 9, marginTop: 2 }}>{i.source}</div></td>
                 <td><span className={`badge ${i.side === 'buy' ? 'up' : 'down'}`}>{i.side.toUpperCase()}</span></td>
                 <td className="num">${i.intentPrice?.toFixed(6)}</td>
                 <td className="num">{i.side === 'buy' ? `$${i.amountUsd?.toFixed(2)}` : `${i.estTokens?.toFixed(4)}`}</td>
+                <td>
+                  {isBuy && conf !== undefined ? (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                      <span className={`badge ${confTone}`} style={{ fontWeight: 700 }}>{conf}%</span>
+                      <span style={{ fontSize: 9, color: 'var(--muted)' }}>
+                        {i.llmPowered ? 'LLM+Quant' : 'Quant'}
+                        {typeof i.bullScore === 'number' && typeof i.bearScore === 'number'
+                          ? ` · B${i.bullScore}/S${i.bearScore}` : ''}
+                      </span>
+                    </div>
+                  ) : (
+                    <span style={{ fontSize: 11, color: 'var(--muted)' }}>—</span>
+                  )}
+                </td>
                 <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                   <button className="btn primary" style={{ marginRight: 4, minHeight: 30, padding: '3px 10px', fontSize: 11 }} disabled={approvingId === i.id} onClick={() => approveIntent(i)}>
                     {approvingId === i.id ? 'Menunggu…' : 'Approve'}
@@ -324,7 +344,8 @@ export function PendingIntents({ compact = false }: { compact?: boolean }) {
                   <button className="btn icon" style={{ minHeight: 30, padding: 3, fontSize: 11 }} disabled={approvingId === i.id} onClick={() => cancelIntent(i)}>Batal</button>
                 </td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </div>

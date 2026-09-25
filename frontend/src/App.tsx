@@ -14,9 +14,12 @@ import { Trade } from './pages/Trade';
 import { Portfolio } from './pages/Portfolio';
 import { Agents } from './pages/Agents';
 import { Leaderboard } from './pages/Leaderboard';
+import { Settings } from './pages/Settings';
 import { ToastProvider } from './components/ToastProvider';
 import { ConfirmProvider } from './components/ConfirmDialog';
 import { WalletModeBanner } from './components/WalletModeBanner';
+import { HotWalletProvider } from './components/HotWalletContext';
+import { EmergencyPauseBanner } from './components/EmergencyPauseBanner';
 import React, { Suspense, lazy } from 'react';
 
 // Lazy so the ~590KB wallet+solana vendor chunks never load on the login screen.
@@ -82,15 +85,17 @@ export function App() {
           : (
             <Suspense fallback={null}>
               <WalletProviderGate>
+                {/* Hot-wallet state is shell-level: the panel (Portfolio/Agents)
+                    and the global emergency-pause banner share one poll. */}
+                <HotWalletProvider>
                 <div className={`shell${navOpen ? '' : ' nav-collapsed'}`}>
                   <Sidebar
                     page={page}
                     onNavigate={navTo}
                     username={authed ? username : undefined}
-                    onLogout={handleLogout}
-                    onChangePassword={async (cur, next) => { await AUTH.changePassword(cur, next); }}
                   />
                   <main className="main">
+                    <EmergencyPauseBanner />
                     <WalletModeBanner />
                     {/* Desktop-only collapse toggle; sits above page content. */}
                     <button
@@ -117,10 +122,12 @@ export function App() {
                     {page === 'chart' && <Chart />}
                     {page === 'trade' && <Trade prefill={tradePrefill} />}
                     {page === 'portfolio' && <Portfolio />}
-                    {page === 'agents' && <Agents />}
+                    {page === 'agents' && <Agents onNavigate={navTo} />}
                     {page === 'leaderboard' && <Leaderboard role={role} />}
+                    {page === 'settings' && <Settings username={username} role={role} onChangePassword={async (cur, next) => { await AUTH.changePassword(cur, next); }} onLogout={handleLogout} />}
                   </main>
                 </div>
+                </HotWalletProvider>
               </WalletProviderGate>
             </Suspense>
           )

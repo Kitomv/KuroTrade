@@ -9,7 +9,6 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useR
 import { useWallet, useConnection } from '@solana/wallet-adapter-react';
 import { VersionedTransaction } from '@solana/web3.js';
 import { api, RealIntent } from '../api/client';
-import { isInsecureOrigin } from '../lib/solana';
 
 // `buffer` polyfill (vite alias) — provide the type so tsc accepts it.
 declare const Buffer: { from(data: string, encoding: 'base64'): Uint8Array };
@@ -42,7 +41,14 @@ export function RealWalletProvider({ children }: { children: React.ReactNode }) 
   const { connection } = useConnection();
   const [loaded, setLoaded] = useState(false);
   const [realMode, setRealModeState] = useState(false);
-  const [realAuto, setRealAutoState] = useState(false);
+  // realAuto is retained in the context shape (banner/panel read it) but is
+  // always false: real-wallet auto-execute was removed in favour of the
+  // autopilot + hot wallet path. setRealAuto is a no-op kept for compile
+  // compatibility with existing callers.
+  const realAuto = false;
+  const setRealAuto = useCallback(async (_on: boolean) => {
+    console.warn('[RealWallet] setRealAuto is deprecated — use Hot Wallet Auto-Execute (Agents) instead.');
+  }, []);
   const [boundWallet, setBoundWallet] = useState<string | null>(null);
   const [binding, setBinding] = useState(false);
   const [bindError, setBindError] = useState('');
@@ -54,10 +60,18 @@ export function RealWalletProvider({ children }: { children: React.ReactNode }) 
   const skippedRef = useRef<Set<string>>(new Set()); // Phantom-rejected ids, skip for auto
   const attemptsRef = useRef<Map<string, number>>(new Map()); // per-intent retry counter (session only)
   const cooldownRef = useRef<Map<string, number>>(new Map()); // intentId -> next-allowed ts (ms)
+  // Guards async chains that outlive this provider. approveIntent's `await`d
+  // steps (claim → swap-tx → Phantom sign → simulate → send) can resolve after
+  // the provider unmounted (user navigates / logs out mid-approval); writing
+  // state then is at best a wasted setState, at worst a torn-state bug.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
   const pubKeyStr = publicKey?.toBase58() ?? null;
   const isBound = Boolean(pubKeyStr && boundWallet === pubKeyStr);
-  const insecure = isInsecureOrigin();
-
+  
   // Load server mode/auto/bind state on mount + whenever the wallet account changes.
   useEffect(() => {
     let cancelled = false;
@@ -70,7 +84,6 @@ export function RealWalletProvider({ children }: { children: React.ReactNode }) 
         ]);
         if (cancelled) return;
         setRealModeState(m.realMode);
-        setRealAutoState(a.realAuto);
         setBoundWallet(b.boundWallet);
       } catch {}
       if (!cancelled) setLoaded(true);
@@ -86,37 +99,34 @@ export function RealWalletProvider({ children }: { children: React.ReactNode }) 
         api.boundWallet().catch(() => ({ boundWallet: null })),
       ]);
       setIntents(list);
-      setRealAutoState(a.realAuto);
       setBoundWallet(b.boundWallet);
     } catch {}
   }, []);
 
   // Poll intents on an interval (always mounted → survives page changes).
+  // Paused while the tab is hidden — three endpoints per tick with nobody
+  // watching is what pushed the per-user rate limit over the edge.
   useEffect(() => {
-    refreshIntents();
-    const id = setInterval(refreshIntents, 10_000);
-    return () => clearInterval(id);
+    let id: ReturnType<typeof setInterval> | null = null;
+    const start = () => {
+      if (id) return;
+      refreshIntents();
+      id = setInterval(refreshIntents, 15_000);
+    };
+    const stop = () => { if (id) { clearInterval(id); id = null; } };
+    const onVisibility = () => (document.hidden ? stop() : start());
+    document.addEventListener('visibilitychange', onVisibility);
+    start();
+    return () => { stop(); document.removeEventListener('visibilitychange', onVisibility); };
   }, [refreshIntents]);
 
   const setRealMode = useCallback(async (on: boolean) => {
     setRealModeState(on);
-    if (!on) setRealAutoState(false);
     try {
       const r = await api.setRealMode(on);
       setRealModeState(Boolean(r.realMode));
-      if (typeof r.realAuto === 'boolean') setRealAutoState(r.realAuto);
     } catch {
       setRealModeState(!on);
-    }
-  }, []);
-
-  const setRealAuto = useCallback(async (on: boolean) => {
-    setRealAutoState(on);
-    try {
-      const r = await api.setRealAuto(on);
-      setRealAutoState(Boolean(r.realAuto));
-    } catch {
-      setRealAutoState(!on);
     }
   }, []);
 
@@ -173,12 +183,27 @@ export function RealWalletProvider({ children }: { children: React.ReactNode }) 
         // the auto-execute loop send the SAME trade again → double-spend of real
         // funds. Mark done instead; the user verifies on Solscan.
         try { await api.realIntentStatus(intent.id, 'done', claimToken); } catch {}
-        setApproveError(`Tx terkirim tapi belum terkonfirmasi (${sentSig.slice(0, 10)}…). Cek Solscan — intent ditandai selesai untuk mencegah eksekusi dobel.`);
-        refreshIntents();
+        if (mountedRef.current) {
+          setApproveError(`Tx terkirim tapi belum terkonfirmasi (${sentSig.slice(0, 10)}…). Cek Solscan — intent ditandai selesai untuk mencegah eksekusi dobel.`);
+          refreshIntents();
+        }
         return;
       } else {
-        // Deterministic failures (no route, bad decimals) must not loop forever:
-        // after 3 attempts in this session, stop auto-retrying this intent.
+        // A 4xx is PERMANENT: the server rejected the request itself (wrong
+        // network, bad intent, missing route). Retrying can never succeed, so
+        // skip the intent outright — otherwise the loop hammers the API until
+        // it 429s and the real error is buried in rate-limit noise.
+        const status = (e as { status?: number })?.status;
+        const permanent = typeof status === 'number' && status >= 400 && status < 500;
+        if (permanent) {
+          skippedRef.current.add(intent.id);
+          if (mountedRef.current) {
+            setApproveError(`${msg.slice(0, 200)} — intent dilewati (error permanen, tidak diulang).`);
+            refreshIntents();
+          }
+          return;
+        }
+        // Transient (5xx/429): back off and allow a bounded number of retries.
         const n = (attemptsRef.current.get(intent.id) ?? 0) + 1;
         attemptsRef.current.set(intent.id, n);
         if (n >= 3) skippedRef.current.add(intent.id);
@@ -188,11 +213,13 @@ export function RealWalletProvider({ children }: { children: React.ReactNode }) 
         cooldownRef.current.set(intent.id, Date.now() + Math.min(30_000, 2_000 * 2 ** (n - 1)));
         if (claimed) { try { await api.realIntentStatus(intent.id, 'open', claimToken); } catch {} }
       }
-      setApproveError(msg.slice(0, 200));
+      if (mountedRef.current) setApproveError(msg.slice(0, 200));
     } finally {
       runningRef.current = false;
-      setApprovingId(null);
-      refreshIntents();
+      if (mountedRef.current) {
+        setApprovingId(null);
+        refreshIntents();
+      }
     }
   }, [publicKey, signTransaction, connection, refreshIntents]);
 
@@ -202,7 +229,7 @@ export function RealWalletProvider({ children }: { children: React.ReactNode }) 
       skippedRef.current.delete(intent.id);
       attemptsRef.current.delete(intent.id);
       cooldownRef.current.delete(intent.id);
-      await refreshIntents();
+      if (mountedRef.current) await refreshIntents();
     } catch {}
   }, [refreshIntents]);
 
@@ -212,14 +239,10 @@ export function RealWalletProvider({ children }: { children: React.ReactNode }) 
   // here (not in a page component) so it survives navigation and panel closes.
   // Honors the per-intent backoff so a deterministically-failing intent can't
   // spin the claim/reopen cycle at sub-second speed.
-  useEffect(() => {
-    if (!realMode || !realAuto || insecure || runningRef.current || !isBound) return;
-    const now = Date.now();
-    const next = openIntents
-      .filter((i) => !skippedRef.current.has(i.id) && (cooldownRef.current.get(i.id) ?? 0) <= now)
-      .sort((a, b) => a.createdAt - b.createdAt)[0];
-    if (next) approveIntent(next);
-  }, [realMode, realAuto, insecure, isBound, openIntents, approveIntent]);
+  // Auto-execute via Phantom REMOVED — execution is handled exclusively by the
+  // autopilot + hot wallet (server-side signing). The old loop that auto-called
+  // approveIntent() on every open intent is deliberately gone: it required a
+  // Phantom popup per trade anyway, which is exactly what the hot wallet solves.
 
   const value = useMemo<RealWalletState>(() => ({
     loaded, realMode, realAuto, connected, boundWallet, isBound, binding, bindError,

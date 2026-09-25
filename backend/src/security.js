@@ -83,7 +83,7 @@ export function isSafeBaseUrl(value) {
 }
 
 /** Small in-memory limiter with periodic stale-entry pruning. */
-export function ipRateLimit({ max, windowMs }) {
+function createLimiter({ max, windowMs, keyOf }) {
   const entries = new Map();
   const prune = setInterval(() => {
     const now = Date.now();
@@ -91,7 +91,7 @@ export function ipRateLimit({ max, windowMs }) {
   }, Math.max(windowMs, 60_000));
   prune.unref?.();
   return (req, res, next) => {
-    const key = String(req.ip || req.socket?.remoteAddress || 'unknown');
+    const key = keyOf(req);
     const now = Date.now();
     let entry = entries.get(key);
     if (!entry || now > entry.resetAt) {
@@ -105,4 +105,27 @@ export function ipRateLimit({ max, windowMs }) {
     }
     next();
   };
+}
+
+/** Per-IP limiter — for pre-auth routes (login) and IP-scoped upstream quota. */
+export function ipRateLimit({ max, windowMs }) {
+  return createLimiter({
+    max,
+    windowMs,
+    keyOf: (req) => String(req.ip || req.socket?.remoteAddress || 'unknown'),
+  });
+}
+
+/**
+ * Per-user limiter keyed by `req.userId` (set by the auth guard). For
+ * post-auth routes: one IP with many users behind NAT/hotel must not
+ * cross-block, and a single user's dashboard polling gets an independent
+ * budget. Falls back to IP when unauthenticated so it can never be unbounded.
+ */
+export function userRateLimit({ max, windowMs }) {
+  return createLimiter({
+    max,
+    windowMs,
+    keyOf: (req) => `u:${req.userId ?? req.ip ?? req.socket?.remoteAddress ?? 'unknown'}`,
+  });
 }

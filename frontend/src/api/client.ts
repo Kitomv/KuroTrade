@@ -267,6 +267,11 @@ export interface RealIntent {
   status: 'open' | 'active' | 'done' | 'cancelled';
   createdAt: number;
   resolvedAt?: number;
+  /** Agent/LLM provenance so the UI can show WHY a trade is proposed. */
+  confidence?: number;
+  llmPowered?: boolean;
+  bullScore?: number | null;
+  bearScore?: number | null;
 }
 
 export interface SignalAccuracy {
@@ -343,7 +348,7 @@ export interface AutopilotConfig {
   nearMisses?: NearMissEntry[];
 }
 
-export type Page = 'overview' | 'trending' | 'watchlist' | 'chart' | 'trade' | 'portfolio' | 'agents' | 'leaderboard';
+export type Page = 'overview' | 'trending' | 'watchlist' | 'chart' | 'trade' | 'portfolio' | 'agents' | 'leaderboard' | 'settings';
 
 export interface HistoryPoint {
   priceUsd: number;
@@ -367,7 +372,13 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
       const parsed = JSON.parse(body);
       if (parsed.error) msg = parsed.error;
     } catch {}
-    throw new Error(msg);
+    // Carry the HTTP status so callers can tell a PERMANENT failure (400 bad
+    // request, 404 gone, 403 forbidden — retrying will never help) from a
+    // TRANSIENT one (5xx, 429). Without this the intent auto-retry loop spins
+    // on an unfixable error and floods the API until it rate-limits (429).
+    const err = new Error(msg) as Error & { status?: number };
+    err.status = res.status;
+    throw err;
   }
   return res.status === 204 ? (undefined as T) : res.json();
 }
@@ -573,11 +584,26 @@ export const api = {
   // --- Hot Wallet (server-side signing for 24/7 autopilot) ---
   /** Public metadata only — never returns the private key. */
   hotWalletStatus: () =>
-    req<{ exists: boolean; publicKey: string | null; createdAt?: number; updatedAt?: number }>(
+    req<{ exists: boolean; publicKey: string | null; createdAt?: number; updatedAt?: number; network?: string }>(
       '/api/real/hot-wallet/status',
     ),
   hotWalletGenerate: () =>
     req<{ ok: boolean; publicKey: string; createdAt: number }>('/api/real/hot-wallet/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }),
+  hotWalletBalance: () =>
+    req<{ exists: boolean; publicKey: string | null; balanceSol: number }>('/api/real/hot-wallet/balance'),
+  hotWalletWithdraw: (amountSol: number) =>
+    req<{ ok: boolean; signature: string; lamports: number; to: string; network: string }>('/api/real/hot-wallet/withdraw', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ amountSol }),
+    }),
+  /** Withdraw the full balance minus a fee buffer — server computes the amount. */
+  hotWalletWithdrawAll: () =>
+    req<{ ok: boolean; signature: string; lamports: number; to: string; network: string }>('/api/real/hot-wallet/withdraw-all', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({}),
@@ -611,5 +637,35 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ paused }),
+    }),
+
+  // --- EVM Hot Wallet (Base / multi-chain manual execution) ---
+  evmStatus: () =>
+    req<{ exists: boolean; address: string | null; createdAt?: number; updatedAt?: number }>('/api/real/evm/status'),
+  evmGenerate: () =>
+    req<{ ok: boolean; address: string; createdAt: number }>('/api/real/evm/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }),
+  evmImport: (privateKey: string) =>
+    req<{ ok: boolean; address: string; createdAt: number }>('/api/real/evm/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ privateKey }),
+    }),
+  evmBalance: (chain: 'base' = 'base') =>
+    req<{ exists: boolean; address: string | null; balanceNative: string }>(`/api/real/evm/balance?chain=${chain}`),
+  evmQuote: (params: { src: string; dst: string; amount: string; chain?: string }) =>
+    req<any>('/api/real/evm/quote', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    }),
+  evmSwap: (params: { src: string; dst: string; amount: string; slippage?: number; chain?: string }) =>
+    req<{ ok: boolean; txHash: string; explorer: string; from: string; src: string; dst: string; amount: string }>('/api/real/evm/swap', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
     }),
 };

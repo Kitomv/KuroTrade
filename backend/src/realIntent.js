@@ -45,6 +45,23 @@ function liveIntents(state) {
       delete intent.claimToken;
       changed = true;
     }
+    // Auto-cancel intents for chains this app cannot execute. Execution is
+    // Solana-only (@solana/web3.js + Jupiter), so a non-Solana intent can never
+    // be filled: it would sit 'open' forever and — via the buy-dedup guard —
+    // permanently block fresh signals for that token. Only cancel when the chain
+    // is a known, non-Solana string; a missing chainId is left alone (older
+    // Solana intents predate the field, and cancelling those would be wrong).
+    if (
+      (intent.status === 'open' || intent.status === 'active')
+      && typeof intent.chainId === 'string' && intent.chainId !== '' && intent.chainId !== 'solana'
+    ) {
+      intent.status = 'cancelled';
+      intent.resolvedAt = now;
+      intent.cancelReason = 'unsupported_chain';
+      delete intent.claimToken;
+      delete intent.claimedAt;
+      changed = true;
+    }
     out.push(intent);
   }
   if (changed) { state.intents = out; }
@@ -224,6 +241,65 @@ export function setHotWalletAuto(userId, enabled) {
 /** Get hot-wallet auto status. */
 export function isHotWalletAuto(userId) {
   return stateFor(userId).hotWalletAuto;
+}
+
+/**
+ * Mark an intent done from ANY live state, claiming it first when needed.
+ *
+ * Server-side executors (the hot wallet) bypass the browser claim flow, but the
+ * guarded state machine only allows `open -> active` and `active -> done`. A
+ * direct `open -> done` throws — and that failure happens AFTER the swap is
+ * already broadcast on-chain, leaving the intent `open` so the next tick could
+ * execute the SAME trade again (double spend). This helper closes that window.
+ */
+export function resolveIntentAsDone(userId, intentId, { force = false } = {}) {
+  const state = stateFor(userId);
+  const { intents } = liveIntents(state);
+  const intent = intents.find((i) => i.id === intentId);
+  if (!intent) throw new Error('Intent tidak ditemukan');
+  if (intent.status === 'done') return intent; // idempotent — never re-apply bookkeeping
+  if (force) {
+    // Last-resort close for a swap that is ALREADY BROADCAST on-chain. The
+    // claim-token guard exists to stop two browser tabs racing to resolve one
+    // intent; it must never be able to strand an executed trade. A stranded
+    // intent stays 'open' and the autopilot's next tick (or a user's manual
+    // retry) would execute the SAME trade a second time → double spend of real
+    // funds. The caller passes force only when on-chain execution is confirmed,
+    // so closing here is honest — the trade did happen.
+    if (intent.status === 'open') {
+      intent.claimToken = intent.claimToken || randomUUID();
+      intent.claimedAt = intent.claimedAt || Date.now();
+    }
+    intent.status = 'done';
+    intent.resolvedAt = Date.now();
+    // Apply the same side-effects the claim-based path applies (persistence
+    // mirrors the intent into the virtual ledger, so the two must agree).
+    if (intent.side === 'sell') {
+      reducePositionAmount(userId, intent.tokenAddress, intent.estTokens);
+      if (intent.source === 'TP1') {
+        updatePositionMetadata(userId, intent.tokenAddress, { tp1Hit: true });
+      }
+    } else if (intent.side === 'buy') {
+      addMirroredPosition(userId, {
+        tokenAddress: intent.tokenAddress,
+        symbol: intent.symbol,
+        chainId: intent.chainId,
+        tokens: intent.estTokens,
+        price: intent.intentPrice,
+      });
+    }
+    delete intent.claimToken;
+    delete intent.claimedAt;
+    state.intents = intents;
+    touch(userId);
+    return intent;
+  }
+  if (intent.status === 'open') {
+    const claimed = setRealIntentStatus(userId, intentId, 'active');
+    return setRealIntentStatus(userId, intentId, 'done', claimed.claimToken);
+  }
+  // 'active' → 'done' requires the matching claim token.
+  return setRealIntentStatus(userId, intentId, 'done', intent.claimToken);
 }
 
 export { buildBindMessage };

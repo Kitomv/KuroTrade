@@ -98,39 +98,26 @@ const nav: { page: Page; label: string; icon: JSX.Element; secondary?: boolean }
     ),
     secondary: true,
   },
+  {
+    page: 'settings',
+    label: 'Pengaturan',
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+        <circle cx="12" cy="12" r="3" />
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+      </svg>
+    ),
+    secondary: true,
+  },
 ];
 
-export function Sidebar({ page, onNavigate, username, onLogout, onChangePassword }: {
+export function Sidebar({ page, onNavigate, username }: {
   page: Page;
   onNavigate: (p: Page) => void;
   username?: string;
-  onLogout?: () => void;
-  onChangePassword?: (current: string, next: string) => Promise<void>;
 }) {
-  const [showPw, setShowPw] = useState(false);
+  // Change Password + Logout moved to the Pengaturan page (fewer mis-clicks).
   const [showMore, setShowMore] = useState(false);
-  const [curPw, setCurPw] = useState('');
-  const [newPw, setNewPw] = useState('');
-  const [pwErr, setPwErr] = useState('');
-  const [pwBusy, setPwBusy] = useState(false);
-
-  const submitPw = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!onChangePassword) return;
-    if (newPw.length < 8) { setPwErr('Password baru minimal 8 karakter'); return; }
-    setPwBusy(true);
-    setPwErr('');
-    try {
-      await onChangePassword(curPw, newPw);
-      setShowPw(false);
-      setCurPw('');
-      setNewPw('');
-    } catch (ex: any) {
-      setPwErr(ex.message ?? 'Gagal ganti password');
-    } finally {
-      setPwBusy(false);
-    }
-  };
 
   return (
     <nav className="sidebar" aria-label="Main navigation">
@@ -156,11 +143,8 @@ export function Sidebar({ page, onNavigate, username, onLogout, onChangePassword
             <div style={{ fontSize: 11, color: 'var(--muted)', padding: '6px 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               <span className="dot" style={{ width: 8, height: 8, marginRight: 6 }} />{username}
             </div>
-            <button className="btn" style={{ width: '100%', minHeight: 34, padding: '4px 8px', fontSize: 12, marginBottom: 6 }} onClick={() => setShowPw(true)}>
-              Ganti Password
-            </button>
-            <button className="btn" style={{ width: '100%', minHeight: 34, padding: '4px 8px', fontSize: 12 }} onClick={onLogout}>
-              Logout
+            <button className="btn" style={{ width: '100%', minHeight: 34, padding: '4px 8px', fontSize: 12 }} onClick={() => onNavigate('settings')}>
+              Akun &amp; Pengaturan
             </button>
           </div>
         </>
@@ -190,39 +174,7 @@ export function Sidebar({ page, onNavigate, username, onLogout, onChangePassword
                 <span>{label}</span>
               </button>
             ))}
-            <button type="button" className="nav-more-item" onClick={() => { setShowMore(false); setShowPw(true); }}>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-                <path d="M21 2l-2 2m-7.6 7.6a5.5 5.5 0 1 1-7.8 7.8 5.5 5.5 0 0 1 7.8-7.8zm0 0L15.5 7.5m2 2l2-2" />
-              </svg>
-              <span>Ganti Password</span>
-            </button>
-            <button type="button" className="nav-more-item" style={{ color: 'var(--down)', borderColor: 'rgba(239,68,68,.4)' }} onClick={() => { setShowMore(false); onLogout?.(); }}>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
-                <path d="M16 17l5-5-5-5M21 12H9" />
-              </svg>
-              <span>Logout{username ? ` (${username})` : ''}</span>
-            </button>
           </div>
-        </Modal>
-      )}
-
-      {showPw && (
-        <Modal title="Ganti Password" onClose={() => { setShowPw(false); setPwErr(''); }} maxWidth={380}>
-          <form onSubmit={submitPw} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            <label style={{ fontSize: 12, color: 'var(--muted)', fontWeight: 600 }}>
-              PASSWORD LAMA
-              <input type="password" className="input" style={{ width: '100%' }} value={curPw} onChange={(e) => setCurPw(e.target.value)} autoComplete="current-password" required />
-            </label>
-            <label style={{ fontSize: 12, color: 'var(--muted)', fontWeight: 600 }}>
-              PASSWORD BARU
-              <input type="password" className="input" style={{ width: '100%' }} value={newPw} onChange={(e) => setNewPw(e.target.value)} autoComplete="new-password" required />
-            </label>
-            {pwErr && <div className="error" style={{ margin: 0 }}>{pwErr}</div>}
-            <button type="submit" className="btn primary" style={{ width: '100%', minHeight: 42, fontWeight: 700 }} disabled={pwBusy}>
-              {pwBusy ? 'Menyimpan…' : 'Simpan Password Baru'}
-            </button>
-          </form>
         </Modal>
       )}
     </nav>

@@ -29,10 +29,11 @@ import {
 import { verifyUser, createSession, getUser, destroySession, seedAdminFromEnv,
   changePassword, destroyOtherSessions, listUsers as listAuthUsers, getUserById, adminSetPassword, deleteUser } from './auth.js';
 import { flushAll, cleanupTempFiles } from './persistence.js';
-import { securityHeaders, redact, sanitizeError, ipRateLimit, isSafeBaseUrl } from './security.js';
+import { securityHeaders, redact, sanitizeError, ipRateLimit, userRateLimit, isSafeBaseUrl } from './security.js';
 import {
   generateHotWallet, importHotWallet, getHotWalletPublicInfo, getMasterKey,
   executeIntentWithHotWallet, isEmergencyPaused, setEmergencyPaused, resolveTokenDecimals,
+  getSolanaRpcUrl,
 } from './hotWallet.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -99,7 +100,11 @@ const wrap = (fn) => (req, res) => {
 // or that can burn money/upstream quota. The per-user rateLimit() below is
 // keyed by req.userId and cannot stop distributed floods or pre-auth probing.
 const loginLimiter = ipRateLimit({ max: 20, windowMs: 60_000 });
-app.use('/api/real', ipRateLimit({ max: 60, windowMs: 60_000 }));   // quotes/swap/bind/intents
+// Post-auth, keyed by userId. The dashboard polls ~10 distinct /api/real
+// endpoints (hot-wallet status/auto/pause/balance, intents, mode, auto, bound)
+// — at 15s each that is ~40 req/min, so 300 leaves generous headroom for
+// manual actions without ever tripping during normal use.
+app.use('/api/real', userRateLimit({ max: 300, windowMs: 60_000 }));
 app.use('/api/llm', ipRateLimit({ max: 30, windowMs: 60_000 }));    // config saves + provider probes
 
 // Simple per-IP brute-force guard: max 10 failed logins per 5 minutes.
@@ -217,14 +222,32 @@ app.get('/api/leaderboard', (req, res) => {
 
 // --- Real trading: Jupiter proxy (stateless, no private keys touch the server) ---
 const JUPITER_BASE = process.env.JUPITER_API_BASE || 'https://lite-api.jup.ag/swap/v1';
+
+// Jupiter's aggregator only exists on mainnet — there is no devnet deployment.
+// On devnet the mints/route simply don't exist, so every swap would fail deep
+// inside Jupiter as an opaque 500. Fail fast with an actionable message instead.
+function jupiterNetworkGuard(res) {
+  const net = (process.env.NETWORK || 'mainnet').toLowerCase();
+  if (net !== 'mainnet') {
+    res.status(400).json({
+      error: `Jupiter hanya tersedia di mainnet (NETWORK=${net}). Swap dana asli tidak bisa dites di devnet — set NETWORK=mainnet di backend/.env untuk trading sungguhan.`,
+    });
+    return false;
+  }
+  return true;
+}
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
-async function jupiterFetch(path, body) {
+async function jupiterFetch(path, opts = {}) {
+  const { method = 'GET', body } = opts;
   const res = await fetch(`${JUPITER_BASE}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(process.env.JUPITER_API_KEY ? { 'x-api-key': process.env.JUPITER_API_KEY } : {}) },
-    body: JSON.stringify(body),
+    method,
+    headers: {
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+      ...(process.env.JUPITER_API_KEY ? { 'x-api-key': process.env.JUPITER_API_KEY } : {}),
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
     signal: AbortSignal.timeout(15_000),
   });
   if (!res.ok) {
@@ -235,6 +258,7 @@ async function jupiterFetch(path, body) {
 }
 
 app.post('/api/real/quote', rateLimit('quote', 20), wrap(async (req, res) => {
+  if (!jupiterNetworkGuard(res)) return;
   const { inputMint, outputMint, amount, slippageBps } = req.body ?? {};
   if (!BASE58_RE.test(String(inputMint)) || !BASE58_RE.test(String(outputMint))) {
     return res.status(400).json({ error: 'inputMint/outputMint harus alamat mint base58 valid' });
@@ -242,7 +266,7 @@ app.post('/api/real/quote', rateLimit('quote', 20), wrap(async (req, res) => {
   const amt = Number(amount);
   if (!Number.isFinite(amt) || amt <= 0) return res.status(400).json({ error: 'amount harus > 0 (satuan terkecil, mis. lamports)' });
   const slip = Math.min(500, Math.max(1, Number(slippageBps) || 100)); // cap 5%
-  const q = await jupiterFetch(`/quote?inputMint=${encodeURIComponent(inputMint)}&outputMint=${encodeURIComponent(outputMint)}&amount=${Math.floor(amt)}&slippageBps=${slip}`, undefined);
+  const q = await jupiterFetch(`/quote?inputMint=${encodeURIComponent(inputMint)}&outputMint=${encodeURIComponent(outputMint)}&amount=${Math.floor(amt)}&slippageBps=${slip}`, { method: 'GET' });
   res.json({
     inAmount: q.inAmount,
     outAmount: q.outAmount,
@@ -260,7 +284,7 @@ async function getTokenDecimals(mint) {
   const hit = decimalsCache.get(mint);
   if (hit && Date.now() - hit.at < 3_600_000) return hit.decimals;
   try {
-    const res = await fetch(`https://lite-api.jup.ag/tokens/v2/search?query=${encodeURIComponent(mint)}`, { signal: AbortSignal.timeout(8_000) });
+    const res = await fetch(`https://lite-api.jup.ag/tokens/v2/search?query=${encodeURIComponent(mint)}`, { method: 'GET', signal: AbortSignal.timeout(8_000) });
     if (!res.ok) throw new Error(`token api ${res.status}`);
     const data = await res.json();
     const found = (Array.isArray(data) ? data : []).find((t) => t.address === mint) ?? (Array.isArray(data) ? data[0] : null);
@@ -275,6 +299,7 @@ async function getTokenDecimals(mint) {
 }
 
 app.post('/api/real/swap-tx', rateLimit('quote', 20), wrap(async (req, res) => {
+  if (!jupiterNetworkGuard(res)) return;
   // Intent-bound swap (audit M3): with `intentId` the server rebuilds the quote
   // from the stored intent (side, mints, amounts, slippage ≤ 1%) — the client
   // cannot control what gets signed. Without it, manual flow still requires a
@@ -304,8 +329,8 @@ app.post('/api/real/swap-tx', rateLimit('quote', 20), wrap(async (req, res) => {
       inputMint = intent.tokenAddress; outputMint = SOL_MINT; amount = atomic;
     }
 
-    const q = await jupiterFetch(`/quote?inputMint=${encodeURIComponent(inputMint)}&outputMint=${encodeURIComponent(outputMint)}&amount=${amount}&slippageBps=100`, undefined);
-    const swap = await jupiterFetch('/swap', { quoteResponse: q, userPublicKey, wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true });
+    const q = await jupiterFetch(`/quote?inputMint=${encodeURIComponent(inputMint)}&outputMint=${encodeURIComponent(outputMint)}&amount=${amount}&slippageBps=100`, { method: 'GET' });
+    const swap = await jupiterFetch('/swap', { method: 'POST', body: { quoteResponse: q, userPublicKey, wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true } });
     if (!swap.swapTransaction) throw new Error('Jupiter tidak mengembalikan swapTransaction');
     return res.json({ swapTransaction: swap.swapTransaction, intentId });
   }
@@ -334,7 +359,7 @@ app.post('/api/real/swap-tx', rateLimit('quote', 20), wrap(async (req, res) => {
   if (effectiveSlippage < 1 || effectiveSlippage > 500) {
     return res.status(400).json({ error: 'quoteResponse.slippageBps harus 1-500 (maks 5%)' });
   }
-  const swap = await jupiterFetch('/swap', { quoteResponse, userPublicKey, wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true });
+  const swap = await jupiterFetch('/swap', { method: 'POST', body: { quoteResponse, userPublicKey, wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true } });
   if (!swap.swapTransaction) throw new Error('Jupiter tidak mengembalikan swapTransaction');
   res.json({ swapTransaction: swap.swapTransaction });
 }));
@@ -460,10 +485,77 @@ app.get('/api/real/hot-wallet/status', async (req, res) => {
   }
 });
 
+// Read-only SOL balance of the hot wallet, so the UI can show funding state.
+app.get('/api/real/hot-wallet/balance', async (req, res) => {
+  try {
+    const { getHotWalletBalance } = await import('./hotWallet.js');
+    res.json(await getHotWalletBalance(req.userId));
+  } catch (e) {
+    res.status(500).json({ error: sanitizeError(e.message) });
+  }
+});
+
+// Withdraw SOL from the hot wallet back to the user's BOUND Phantom wallet.
+/** Withdraw all SOL except a small fee buffer. Server-side computation avoids
+ * client truncation issues (front-end sends 4-decimal balance, backend floors
+ * and subtracts fee → insufficient error when user sees "enough" in UI). */
+app.post('/api/real/hot-wallet/withdraw-all', async (req, res) => {
+  try {
+    const { withdrawFromHotWallet, getHotWalletBalance, getSolanaConnection } = await import('./hotWallet.js');
+    const masterKey = getMasterKey();
+    const info = await getHotWalletBalance(req.userId);
+    if (!info.exists) {
+      return res.status(400).json({ error: 'Hot wallet belum dibuat' });
+    }
+    const conn = getSolanaConnection();
+    const balanceLamports = Math.floor(info.balanceSol * 1_000_000_000);
+
+    // Solana requires the SENDER account to stay rent-exempt (~890,880 lamports)
+    // in addition to paying the tx fee. Sending more than
+    // (balance − rentExempt − txFee) fails simulation with InsufficientFundsForRent.
+    const minRentLamports = await conn.getMinimumBalanceForRentExemption(0);
+    const TX_FEE_BUFFER = 5_000;
+    const sendable = balanceLamports - minRentLamports - TX_FEE_BUFFER;
+    if (sendable <= 0) {
+      return res.status(400).json({
+        error: `Saldo tidak cukup untuk menarik — butuh minimal ${((minRentLamports + TX_FEE_BUFFER) / 1e9).toFixed(6)} SOL (rent + fee)`,
+      });
+    }
+
+    const result = await withdrawFromHotWallet(req.userId, sendable, { masterKey });
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ error: sanitizeError(e.message) });
+  }
+});
+
+// Destination is never client-supplied — it is read from the bind state, so a
+// compromised session cannot redirect funds to an attacker address.
+app.post('/api/real/hot-wallet/withdraw', async (req, res) => {
+  try {
+    const { withdrawFromHotWallet } = await import('./hotWallet.js');
+    const { amountSol } = req.body ?? {};
+    const sol = Number(amountSol);
+    if (!Number.isFinite(sol) || sol <= 0) {
+      return res.status(400).json({ error: 'amountSol harus angka > 0' });
+    }
+    const lamports = Math.floor(sol * 1_000_000_000);
+    const masterKey = getMasterKey();
+    const result = await withdrawFromHotWallet(req.userId, lamports, { masterKey });
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ error: sanitizeError(e.message) });
+  }
+});
+
 // Generate new hot wallet for userId (private key encrypted at server, never exposed)
 app.post('/api/real/hot-wallet/generate', async (req, res) => {
   try {
-    const { generateHotWallet } = await import('./hotWallet.js');
+    const { getHotWalletPublicInfo, generateHotWallet } = await import('./hotWallet.js');
+    const info = getHotWalletPublicInfo(req.userId);
+    if (info.exists) {
+      return res.status(400).json({ error: `Hot wallet sudah ada (${info.publicKey}). Hapus dulu kalau mau buat baru.` });
+    }
     const masterKey = getMasterKey();
     const result = generateHotWallet(req.userId, masterKey);
     res.json({ ok: true, ...result });
@@ -478,7 +570,11 @@ app.post('/api/real/hot-wallet/generate', async (req, res) => {
 // Import existing secret key (must be 64-byte Uint8Array Ed25519 format)
 app.post('/api/real/hot-wallet/import', async (req, res) => {
   try {
-    const { importHotWallet } = await import('./hotWallet.js');
+    const { importHotWallet, getHotWalletPublicInfo } = await import('./hotWallet.js');
+    const info = getHotWalletPublicInfo(req.userId);
+    if (info.exists) {
+      return res.status(400).json({ error: `Hot wallet sudah ada (${info.publicKey}). Hapus dulu kalau mau import yang baru.` });
+    }
     const { secretKey } = req.body ?? {};
     if (!secretKey || !Array.isArray(secretKey)) {
       return res.status(400).json({ error: 'secretKey harus array of numbers (64 byte Ed25519)' });
@@ -511,23 +607,37 @@ app.post('/api/real/hot-wallet/execute-intent', async (req, res) => {
       masterKey,
       getTokenDecimalsFn: resolveTokenDecimals, // shared decimals resolver for SELL
     });
-    // Mark as done since we've executed it
-    const { setRealIntentStatus } = await import('./realIntent.js');
-    setRealIntentStatus(req.userId, intentId, 'done');
+    // The swap is already broadcast — closing the intent MUST NOT fail. A direct
+    // open→done would throw on the guarded state machine and leave it open for a
+    // second execution (double spend). force:true closes unconditionally, which
+    // is honest here because on-chain execution is already confirmed.
+    try {
+      const { resolveIntentAsDone } = await import('./realIntent.js');
+      resolveIntentAsDone(req.userId, intentId, { force: true });
+    } catch (closeErr) {
+      console.error(`[hot-wallet] intent ${intentId} executed but could not be closed:`, sanitizeError(closeErr.message));
+    }
     res.json({ ok: true, ...result });
   } catch (e) {
     res.status(500).json({ error: sanitizeError(e.message) });
   }
 });
 
-// Auto-execute toggle: when enabled, autopilot intents auto-execute via hot wallet
+// Auto-execute toggle: when enabled, autopilot intents are signed + broadcast
+// server-side by the hot wallet instead of waiting for a Phantom approval.
+// Persisted per-user (realIntent state), NOT in process.env — a process-wide
+// flag would let one user's toggle enable auto-trading for every user.
 app.get('/api/real/hot-wallet/auto', async (req, res) => {
-  res.json({ autoEnabled: Boolean(process.env.HOT_WALLET_AUTO_ENABLED) === true });
+  const { isHotWalletAuto } = await import('./realIntent.js');
+  res.json({ autoEnabled: isHotWalletAuto(req.userId) });
 });
 app.post('/api/real/hot-wallet/auto', async (req, res) => {
   const { autoEnabled } = req.body ?? {};
-  process.env.HOT_WALLET_AUTO_ENABLED = String(Boolean(autoEnabled)).toLowerCase();
-  res.json({ ok: true, autoEnabled: process.env.HOT_WALLET_AUTO_ENABLED === 'true' });
+  const { setHotWalletAuto, isRealMode } = await import('./realIntent.js');
+  if (autoEnabled && !isRealMode(req.userId)) {
+    return res.status(400).json({ error: 'Nyalakan Real Wallet Mode dulu sebelum auto-execute hot wallet' });
+  }
+  res.json(setHotWalletAuto(req.userId, Boolean(autoEnabled)));
 });
 
 // Emergency pause switch: globally disable all hot-wallet auto-execution
@@ -535,11 +645,92 @@ app.get('/api/real/hot-wallet/emergency-pause', async (req, res) => {
   const { isEmergencyPaused } = await import('./hotWallet.js');
   res.json({ paused: isEmergencyPaused() });
 });
-app.post('/api/real/hot-wallet/emergency-pause', async (req, res) => {
+// ADMIN ONLY: emergencyPaused is process-global (hotWallet.js) — it stops or
+// re-arms autopilot for EVERY user, so a non-admin must not be able to flip it.
+app.post('/api/real/hot-wallet/emergency-pause', requireAdmin, async (req, res) => {
   const { paused } = req.body ?? {};
   const { setEmergencyPaused } = await import('./hotWallet.js');
   setEmergencyPaused(Boolean(paused));
   res.json({ ok: true, paused: Boolean(paused) });
+});
+
+// --- EVM (Base) hot wallet — Multi-chain trading, MANUAL execution only ---
+// Shared master key + per-user AES-GCM keystore, separate from the SOL hot wallet.
+const VALID_CHAINS = new Set(['base']);
+
+app.get('/api/real/evm/status', async (req, res) => {
+  const { getEvmWalletStatus } = await import('./evmWallet.js');
+  res.json(getEvmWalletStatus(req.userId));
+});
+
+app.post('/api/real/evm/generate', async (req, res) => {
+  try {
+    const { generateEvmWallet, getEvmWalletStatus, getMasterKey } = await import('./evmWallet.js');
+    if (getEvmWalletStatus(req.userId).exists) {
+      return res.status(400).json({ error: 'EVM wallet sudah ada — hapus dulu untuk buat baru' });
+    }
+    res.json({ ok: true, ...generateEvmWallet(req.userId, getMasterKey()) });
+  } catch (e) {
+    res.status(500).json({ error: sanitizeError(e.message) });
+  }
+});
+
+app.post('/api/real/evm/import', async (req, res) => {
+  try {
+    const { importEvmWallet, getEvmWalletStatus, getMasterKey } = await import('./evmWallet.js');
+    if (getEvmWalletStatus(req.userId).exists) {
+      return res.status(400).json({ error: 'EVM wallet sudah ada — hapus dulu untuk import' });
+    }
+    const { privateKey } = req.body ?? {};
+    if (!privateKey || typeof privateKey !== 'string') {
+      return res.status(400).json({ error: 'privateKey (hex) required' });
+    }
+    res.json({ ok: true, ...importEvmWallet(req.userId, privateKey, getMasterKey()) });
+  } catch (e) {
+    res.status(500).json({ error: sanitizeError(e.message) });
+  }
+});
+
+app.get('/api/real/evm/balance', async (req, res) => {
+  try {
+    const { getEvmBalance } = await import('./evmWallet.js');
+    const chain = VALID_CHAINS.has(String(req.query.chain)) ? req.query.chain : 'base';
+    res.json(await getEvmBalance(req.userId, chain));
+  } catch (e) {
+    res.status(500).json({ error: sanitizeError(e.message) });
+  }
+});
+
+app.post('/api/real/evm/quote', async (req, res) => {
+  try {
+    const { evmQuote } = await import('./evmWallet.js');
+    const { src, dst, amount } = req.body ?? {};
+    if (!src || !dst || !Number.isFinite(Number(amount)) || Number(amount) <= 0) {
+      return res.status(400).json({ error: 'src, dst, amount (number > 0) required' });
+    }
+    const chain = VALID_CHAINS.has(String(req.body.chain)) ? req.body.chain : 'base';
+    const result = await evmQuote(req.userId, { src, dst, amount, chain });
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: sanitizeError(e.message) });
+  }
+});
+
+// MANUAL swap: server signs + broadcasts; frontend shows a confirm dialog first.
+// Never uses Phantom. Emergency pause (admin) blocks it.
+app.post('/api/real/evm/swap', async (req, res) => {
+  try {
+    const { executeEvmSwap } = await import('./evmWallet.js');
+    const { src, dst, amount, slippage = 100, chain } = req.body ?? {};
+    if (!src || !dst || !Number.isFinite(Number(amount)) || Number(amount) <= 0) {
+      return res.status(400).json({ error: 'src, dst, amount (number > 0) required' });
+    }
+    const resolvedChain = VALID_CHAINS.has(String(chain)) ? chain : 'base';
+    const result = await executeEvmSwap(req.userId, { src, dst, amount, slippage, chain: resolvedChain });
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: sanitizeError(e.message) });
+  }
 });
 
 // --- Per-user rate limits for heavy AI endpoints ---
@@ -855,6 +1046,48 @@ setInterval(() => {
 }, 5 * 60 * 1000).unref?.();
 
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
+
+// --- Solana JSON-RPC proxy (same-origin) ---
+// The browser cannot call public RPCs reliably: api.mainnet-beta.solana.com
+// returns 403 to browser origins, and shipping a paid RPC key to the client
+// would leak it to anyone who opens devtools. The backend already holds the
+// configured RPC (BACKEND_SOLANA_RPC / NETWORK), so the wallet UI reads chain
+// state through this same-origin passthrough instead. Read methods only — this
+// is for balances/account reads, not for broadcasting (signing stays client-side
+// with Phantom, and the hot wallet never exposes its key).
+const RPC_READ_METHODS = new Set([
+  'getBalance', 'getAccountInfo', 'getMultipleAccounts', 'getTokenAccountBalance',
+  'getParsedTokenAccountsByOwner', 'getTokenAccountsByOwner', 'getLatestBlockhash',
+  'getRecentBlockhash', 'getFeeForMessage', 'getMinimumBalanceForRentExemption',
+  'getSignatureStatuses', 'getTransaction', 'getEpochInfo', 'getVersion',
+  'getSlot', 'getBlockHeight', 'getHealth', 'simulateTransaction',
+]);
+app.post('/api/rpc', userRateLimit({ max: 600, windowMs: 60_000 }), wrap(async (req, res) => {
+  const body = req.body;
+  if (!body || typeof body !== 'object') return res.status(400).json({ error: 'JSON-RPC body required' });
+  // Batch requests arrive as arrays — reject to keep the method allow-list simple
+  // and unambiguous (the wallet adapter only sends single calls).
+  if (Array.isArray(body)) return res.status(400).json({ error: 'Batch request tidak didukung' });
+  const method = String(body.method ?? '');
+  if (!RPC_READ_METHODS.has(method)) {
+    return res.status(403).json({ error: `Method RPC "${method}" tidak diizinkan lewat proxy` });
+  }
+  const rpcUrl = getSolanaRpcUrl();
+  const upstream = await fetch(rpcUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(process.env.HELIUS_API_KEY ? { 'x-api-key': process.env.HELIUS_API_KEY } : {}),
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(20_000),
+  });
+  const text = await upstream.text();
+  if (!upstream.ok) {
+    return res.status(upstream.status).json({ error: `RPC upstream ${upstream.status}: ${sanitizeError(text)}` });
+  }
+  res.type('application/json').send(text);
+}));
 
 // Serve built frontend if present
 app.use(express.static(join(__dirname, '../../frontend/dist')));

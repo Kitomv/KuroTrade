@@ -8,9 +8,8 @@ import { useToast } from '../components/ToastProvider';
 import { useConfirm } from '../components/ConfirmDialog';
 import { StaleBadge } from '../components/StaleBadge';
 import { useRealWallet } from '../components/RealWalletContext';
-import { RealTradePanel, PendingIntents } from '../components/RealTradePanel';
-import { RealWalletBalance } from '../components/RealWalletBalance';
-import { HotWalletPanel } from '../components/HotWalletPanel';
+import { RealWalletPortfolio } from '../components/RealWalletPortfolio';
+import { PendingIntents } from '../components/RealTradePanel';
 
 export interface PortfolioData {
   wallet: Wallet;
@@ -23,12 +22,9 @@ export interface PortfolioData {
 
 export function Portfolio() {
   const { realMode, realAuto, connected, isBound } = useRealWallet();
-    // Skip virtual polling entirely while real mode is on.
-  const p = usePolling<PortfolioData | undefined>(
-    () => (realMode ? Promise.resolve(undefined) : api.portfolio()),
-    2_500,
-    [realMode],
-  );
+  // The summary is the same in both modes — keep polling the virtual ledger so
+  // the page never goes blank when real mode is switched on.
+  const p = usePolling<PortfolioData | undefined>(() => api.portfolio(), 2_500, []);
   const data = p.data;
   const wallet = data?.wallet;
   const positions = data?.positions;
@@ -168,40 +164,23 @@ export function Portfolio() {
     })
     .sort((a, b) => b.value - a.value);
 
-  // REAL mode → this page shows the on-chain wallet (balances, manual swap,
-  // pending intents) instead of the virtual ledger. Virtual data below is not
-  // rendered in this branch (poll short-circuits via the realMode guard above).
   if (realMode) {
+    // REAL mode → the page shows the on-chain wallet (balances + swap dialog),
+    // not the virtual paper-trading ledger.
     return (
       <>
-        <div className="page-head" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 14 }}>
-          <div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
-              <h1>Portfolio</h1>
-              <span className="chip" style={{ background: 'var(--down-bg)', color: 'var(--down)', fontSize: 11, fontWeight: 700, border: '1px solid rgba(239,68,68,.4)' }}>
-                REAL · PHANTOM{realAuto ? ' · AUTO' : ''}
-              </span>
-              {connected && (isBound ? (
-                <span className="chip" style={{ background: 'var(--up-bg)', color: 'var(--up)', fontSize: 11 }}>Wallet ter-bind</span>
-              ) : (
-                <span className="chip" style={{ background: 'rgba(245,158,11,.15)', color: 'var(--accent)', fontSize: 11 }}>Belum bind</span>
-              ))}
-            </div>
-            <p>Dana asli di wallet Phantom — saldo on-chain, swap manual, dan intent autopilot. Ganti ke virtual lewat tombol di banner atas atau panel Real Wallet.</p>
+        <div className="page-head">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4, flexWrap: 'wrap' }}>
+            <h1 style={{ margin: 0 }}>Portfolio</h1>
+            <span className="chip" style={{ background: 'var(--down-bg)', color: 'var(--down)', fontSize: 11, fontWeight: 700, border: '1px solid rgba(239,68,68,.4)' }}>
+              REAL · DANA ASLI{realAuto ? ' · AUTO' : ''}
+            </span>
           </div>
+          <p>Detail wallet on-chain (dana asli). Ganti ke virtual lewat panel Real Wallet di sidebar.</p>
         </div>
 
-        {connected && !isBound && (
-          <div className="error" style={{ width: '100%', marginBottom: 16, background: 'rgba(245,158,11,.14)' }}>
-            Bind wallet dulu (panel Real Wallet di sidebar) sebelum bisa swap dana asli.
-          </div>
-        )}
-
-        <RealTradePanel />
-        <RealWalletBalance />
+        <RealWalletPortfolio />
         <PendingIntents />
-        {/* Server-side signing for 24/7 autopilot (no Phantom popup per order). */}
-        <HotWalletPanel />
       </>
     );
   }

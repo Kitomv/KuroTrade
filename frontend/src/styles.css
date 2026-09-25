@@ -676,6 +676,37 @@ button.chip:hover { opacity: .85; box-shadow: 0 0 8px var(--accent-glow); } /* c
 }
 .btn.icon { padding: 10px; font-size: 13px; }
 
+/* --- Hot-wallet state buttons ---
+   Real-money controls must never be two stateless reds: the auto-execute and
+   emergency-pause buttons each get a distinct fill per state (outline / pulsing
+   outline / solid) so "OFF" and "PAUSED" can't be confused at a glance. */
+.btn-danger { background: transparent; border-color: rgba(239,68,68,.45); color: var(--down); }
+.btn-danger:hover:not(:disabled) { background: var(--down-bg); border-color: rgba(239,68,68,.6); }
+.btn-danger-solid { background: var(--down); border-color: var(--down); color: #fff; }
+.btn-danger-solid:hover:not(:disabled) { background: #dc2626; border-color: #dc2626; box-shadow: 0 0 16px rgba(239,68,68,.3); }
+.btn-danger-on { background: rgba(239,68,68,.16); border-color: rgba(239,68,68,.5); color: var(--down); }
+.btn-danger-on:hover:not(:disabled) { background: rgba(239,68,68,.24); }
+.btn-danger-on .hwp-dot { animation: pulse-dot 1.6s ease-in-out infinite; }
+.hwp-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex: none; }
+.hwp-balance {
+  font-family: var(--font-heading);
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  color: var(--text);
+  white-space: nowrap;
+}
+.hwp-key {
+  font-family: var(--font-body);
+  font-size: 12px;
+  word-break: break-all;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  color: var(--muted);
+  max-width: 100%;
+}
+
 /* --- Forms --- */
 .input {
   min-height: 44px;

@@ -16,5 +16,9 @@ frontend/dist/
 # Logs / env
 *.log
 .env
+.env.backup
 .env.*
 !.env.example
+
+#Uneccesary
+.claude

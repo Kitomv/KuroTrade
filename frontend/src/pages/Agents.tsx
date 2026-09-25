@@ -8,15 +8,22 @@ import { Modal } from '../components/Modal';
 import { useToast } from '../components/ToastProvider';
 import { useConfirm } from '../components/ConfirmDialog';
 import { StaleBadge } from '../components/StaleBadge';
-import { HotWalletPanel } from '../components/HotWalletPanel';
+import { RealTradeForm } from '../components/RealTradeForm';
+import { useHotWallet } from '../components/HotWalletContext';
+import { shortAddr } from '../lib/solana';
+import type { Page } from '../api/client';
 
 const logTags = ['ALL', 'BUY', 'TP', 'SELL', 'SL', 'WARN', 'SCAN', 'ROTATE', 'CONFIG'] as const;
 type LogTag = (typeof logTags)[number];
 
-export function Agents() {
+export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
+  const hotWallet = useHotWallet();
   const [tokenAddr, setTokenAddr] = useState('');
   const [analyzing, setAnalyzing] = useState(false);
   const [report, setReport] = useState<AgentReport | null>(null);
+  // Real-mode swap prefill: the AI-Debate result's "Eksekusi" button opens
+  // RealTradeForm with this token/amount instead of placing a virtual order.
+  const [radarTrade, setRadarTrade] = useState<AgentReport | null>(null);
   const [err, setErr] = useState('');
   const [tradeSuccess, setTradeSuccess] = useState('');
   const [executingTrade, setExecutingTrade] = useState(false);
@@ -54,8 +61,8 @@ export function Agents() {
   const [enableLeadSynthesis, setEnableLeadSynthesis] = useState(true);
   // Real-wallet auto-approve switch in the Guardian drawer (polled + toggleable).
   const [realMode, setRealMode] = useState(false);
-  const [realAuto, setRealAuto] = useState(false);
-  const [realSaving, setRealSaving] = useState(false);
+  // Real-wallet auto-approve was removed (autopilot + hot wallet execute now).
+  // No local realAuto state needed — realMode only.
 
   // LLM Modal State
   // LLM Modal State — multi-provider stack (fallback chain / role routing)
@@ -91,44 +98,30 @@ export function Agents() {
 
   const visibleLogs = (autopilot?.logs ?? []).filter((l) => tagFilter === 'ALL' || l.tag === tagFilter);
 
-  // Real wallet mode + auto-approve status (10s poll; Portfolio toggle reflects
-  // within 10s). Toggle handler mirrors the RealTradingSection danger confirm.
+  // Real wallet mode + auto-approve status (15s poll; Portfolio toggle reflects
+  // within 15s). Paused while hidden — this page already polls 4 other
+  // endpoints, and an unwatched tab must not keep spending the rate limit.
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
       try {
-        const [m, a] = await Promise.all([api.realMode(), api.realAuto().catch(() => ({ realAuto: false }))]);
+        const [m] = await Promise.all([api.realMode()]);
         if (cancelled) return;
         setRealMode(m.realMode);
-        setRealAuto(a.realAuto);
       } catch {}
     };
-    load();
-    const id = setInterval(load, 10_000);
-    return () => { cancelled = true; clearInterval(id); };
+    let id: ReturnType<typeof setInterval> | null = null;
+    const start = () => {
+      if (id || cancelled) return;
+      load();
+      id = setInterval(load, 15_000);
+    };
+    const stop = () => { if (id) { clearInterval(id); id = null; } };
+    const onVisibility = () => (document.hidden ? stop() : start());
+    document.addEventListener('visibilitychange', onVisibility);
+    start();
+    return () => { cancelled = true; stop(); document.removeEventListener('visibilitychange', onVisibility); };
   }, []);
-
-  const toggleRealAuto = async () => {
-    if (!realMode) return; // auto needs real mode; drawer shows hint instead
-    if (realAuto) {
-      setRealSaving(true);
-      try { await api.setRealAuto(false); setRealAuto(false); toast.showToast('Auto-approve dimatikan', 'success'); }
-      catch (e: any) { toast.showToast(e.message ?? 'Gagal matikan auto-approve', 'error'); }
-      setRealSaving(false);
-      return;
-    }
-    const ok = await confirmAction({
-      title: 'Nyalakan Auto-Execute Real?',
-      message: 'Semua BUY/SELL autopilot (termasuk SL/TP/rotasi) langsung menjalankan flow swap TANPA klik Approve. Tidak ada batas USD. Phantom tetap popup tiap transaksi — Reject = intent di-skip.',
-      confirmLabel: 'Ya, auto-execution',
-      danger: true,
-    });
-    if (!ok) return;
-    setRealSaving(true);
-    try { await api.setRealAuto(true); setRealAuto(true); toast.showToast('Auto-approve NYALA — dana asli bergerak otomatis', 'error'); }
-    catch (e: any) { toast.showToast(e.message ?? 'Gagal nyalakan auto-approve', 'error'); }
-    setRealSaving(false);
-  };
 
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -299,6 +292,18 @@ export function Agents() {
 
     const side = verdict.signal.includes('BUY') ? 'buy' : 'sell';
     const sideLabel = side === 'buy' ? 'BUY' : 'SELL';
+
+    if (realMode) {
+      // Real mode → open RealTradeForm modal with token/amount prefilled.
+      // RealTradeForm will handle quote → swap → Phantom sign → broadcast.
+      setRadarTrade({
+        ...report,
+        token: { ...token, symbol: token.symbol, name: token.name, chainId: token.chainId, priceUsd: verdict.entryPrice },
+      });
+      return;
+    }
+
+    // Virtual mode → existing virtual order flow.
     const ok = await confirmAction({
       title: `Eksekusi ${sideLabel} ${token.symbol}`,
       message: `Eksekusi order virtual ${sideLabel} ${token.symbol} @ $${verdict.entryPrice} ($${verdict.recommendedUsd} USDC)?`,
@@ -700,30 +705,6 @@ export function Agents() {
                 <option value="high">High (35% Saldo)</option>
               </select>
             </div>
-            <div>
-              <label style={{ display: 'block', fontSize: 12, color: 'var(--muted)', marginBottom: 4, fontWeight: 600 }}>Real Auto-Approve</label>
-              <button
-                type="button"
-                className="btn"
-                style={{
-                  width: '100%', minHeight: 44, fontWeight: 700, fontSize: 12,
-                  background: realAuto ? 'rgba(239,68,68,.18)' : 'var(--panel-2)',
-                  borderColor: realAuto ? 'rgba(239,68,68,.5)' : 'var(--border)',
-                  color: realAuto ? 'var(--down)' : 'var(--muted)',
-                  opacity: realMode ? 1 : 0.5,
-                }}
-                disabled={realSaving || !realMode}
-                onClick={toggleRealAuto}
-                title={realMode ? 'Intent real wallet langsung dieksekusi (Phantom tetap tanda tangan)' : 'Nyalakan Real Wallet Mode dulu di halaman Portfolio'}
-              >
-                {realSaving ? 'Menyimpan…' : realAuto ? '⛔ AUTO-EXECUTE ON' : realMode ? 'Auto-Approve: OFF (manual)' : 'Butuh Real Mode'}
-              </button>
-              <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
-                {realMode
-                  ? realAuto ? 'BUY/SELL real langsung jalan — tanpa batas USD.' : 'Default: approve manual tiap intent di Phantom.'
-                  : 'Real mode mati — Auto-Pilot jalan di virtual.'}
-              </div>
-            </div>
             <div style={{ display: 'flex', alignItems: 'flex-end' }}>
               <button type="submit" className="btn primary" style={{ width: '100%', minHeight: 44 }}>
                 Simpan Aturan Guardian
@@ -927,6 +908,113 @@ export function Agents() {
           <span style={{ fontSize: 12, color: 'var(--muted)' }}>{ap.pnlHistory?.length ?? 0} titik · refresh 2s</span>
         </div>
         <EquityChart points={ap.pnlHistory ?? []} />
+      </div>
+
+      {/* Hot-wallet status is read-only here on purpose: create/import/auto-execute
+          live on the Pengaturan page so a stray click can't move real funds
+          mid-session. This strip only reports what the autopilot is doing. */}
+      <div className="card" style={{ padding: 14, marginBottom: 24, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 12 }}>
+        <IconKey size={14} />
+        <strong style={{ fontSize: 13 }}>Hot Wallet</strong>
+        <span
+          className="chip"
+          style={{
+            background: hotWallet.paused ? 'rgba(239,68,68,.16)' : hotWallet.autoEnabled ? 'var(--up-bg)' : 'var(--panel-2)',
+            color: hotWallet.paused ? 'var(--down)' : hotWallet.autoEnabled ? 'var(--up)' : 'var(--muted)',
+            fontSize: 10, fontWeight: 700,
+          }}
+        >
+          {hotWallet.paused ? 'PAUSED' : !hotWallet.status?.exists ? 'BELUM ADA' : hotWallet.autoEnabled ? 'AUTO-EXECUTE ON' : 'AUTO-EXECUTE OFF'}
+        </span>
+        {hotWallet.status?.exists && (
+          <span style={{ color: 'var(--muted)' }}>
+            {hotWallet.balanceSol.toFixed(4)} SOL · {shortAddr(hotWallet.status.publicKey ?? '', 4)}
+          </span>
+        )}
+        <span style={{ color: 'var(--muted)' }}>Kelola di halaman</span>
+        <button type="button" className="btn" style={{ minHeight: 28, padding: '2px 10px', fontSize: 12 }} onClick={() => onNavigate?.('settings')}>
+          Pengaturan
+        </button>
+      </div>
+
+      {/* Radar → swap prefill (real mode): click Trade on a radar row to open
+          the swap form with the token already selected — no intent queue. */}
+      {radarTrade && (
+        <Modal title={`Trade ${radarTrade.token.symbol} (Dana Asli)`} onClose={() => setRadarTrade(null)} maxWidth={560}>
+          <RealTradeForm
+            prefill={{ market: {
+              pairAddress: '',
+              tokenAddress: radarTrade.token.address,
+              symbol: radarTrade.token.symbol,
+              name: radarTrade.token.name ?? '',
+              chainId: radarTrade.token.chainId ?? 'solana',
+              dexId: radarTrade.token.dexId ?? '',
+              url: '',
+              priceUsd: radarTrade.token.priceUsd ?? 0,
+              icon: radarTrade.token.icon ?? null,
+              change24h: 0,
+              change5m: 0,
+              change1h: 0,
+              volume24h: 0,
+              liquidityUsd: 0,
+              fdv: 0,
+              txns24h: { buys: 0, sells: 0 },
+            }, nonce: Date.now() }}
+          />
+        </Modal>
+      )}
+
+      {/* Top AI Signals Market Scanner */}
+      <div className="card">
+        <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--border)', fontWeight: 600, fontSize: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <span>Market AI Radar (Top Scanned Tokens)</span>
+          <span style={{ fontSize: 12, color: 'var(--muted)' }}>
+            {autopilot?.enabled ? 'Live Refresh 5s' : 'Auto-Pilot OFF — radar berhenti (tidak ada token LLM terpakai)'}
+          </span>
+        </div>
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Token</th>
+                <th className="num">Harga Live</th>
+                <th>Sinyal AI</th>
+                <th className="num">Confidence</th>
+                <th className="num">Target TP</th>
+                <th>Aksi</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(scannedSignals ?? []).map((s) => (
+                <tr key={s.token.address}>
+                  <td>
+                    <div className="tok">
+                      <div className="ph">{s.token.symbol.slice(0, 2).toUpperCase()}</div>
+                      <div className="meta">
+                        <div className="sym">{s.token.symbol}</div>
+                        <div className="nm">{s.token.chainId}</div>
+                      </div>
+                    </div>
+                  </td>
+                  <td className="num">${s.token.priceUsd.toFixed(6)}</td>
+                  <td>
+                    <span className={`badge ${s.verdict.signal.includes('BUY') ? 'up' : s.verdict.signal === 'SELL' ? 'down' : 'flat'}`}>
+                      {s.verdict.signal.replace('_', ' ')}
+                    </span>
+                  </td>
+                  <td className="num" style={{ fontFamily: 'var(--font-heading)' }}>{s.verdict.confidence}%</td>
+                  <td className="num">${s.verdict.targetPrice.toFixed(6)}</td>
+                  <td>
+                  <button className="btn icon" style={{ padding: '4px 10px', fontSize: 12 }} onClick={() => handleAnalyze(s.token.address)}>
+                    Audit
+                  </button>
+                </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {!scannedSignals?.length && <div className="empty">Sedang memindai sinyal AI pasar realtime…</div>}
       </div>
 
       {/* Signal History + Accuracy */}
@@ -1233,64 +1321,6 @@ export function Agents() {
         </div>
       )}
 
-      {/* Hot Wallet: server-side signing so the autopilot can act without a
-          Phantom popup per order (24/7). */}
-      <div style={{ marginBottom: 24 }}>
-        <HotWalletPanel />
-      </div>
-
-      {/* Top AI Signals Market Scanner */}
-      <div className="card">
-        <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--border)', fontWeight: 600, fontSize: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-          <span>Market AI Radar (Top Scanned Tokens)</span>
-          <span style={{ fontSize: 12, color: 'var(--muted)' }}>
-            {autopilot?.enabled ? 'Live Refresh 5s' : 'Auto-Pilot OFF — radar berhenti (tidak ada token LLM terpakai)'}
-          </span>
-        </div>
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Token</th>
-                <th className="num">Harga Live</th>
-                <th>Sinyal AI</th>
-                <th className="num">Confidence</th>
-                <th className="num">Target TP</th>
-                <th>Aksi</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(scannedSignals ?? []).map((s) => (
-                <tr key={s.token.address}>
-                  <td>
-                    <div className="tok">
-                      <div className="ph">{s.token.symbol.slice(0, 2).toUpperCase()}</div>
-                      <div className="meta">
-                        <div className="sym">{s.token.symbol}</div>
-                        <div className="nm">{s.token.chainId}</div>
-                      </div>
-                    </div>
-                  </td>
-                  <td className="num">${s.token.priceUsd.toFixed(6)}</td>
-                  <td>
-                    <span className={`badge ${s.verdict.signal.includes('BUY') ? 'up' : s.verdict.signal === 'SELL' ? 'down' : 'flat'}`}>
-                      {s.verdict.signal.replace('_', ' ')}
-                    </span>
-                  </td>
-                  <td className="num" style={{ fontFamily: 'var(--font-heading)' }}>{s.verdict.confidence}%</td>
-                  <td className="num">${s.verdict.targetPrice.toFixed(6)}</td>
-                  <td>
-                    <button className="btn primary icon" style={{ padding: '4px 10px', fontSize: 12 }} onClick={() => handleAnalyze(s.token.address)}>
-                      Audit
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        {!scannedSignals?.length && <div className="empty">Sedang memindai sinyal AI pasar realtime…</div>}
-      </div>
     </>
   );
 }

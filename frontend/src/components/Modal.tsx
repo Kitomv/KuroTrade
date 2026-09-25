@@ -26,11 +26,23 @@ export function Modal({ title, onClose, children, actions, maxWidth = 480 }: Pro
     const first = dialogRef.current?.querySelector<HTMLElement>(focusable);
     first?.focus();
 
+    // Guard against recursive refocus: `first.focus()` dispatches a new
+    // 'focusin' (potentially synchronously). If focus is yanked back to the SAME
+    // `first`, that fires another 'focusin' → infinite recursion → RangeError.
+    // Only refocus when a real target actually sits outside this dialog. Also,
+    // when a nested Modal opens (e.g. RealWalletModal running a confirm()), its
+    // focus belongs to the inner dialog — don't fight it.
+    let lastTrapTarget: Node | null = null;
     const onFocus = (e: FocusEvent) => {
-      // Trap Tab inside the dialog; wrap around when leaving at either end.
-      if (!dialogRef.current?.contains(e.target as Node)) {
-        first?.focus();
-      }
+      const target = e.target as Node | null;
+      if (!target) return;
+      if (dialogRef.current?.contains(target)) { lastTrapTarget = null; return; }
+      // Focus belongs to another modal on top (nested confirm) — don't fight it.
+      if ((target as HTMLElement)?.closest?.('.modal-backdrop')) return;
+      // Only move focus if it didn't already arrive at the trap boundary.
+      if (target === lastTrapTarget) return;
+      lastTrapTarget = target;
+      first?.focus();
     };
     addEventListener('keydown', onKey);
     document.addEventListener('focusin', onFocus);

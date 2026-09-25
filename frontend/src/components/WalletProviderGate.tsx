@@ -8,7 +8,7 @@ import { ConnectionProvider, WalletProvider } from '@solana/wallet-adapter-react
 import { WalletModalProvider } from '@solana/wallet-adapter-react-ui';
 import { PhantomWalletAdapter } from '@solana/wallet-adapter-phantom';
 import { RealWalletProvider } from './RealWalletContext';
-import { SOLANA_RPC } from '../lib/solana';
+import { SOLANA_RPC, RPC_CONFIG } from '../lib/solana';
 import '@solana/wallet-adapter-react-ui/styles.css';
 
 export default function WalletProviderGate({ children }: { children: React.ReactNode }) {
@@ -16,7 +16,7 @@ export default function WalletProviderGate({ children }: { children: React.React
   // createElement avoids TS2786 with wallet-adapter's older React types.
   return React.createElement(
     ConnectionProvider as any,
-    { endpoint: SOLANA_RPC },
+    { endpoint: SOLANA_RPC, config: RPC_CONFIG as any },
     React.createElement(
       WalletProvider as any,
       { wallets, autoConnect: false },

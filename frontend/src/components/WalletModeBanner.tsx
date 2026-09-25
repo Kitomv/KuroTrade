@@ -9,10 +9,15 @@
 // User instruction: "pilih real wallet all jadi real wallet apapun itu dari
 // dashboard sampai leaderboard, terus ada tombol virtual wallet".
 import { useRealWallet } from './RealWalletContext';
+import { useHotWallet } from './HotWalletContext';
 import { IconWallet, IconArrowDown } from './Icons';
 
 export function WalletModeBanner() {
-  const { loaded, connected, isBound, realMode, realAuto, setRealMode } = useRealWallet();
+  const { loaded, connected, isBound, realMode, setRealMode } = useRealWallet();
+  // Auto-execution is the HOT WALLET's job now (server-side signing, no Phantom
+  // popup). `realAuto` is a deprecated hardcoded false, so reading it here would
+  // always claim "approve manual" even while the hot wallet autonomously spends.
+  const { autoEnabled: hotAuto, paused: hotPaused } = useHotWallet();
   if (!loaded || !realMode) return null;
 
   return (
@@ -26,9 +31,11 @@ export function WalletModeBanner() {
           ? 'Connect Phantom untuk eksekusi dana asli'
           : !isBound
             ? 'Bind wallet di panel Real Wallet dulu'
-            : realAuto
-              ? 'Dana asli — auto-execute (Phantom tetap tanda tangan)'
-              : 'Dana asli — approve manual tiap transaksi'}
+            : hotPaused
+              ? 'Hot wallet dijeda (emergency pause) — tidak ada eksekusi otomatis'
+              : hotAuto
+                ? 'Dana asli — hot wallet auto-execute (tanpa popup Phantom)'
+                : 'Dana asli — approve manual tiap transaksi'}
       </span>
       <button type="button" className="mode-banner-btn" onClick={() => setRealMode(false)} aria-label="Kembali ke virtual wallet">
         <IconArrowDown size={13} />

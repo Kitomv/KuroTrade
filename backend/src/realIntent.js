@@ -8,7 +8,7 @@
 import { randomBytes, randomUUID } from 'crypto';
 import { loadUserState, touch, registerStateProvider } from './persistence.js';
 import { buildBindMessage, verifyEd25519 } from './ed25519.js';
-import { reducePositionAmount, addMirroredPosition, updatePositionMetadata } from './wallet.js';
+import { reducePositionAmount, addMirroredPosition, updatePositionMetadata, clearPositions } from './wallet.js';
 
 const INTENT_TTL_MS = 30 * 60 * 1000;
 const CLAIM_TTL_MS = 10 * 60 * 1000;
@@ -233,7 +233,19 @@ export function setRealIntentStatus(userId, intentId, status, claimToken = null)
 /** Set hot-wallet auto: server signs + broadcasts intents without Phantom. */
 export function setHotWalletAuto(userId, enabled) {
   const state = stateFor(userId);
-  state.hotWalletAuto = Boolean(enabled && state.realMode);
+  const on = Boolean(enabled && state.realMode);
+  // Turning hot-wallet auto ON makes the on-chain wallet the only source of
+  // truth, so leftover paper positions are dropped from the ledger. Kept
+  // otherwise, they blend with mirrored real fills: the guardian guards a
+  // position the wallet never held and tries to sell it forever.
+  if (on && !state.hotWalletAuto) {
+    try {
+      clearPositions(userId);
+    } catch (e) {
+      console.warn(`[realIntent] clear positions on hot-wallet-auto: ${e.message}`);
+    }
+  }
+  state.hotWalletAuto = on;
   touch(userId);
   return { ok: true, hotWalletAuto: state.hotWalletAuto };
 }

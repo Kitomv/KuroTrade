@@ -214,6 +214,13 @@ export function reducePositionAmount(userId, tokenAddress, tokens) {
  * Mirror a FILLED real buy so the guardian monitors the real holding (and can
  * emit TP/SL exit intents for it). No virtual balance is debited — the tokens
  * were bought with real funds, so only the position is tracked here.
+ *
+ * A real fill REPLACES any existing position for that token rather than adding
+ * to it. Mixing them averaged a paper entry and a real entry into one
+ * avgBuyPrice, so every later PnL/SL/TP decision ran against a cost basis that
+ * belonged to neither trade — and the guardian then tried to sell the combined
+ * amount while the wallet only held the real part. In real mode the ledger is a
+ * mirror of on-chain reality, so on-chain wins outright.
  */
 export function addMirroredPosition(userId, { tokenAddress, symbol, name, chainId, tokens, price }) {
   if (typeof tokenAddress !== 'string' || !tokenAddress) return null;
@@ -223,32 +230,22 @@ export function addMirroredPosition(userId, { tokenAddress, symbol, name, chainI
   if (!Number.isFinite(px) || px <= 0 || px > MAX_TOKEN_PRICE) return null;
   const w = walletFor(userId);
   const existing = w.positions.get(tokenAddress);
-  if (existing) {
-    const newAmount = Math.min(MAX_TOKEN_AMOUNT, (Number(existing.amount) || 0) + qty);
-    const newTotalCost = Math.min(MAX_VIRTUAL_USD, (Number(existing.totalCost) || 0) + qty * px);
-    w.positions.set(tokenAddress, {
-      ...existing,
-      amount: newAmount,
-      avgBuyPrice: newAmount > 0 ? newTotalCost / newAmount : px,
-      totalCost: newTotalCost,
-      currentPrice: px,
-      highestPrice: Math.max(Number(existing.highestPrice) || px, px),
-    });
-  } else {
-    w.positions.set(tokenAddress, {
-      symbol: symbol ?? 'UNKNOWN',
-      name: name ?? '',
-      chainId: chainId ?? 'solana',
-      amount: qty,
-      avgBuyPrice: px,
-      totalCost: qty * px,
-      currentPrice: px,
-      highestPrice: px,
-      tp1Hit: false,
-      realizedPnl: 0,
-      openedAt: Date.now(),
-    });
-  }
+  w.positions.set(tokenAddress, {
+    // Keep identity metadata so the guardian keeps tracking the same token, but
+    // reset the economics to the real fill alone.
+    ...(existing ?? {}),
+    symbol: symbol ?? existing?.symbol ?? 'UNKNOWN',
+    name: name ?? existing?.name ?? '',
+    chainId: chainId ?? existing?.chainId ?? 'solana',
+    amount: qty,
+    avgBuyPrice: px,
+    totalCost: qty * px,
+    currentPrice: px,
+    highestPrice: Math.max(Number(existing?.highestPrice) || px, px),
+    tp1Hit: false,
+    realizedPnl: existing?.realizedPnl ?? 0,
+    openedAt: existing?.openedAt ?? Date.now(),
+  });
   saveUserState(userId);
   return w.positions.get(tokenAddress);
 }
@@ -277,6 +274,14 @@ export function getPositions(userId) {
     if (clean) out.push(clean); // corrupt rows are omitted, never rendered
   }
   return out;
+}
+
+/** Clear ALL positions for a user — used when switching to real mode so the
+ *  virtual ledger doesn't mix with on-chain mirrors. */
+export function clearPositions(userId) {
+  const w = walletFor(userId);
+  w.positions.clear();
+  saveUserState(userId);
 }
 
 export function getOrders(userId) {

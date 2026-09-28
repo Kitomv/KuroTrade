@@ -1,87 +1,94 @@
-// EVM Hot Wallet for Multi-Chain Trading (Base first, manual execution).
-// Self-contained: owns its own keystore file (data/evmwallets.json), same
-// AES-256-GCM pattern + shared MASTER_ENCRYPTION_KEY as hotWallet.js. Uses
-// ethers (secp256k1) + 1inch Aggregation for swaps on Base (chainId 8453).
-// Importers/callers: server.js (/api/real/evm/*). Manual-only for now — no
-// auto-execute integration until the EVM happy path is proven on a small trade.
-// User instruction: "buat biar bisa jadi trade multi chain" → Base first, manual.
+// EVM execution layer — 1inch quote + unsigned tx builder. NO private keys.
+// Importers/callers: server.js (/api/real/*), aiAgent.js (exposure/affordability).
+// User instruction: "allin metamask pokoknya kalo real wallet yang lain hapus".
+//
+// The server never signs. It holds INCH_API_KEY (an aggregator key that must
+// not ship in the browser bundle) and returns the unsigned tx that MetaMask
+// signs via eth_sendTransaction. hotWallet.js's keystore and every execute*
+// function were removed with that decision — they were the only code path that
+// could move funds without a human click.
 
-import { randomBytes, scryptSync, createCipheriv, createDecipheriv } from 'crypto';
-import { readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync, existsSync } from 'fs';
-import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import { ethers } from 'ethers';
-import { isEmergencyPaused } from './hotWallet.js';
+import { getBoundWallet } from './realIntent.js';
+import { dexscreener } from './dexscreener.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = join(__dirname, '../data');
-const KEYS_FILE = () => process.env.EVM_WALLET_KEYS_FILE || join(DATA_DIR, 'evmwallets.json');
-const ENCRYPTION_KEY_SIZE_BYTES = 32;
-const NONCE_SIZE_BYTES = 12;
-
-// --- Chain config — EVM family shares ONE wallet/key across all chains.
-// The keystore maps by userId (not chain), so the same 0x address signs on
-// every chain below; only the RPC/gas-native/1inch chainId differ.
-const CHAINS = {
+// --- Chain config -----------------------------------------------------------
+// Per-chain: rpc, 1inch endpoint, native symbol, explorer. Nothing else in the
+// execution path is chain-specific, so adding a chain is one entry here.
+export const CHAINS = {
   base: {
     chainId: 8453,
     rpc: () => process.env.BACKEND_BASE_RPC || 'https://mainnet.base.org',
     native: 'ETH',
     explorer: 'https://basescan.org/tx/',
-    inch: { base: 'https://api.1inch.dev/swap/v6.0/8453', key: () => process.env.INCH_API_KEY || '' },
-    erc20Abi: ['function approve(address spender, uint256 amount) returns (bool)', 'function allowance(address owner, address spender) view returns (uint256)', 'function decimals() view returns (uint8)', 'function balanceOf(address) view returns (uint256)'],
+    inch: 'https://api.1inch.dev/swap/v6.0/8453',
   },
   ethereum: {
     chainId: 1,
     rpc: () => process.env.BACKEND_ETH_RPC || 'https://eth.llamarpc.com',
     native: 'ETH',
     explorer: 'https://etherscan.io/tx/',
-    inch: { base: 'https://api.1inch.dev/swap/v6.0/1', key: () => process.env.INCH_API_KEY || '' },
-    erc20Abi: ['function approve(address spender, uint256 amount) returns (bool)', 'function allowance(address owner, address spender) view returns (uint256)', 'function decimals() view returns (uint8)', 'function balanceOf(address) view returns (uint256)'],
+    inch: 'https://api.1inch.dev/swap/v6.0/1',
   },
   arbitrum: {
     chainId: 42161,
     rpc: () => process.env.BACKEND_ARBITRUM_RPC || 'https://arb1.arbitrum.io/rpc',
     native: 'ETH',
     explorer: 'https://arbiscan.io/tx/',
-    inch: { base: 'https://api.1inch.dev/swap/v6.0/42161', key: () => process.env.INCH_API_KEY || '' },
-    erc20Abi: ['function approve(address spender, uint256 amount) returns (bool)', 'function allowance(address owner, address spender) view returns (uint256)', 'function decimals() view returns (uint8)', 'function balanceOf(address) view returns (uint256)'],
+    inch: 'https://api.1inch.dev/swap/v6.0/42161',
   },
   bsc: {
     chainId: 56,
     rpc: () => process.env.BACKEND_BSC_RPC || 'https://bsc-dataseed.bnbchain.org',
     native: 'BNB',
     explorer: 'https://bscscan.com/tx/',
-    inch: { base: 'https://api.1inch.dev/swap/v6.0/56', key: () => process.env.INCH_API_KEY || '' },
-    erc20Abi: ['function approve(address spender, uint256 amount) returns (bool)', 'function allowance(address owner, address spender) view returns (uint256)', 'function decimals() view returns (uint8)', 'function balanceOf(address) view returns (uint256)'],
+    inch: 'https://api.1inch.dev/swap/v6.0/56',
   },
   optimism: {
     chainId: 10,
     rpc: () => process.env.BACKEND_OPTIMISM_RPC || 'https://mainnet.optimism.io',
     native: 'ETH',
     explorer: 'https://optimistic.etherscan.io/tx/',
-    inch: { base: 'https://api.1inch.dev/swap/v6.0/10', key: () => process.env.INCH_API_KEY || '' },
-    erc20Abi: ['function approve(address spender, uint256 amount) returns (bool)', 'function allowance(address owner, address spender) view returns (uint256)', 'function decimals() view returns (uint8)', 'function balanceOf(address) view returns (uint256)'],
+    inch: 'https://api.1inch.dev/swap/v6.0/10',
   },
   polygon: {
     chainId: 137,
     rpc: () => process.env.BACKEND_POLYGON_RPC || 'https://polygon-rpc.com',
     native: 'POL',
     explorer: 'https://polygonscan.com/tx/',
-    inch: { base: 'https://api.1inch.dev/swap/v6.0/137', key: () => process.env.INCH_API_KEY || '' },
-    erc20Abi: ['function approve(address spender, uint256 amount) returns (bool)', 'function allowance(address owner, address spender) view returns (uint256)', 'function decimals() view returns (uint8)', 'function balanceOf(address) view returns (uint256)'],
+    inch: 'https://api.1inch.dev/swap/v6.0/137',
   },
   avalanche: {
     chainId: 43114,
     rpc: () => process.env.BACKEND_AVALANCHE_RPC || 'https://api.avax.network/ext/bc/C/rpc',
     native: 'AVAX',
     explorer: 'https://snowtrace.io/tx/',
-    inch: { base: 'https://api.1inch.dev/swap/v6.0/43114', key: () => process.env.INCH_API_KEY || '' },
-    erc20Abi: ['function approve(address spender, uint256 amount) returns (bool)', 'function allowance(address owner, address spender) view returns (uint256)', 'function decimals() view returns (uint8)', 'function balanceOf(address) view returns (uint256)'],
+    inch: 'https://api.1inch.dev/swap/v6.0/43114',
   },
 };
 
-/** List supported EVM chains (for the UI selector). */
+const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+const ZERO_ADDRESS = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'; // 1inch native sentinel
+const HEX_RE = /^0x[0-9a-fA-F]*$/;
+
+/**
+ * 1inch Aggregation Router v6.
+ *
+ * v6 is deployed at the SAME CREATE2 address on every supported chain, which
+ * is why this is one constant and not a per-chain map. A per-chain map is how
+ * an earlier draft silently shipped the v5 address
+ * (0x1111111254EEB25477B68fb85Ed929f73A960582) for six chains.
+ *
+ * VERIFY against https://docs.1inch.io before the first real trade. This is a
+ * security boundary and the failure mode is deliberately CLOSED: a wrong value
+ * refuses every swap rather than approving an unknown contract. Override via
+ * env if 1inch rotates the router.
+ */
+const ONE_INCH_ROUTER = String(
+  process.env.ONE_INCH_ROUTER || '0x111111125421cA6dc452d289314280a0f8842A65',
+).toLowerCase();
+
+/** List supported EVM chains (drives the chain selector in the UI). */
 export function listEvmChains() {
   return Object.entries(CHAINS).map(([key, cfg]) => ({
     key,
@@ -91,162 +98,43 @@ export function listEvmChains() {
   }));
 }
 
-/** Get the EVM provider for a chain. */
+export function isSupportedChain(chain) {
+  return Object.hasOwn(CHAINS, String(chain));
+}
+
+export function getChainConfig(chain = 'base') {
+  const cfg = CHAINS[chain];
+  if (!cfg) throw new Error(`Chain "${chain}" tidak didukung`);
+  return cfg;
+}
+
 export function getProvider(chain = 'base') {
-  const cfg = CHAINS[chain];
-  if (!cfg) throw new Error(`Chain ${chain} tidak didukung`);
-  return new ethers.JsonRpcProvider(cfg.rpc());
+  return new ethers.JsonRpcProvider(getChainConfig(chain).rpc());
 }
 
-function ensureDataDir() {
-  mkdirSync(dirname(KEYS_FILE()), { recursive: true });
+/** The wallet this user bound for real trading (MetaMask address, or null). */
+export function getBoundEvmAddress(userId) {
+  return getBoundWallet(userId);
 }
 
-/** Master key — same env var as the Solana hot wallet. */
-export function getMasterKey() {
-  const k = process.env.MASTER_ENCRYPTION_KEY;
-  if (!k || String(k).trim().length < 16) throw new Error('MASTER_ENCRYPTION_KEY belum diset di .env');
-  return String(k).trim();
-}
-
-/** Per-user AES key scoped by userId (same pattern as hotWallet.js). */
-function deriveKey(userId, masterKey) {
-  if (!userId || typeof userId !== 'string') throw new Error('userId required');
-  return scryptSync(masterKey, `evmwallet:${userId}`, ENCRYPTION_KEY_SIZE_BYTES);
-}
-
-function loadKeystores() {
-  ensureDataDir();
-  try {
-    if (!existsSync(KEYS_FILE())) return new Map();
-    const raw = JSON.parse(readFileSync(KEYS_FILE(), 'utf-8'));
-    const list = Array.isArray(raw?.keystores) ? raw.keystores : [];
-    const map = new Map();
-    for (const e of list) {
-      if (e?.userId && e.address && e.ciphertext && e.iv && e.tag) {
-        map.set(e.userId, { ...e, createdAt: Number(e.createdAt) || Date.now(), updatedAt: Number(e.updatedAt) || Date.now() });
-      }
-    }
-    return map;
-  } catch {
-    return new Map();
-  }
-}
-
-function saveKeystores(map) {
-  ensureDataDir();
-  const target = KEYS_FILE();
-  const tmp = `${target}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
-  try {
-    writeFileSync(tmp, JSON.stringify({ keystores: Array.from(map.values()) }, null, 2), 'utf-8');
-    renameSync(tmp, target);
-  } catch (e) {
-    try { unlinkSync(tmp); } catch {}
-    throw e;
-  }
-}
-
-function saveEncryptedWallet(userId, privateKeyHex, masterKey) {
-  const derivedKey = deriveKey(userId, masterKey);
-  const iv = randomBytes(NONCE_SIZE_BYTES);
-  const cipher = createCipheriv('aes-256-gcm', derivedKey, iv);
-  // privateKeyHex is 0x + 64 hex chars = 66 chars → 33 bytes. Strip 0x for storage.
-  const secretBuffer = Buffer.from(privateKeyHex.replace(/^0x/, ''), 'hex');
-  const encrypted = Buffer.concat([cipher.update(secretBuffer), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  const wallet = new ethers.Wallet(privateKeyHex);
-
-  const map = loadKeystores();
-  const now = Date.now();
-  const record = {
-    userId,
-    address: wallet.address.toLowerCase(),
-    ciphertext: encrypted.toString('base64'),
-    iv: iv.toString('base64'),
-    tag: tag.toString('base64'),
-    createdAt: map.get(userId)?.createdAt ?? now,
-    updatedAt: now,
-  };
-  const existing = map.get(userId);
-  if (existing?.address && existing.address !== record.address) {
-    throw new Error('EVM wallet sudah ada untuk user ini — hapus dulu jika mau ganti (dana lama tidak bisa diakses)');
-  }
-  map.set(userId, record);
-  saveKeystores(map);
-  // Zero key material in memory.
-  secretBuffer.fill(0);
-  return { address: record.address, createdAt: record.createdAt };
-}
-
-/** Generate a fresh EVM wallet (Base) for userId. */
-export function generateEvmWallet(userId, masterKey = getMasterKey()) {
-  const wallet = ethers.Wallet.createRandom();
-  return saveEncryptedWallet(userId, wallet.privateKey, masterKey);
-}
-
-/** Import an existing EVM private key (0x-hex or bare 64-hex). */
-export function importEvmWallet(userId, privateKeyHex, masterKey = getMasterKey()) {
-  const clean = String(privateKeyHex).replace(/^0x/, '').trim();
-  if (!/^[0-9a-fA-F]{64}$/.test(clean)) throw new Error('Private key tidak valid — harus 64 hex char');
-  const wallet = new ethers.Wallet(`0x${clean}`);
-  return saveEncryptedWallet(userId, wallet.privateKey, masterKey);
-}
-
-/** Decrypt + return an ethers.Wallet (caller must zero wallet.privateKey after). */
-export function decryptEvmWallet(userId, masterKey = getMasterKey()) {
-  const map = loadKeystores();
-  const record = map.get(userId);
-  if (!record) throw new Error(`EVM wallet untuk user ${userId} belum dibuat`);
-  const derivedKey = deriveKey(userId, masterKey);
-  const decipher = createDecipheriv('aes-256-gcm', derivedKey, Buffer.from(record.iv, 'base64'));
-  decipher.setAuthTag(Buffer.from(record.tag, 'base64'));
-  try {
-    const decrypted = Buffer.concat([decipher.update(Buffer.from(record.ciphertext, 'base64')), decipher.final()]);
-    const wallet = new ethers.Wallet(`0x${decrypted.toString('hex')}`);
-    decrypted.fill(0);
-    derivedKey.fill(0);
-    return wallet;
-  } catch {
-    derivedKey.fill(0);
-    throw new Error('Gagal mendekripsi EVM wallet: MASTER_ENCRYPTION_KEY tidak cocok atau data corrupt');
-  }
-}
-
-/** Public status (no secrets). */
-export function getEvmWalletStatus(userId) {
-  const record = loadKeystores().get(userId);
-  if (!record) return { exists: false, address: null };
-  return { exists: true, address: record.address, createdAt: record.createdAt, updatedAt: record.updatedAt };
-}
-
-/** Native-token (ETH) balance of the EVM hot wallet on the given chain. */
-export async function getEvmBalance(userId, chain = 'base') {
-  const info = getEvmWalletStatus(userId);
-  if (!info.exists) return { exists: false, address: null, balanceNative: '0' };
-  const provider = getProvider(chain);
-  const wei = await provider.getBalance(info.address);
-  return { exists: true, address: info.address, balanceNative: wei.toString() };
-}
-
-/** Token (ERC-20) balance in atomic units, or null if no balanceOf for contract. */
-export async function getEvmTokenBalance(userId, tokenAddress, chain = 'base') {
-  const info = getEvmWalletStatus(userId);
-  if (!info.exists || !/^0x[0-9a-fA-F]{40}$/.test(tokenAddress)) return null;
-  const cfg = CHAINS[chain];
-  const provider = getProvider(chain);
-  try {
-    const contract = new ethers.Contract(tokenAddress, cfg.erc20Abi, provider);
-    return (await contract.balanceOf(info.address)).toString();
-  } catch {
-    return null;
-  }
+/**
+ * Is this the router we are willing to hand an ERC-20 allowance to?
+ *
+ * The old executor trusted whatever `tx.to` came back in the 1inch payload and
+ * approved it for MaxUint256, with no check at all. This is the choke point
+ * that replaced it: the frontend must clear this before signing an approval,
+ * and the amount approved is the exact swap size, never an unlimited grant.
+ */
+export function isAllowedRouter(address) {
+  if (!ADDRESS_RE.test(String(address ?? ''))) return false;
+  return String(address).toLowerCase() === ONE_INCH_ROUTER;
 }
 
 async function inchFetch(path, chain = 'base') {
-  const cfg = CHAINS[chain];
-  const key = cfg.inch.key();
+  const cfg = getChainConfig(chain);
+  const key = process.env.INCH_API_KEY || '';
   if (!key) throw new Error('INCH_API_KEY belum diset di .env — gratis di https://portal.1inch.dev');
-  const res = await fetch(`${cfg.inch.base}${path}`, {
+  const res = await fetch(`${cfg.inch}${path}`, {
     headers: { Authorization: `Bearer ${key}` },
     signal: AbortSignal.timeout(15_000),
   });
@@ -257,91 +145,274 @@ async function inchFetch(path, chain = 'base') {
   return res.json();
 }
 
-const ZERO_ADDRESS = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+function assertAddress(value, label) {
+  const v = String(value ?? '');
+  if (!ADDRESS_RE.test(v)) throw new Error(`${label} harus alamat 0x + 40 hex`);
+  return v;
+}
+
+function assertAtomicAmount(amount) {
+  const amt = String(amount);
+  if (!/^\d+$/.test(amt) || amt === '0') throw new Error('amount harus atomic units > 0');
+  return amt;
+}
+
+function isNative(src) {
+  return String(src).toLowerCase() === ZERO_ADDRESS;
+}
+
+/** Quote a swap. `amount` is atomic units of `src` (wei for native). */
+export async function evmQuote({ src, dst, amount, chain = 'base' }) {
+  assertAddress(src, 'src');
+  assertAddress(dst, 'dst');
+  const params = new URLSearchParams({
+    src, dst, amount: assertAtomicAmount(amount), disableEstimate: 'true',
+  });
+  return inchFetch(`/quote?${params}`, chain);
+}
 
 /**
- * Quote a swap on the configured chain. `amount` is in atomic units of `src`.
- * src/dst use the 1inch convention: native token = 0xEEE...EEE.
+ * Build the UNSIGNED swap transaction for MetaMask to sign.
+ *
+ * This is the whole point of the refactor: the server asks 1inch what to do,
+ * hands the calldata to the browser, and a human approves it in MetaMask.
+ * Nothing here broadcasts and nothing here holds a key.
  */
-export async function evmQuote(userId, { src, dst, amount, chain = 'base' }, { masterKey = getMasterKey() } = {}) {
-  const wallet = decryptEvmWallet(userId, masterKey);
+export async function buildSwapTx({ src, dst, amount, chain = 'base', from, slippage = 100 }) {
+  assertAddress(src, 'src');
+  assertAddress(dst, 'dst');
+  assertAddress(from, 'from');
+  const amt = assertAtomicAmount(amount);
+  const slip = Math.min(500, Math.max(1, Math.floor(Number(slippage) || 100)));
+  const params = new URLSearchParams({
+    src, dst, amount: amt, from, slippage: String(slip), disableEstimate: 'true',
+  });
+  const swapResp = await inchFetch(`/swap?${params}`, chain);
+  const tx = swapResp?.tx;
+  if (!tx?.to || !tx?.data) throw new Error('1inch tidak mengembalikan data transaksi swap');
+  if (!HEX_RE.test(String(tx.data)) || !HEX_RE.test(String(tx.value ?? '0x0'))) {
+    throw new Error('1inch mengembalikan tx dengan field tidak valid');
+  }
+  // The router is the one address we will ask the user to approve. Refuse to
+  // hand back a tx aimed anywhere else — a spoofed aggregator response must
+  // never become a MetaMask signature request.
+  if (!isAllowedRouter(tx.to)) {
+    throw new Error(`Router 1inch tidak dikenal — swap dibatalkan demi keamanan`);
+  }
+  return {
+    chain,
+    chainId: getChainConfig(chain).chainId,
+    to: tx.to,
+    data: tx.data,
+    value: String(tx.value ?? '0x0'),
+    gas: tx.gas ? String(tx.gas) : null,
+    // Frontend approves this router for exactly `amount` when src is an ERC-20.
+    // Native swaps need no approval.
+    needsApproval: !isNative(src),
+    approveSpender: isNative(src) ? null : tx.to,
+    approveAmount: isNative(src) ? null : amt,
+    slippageBps: slip,
+  };
+}
+
+// --- On-chain reads ---------------------------------------------------------
+
+const ERC20_ABI = [
+  'function balanceOf(address) view returns (uint256)',
+  'function decimals() view returns (uint8)',
+];
+
+const decimalsCache = new Map(); // `${chain}:${token}` -> { at, decimals }
+
+/**
+ * ERC-20 decimals, resolved ON-CHAIN from the token contract itself.
+ *
+ * The contract is authoritative. An aggregator index routinely misses new
+ * tokens, and guessing 9 for a 6-decimal token mis-sells by 1000x. Cached 1h.
+ * Returns null when unresolvable; callers MUST refuse the sell rather than
+ * guess (the rule the Solana executor enforced at hotWallet.js:210).
+ */
+export async function resolveTokenDecimals(token, chain = 'base') {
+  const addr = assertAddress(token, 'token');
+  const key = `${chain}:${addr.toLowerCase()}`;
+  const hit = decimalsCache.get(key);
+  if (hit && Date.now() - hit.at < 3_600_000) return hit.decimals;
   try {
-    const params = new URLSearchParams({ src, dst, amount: String(amount), from: wallet.address });
-    return await inchFetch(`/quote?${params}`, chain);
-  } finally {
-    wallet.privateKey = '';
+    const contract = new ethers.Contract(addr, ERC20_ABI, getProvider(chain));
+    const decimals = Number(await contract.decimals());
+    if (Number.isInteger(decimals) && decimals >= 0 && decimals <= 36) {
+      decimalsCache.set(key, { at: Date.now(), decimals });
+      return decimals;
+    }
+  } catch {
+    // non-contract address or RPC failure — both land here
+  }
+  return null;
+}
+
+/** Native balance in wei. */
+export async function getEvmBalance(address, chain = 'base') {
+  return getProvider(chain).getBalance(assertAddress(address, 'address'));
+}
+
+/** Native balance in human units (ETH, not wei). */
+export async function getEvmBalanceNative(address, chain = 'base') {
+  return Number(ethers.formatEther(await getEvmBalance(address, chain)));
+}
+
+/** ERC-20 balance in atomic units, or null when the contract does not answer. */
+export async function getEvmTokenBalance(address, token, chain = 'base') {
+  try {
+    const contract = new ethers.Contract(assertAddress(token, 'token'), ERC20_ABI, getProvider(chain));
+    return BigInt(await contract.balanceOf(assertAddress(address, 'address')));
+  } catch {
+    return null;
   }
 }
 
 /**
- * Execute a manual EVM swap on Base via 1inch Aggregation.
- * Steps: emergency pause → spend-permission check → ERC-20 approve (auto, only
- * if src is a token) → sign swap tx → broadcast. Manual-only.
+ * USD value of the wallet's ERC-20 holdings ONLY, excluding the native coin.
+ *
+ * Exposure is the risky part of a book: the ETH in the wallet is undeployed
+ * cash and gas, not a position at risk. Counting it reports ~100% exposure on
+ * a wallet holding nothing but ETH, which permanently blocks every new buy.
+ * (Same split getHotWalletTokenValue made for Solana.)
+ *
+ * `tokens` is the set to value — the caller's tracked/held tokens.
  */
-export async function executeEvmSwap(userId, { src, dst, amount, slippage = 100, chain = 'base' }, { masterKey = getMasterKey() } = {}) {
-  if (isEmergencyPaused()) throw new Error('Circuit Breaker: Emergency Pause aktif. Semua transaksi EVM dihentikan.');
-
-  const wallet = decryptEvmWallet(userId, masterKey);
-  const provider = getProvider(chain);
-  try {
-    const from = wallet.address;
-
-    // 1. Request swap tx from 1inch.
-    const params = new URLSearchParams({
-      src, dst, amount: String(amount), from,
-      slippage: String(slippage), // basis points (1% = 100)
-      disableEstimate: 'true',
-    });
-    const swapResp = await inchFetch(`/swap?${params}`, chain);
-    const txData = swapResp?.tx;
-    if (!txData?.to || !txData?.data) throw new Error('1inch tidak mengembalikan data transaksi swap');
-
-    // 2. ERC-20 allowance: if src is a token (not native), ensure allowance.
-    if (src.toLowerCase() === ZERO_ADDRESS) {
-      // Native → no approve needed.
-    } else {
-      const cfg = CHAINS[chain];
-      const contract = new ethers.Contract(src, cfg.erc20Abi, provider);
-      const allowance = await contract.allowance(from, txData.to);
-      if (BigInt(allowance) < BigInt(amount)) {
-        const spender = txData.to;
-        const approveTx = await contract.approve.populateTransaction(spender, ethers.MaxUint256);
-        approveTx.from = from;
-        approveTx.chainId = cfg.chainId;
-        approveTx.nonce = await provider.getTransactionCount(from);
-        const signedApprove = await wallet.signTransaction(approveTx);
-        const approveRes = await provider.broadcastTransaction(signedApprove);
-        await approveRes.wait();
-        // New approval is now in the mempool — retry the swap after a short wait.
-        await new Promise((r) => setTimeout(r, 3000));
-      }
-    }
-
-    // 3. Build + sign the swap tx (1inch returns {from,to,data,value,gas,...}).
-    const build = {
-      to: txData.to,
-      data: txData.data,
-      value: txData.value ? BigInt(txData.value) : 0n,
-      chainId: CHAINS[chain].chainId,
-      nonce: await provider.getTransactionCount(from),
-    };
-    if (txData.gasPrice) build.gasPrice = BigInt(txData.gasPrice);
-    if (txData.gas) build.gasLimit = BigInt(txData.gas);
-    const signed = await wallet.signTransaction(build);
-    const tx = await provider.broadcastTransaction(signed);
-    const receipt = await tx.wait();
-
-    return {
-      ok: true,
-      txHash: tx.hash,
-      explorer: CHAINS[chain].explorer + tx.hash,
-      chain,
-      from,
-      src,
-      dst,
-      amount: String(amount),
-    };
-  } finally {
-    wallet.privateKey = '';
+export async function getEvmTokenValue(address, chain = 'base', tokens = []) {
+  const owner = assertAddress(address, 'address');
+  if (tokens.length === 0) return { valueUsd: 0, holdings: [] };
+  const markets = await dexscreener.tokens(tokens).catch(() => new Map());
+  let total = 0;
+  const holdings = [];
+  for (const token of tokens) {
+    const balance = await getEvmTokenBalance(owner, token, chain);
+    if (balance === null || balance === 0n) continue;
+    const decimals = await resolveTokenDecimals(token, chain);
+    if (decimals === null) continue;
+    const amount = Number(ethers.formatUnits(balance, decimals));
+    const norm = markets.get(String(token).toLowerCase());
+    const priceUsd = norm && norm.chainId === chain && Number(norm.priceUsd) > 0
+      ? Number(norm.priceUsd)
+      : null;
+    const valueUsd = priceUsd !== null ? Math.round(amount * priceUsd * 100) / 100 : null;
+    if (valueUsd !== null) total += valueUsd;
+    holdings.push({ token, amount, decimals, priceUsd, valueUsd });
   }
+  return { valueUsd: Math.round(total * 100) / 100, holdings };
+}
+
+/** Total on-chain USD value: native coin + priced ERC-20 holdings. */
+export async function getEvmTotalValue(address, chain = 'base', { nativeUsd = null, tokens = [] } = {}) {
+  const price = Number(nativeUsd) > 0 ? Number(nativeUsd) : await getNativeUsdPrice(chain);
+  if (!price) return null;
+  const nativeHuman = await getEvmBalanceNative(address, chain);
+  const { valueUsd } = await getEvmTokenValue(address, chain, tokens);
+  return Math.round((nativeHuman * price + valueUsd) * 100) / 100;
+}
+
+// --- Pricing ---------------------------------------------------------------
+
+const nativePriceCache = new Map(); // chain -> { at, price }
+
+/**
+ * Canonical wrapped-native token per chain (WETH/WBNB/WPOL/WAVAX).
+ *
+ * This exists because a TEXT search for "ETH" does not surface Base pairs at
+ * all — DexScreener's search returns Ethereum/BSC/Starknet and zero Base rows,
+ * so the native price resolved to null on the chain the app actually trades.
+ * An address lookup is exact and chain-pinned, which is what a price oracle
+ * for a specific chain needs.
+ */
+const WRAPPED_NATIVE = {
+  base: '0x4200000000000000000000000000000000000006',       // WETH
+  ethereum: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',   // WETH
+  arbitrum: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1',   // WETH
+  optimism: '0x4200000000000000000000000000000000000006',   // WETH
+  bsc: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',        // WBNB
+  polygon: '0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270',   // WPOL
+  avalanche: '0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7', // WAVAX
+};
+
+/**
+ * Native-coin USD price for `chain`, via DexScreener.
+ *
+ * Returns null when unknown, and the caller MUST refuse rather than guess.
+ * That matters more than it looks: `/latest/dex/tokens/{addr}` returns a
+ * TRUNCATED set of pairs (30, ordered by an opaque ranking), so a chain can be
+ * absent from the response even though its pool exists — Optimism never
+ * appears for WETH, for instance. Those chains simply price as unknown and
+ * their buys are blocked, which is the honest outcome: the alternative is
+ * converting a USD budget into native units at another chain's rate.
+ */
+export async function getNativeUsdPrice(chain = 'base') {
+  const hit = nativePriceCache.get(chain);
+  if (hit && Date.now() - hit.at < 15_000) return hit.price;
+  const wrapped = WRAPPED_NATIVE[chain];
+  if (!wrapped) return null;
+  try {
+    const market = await dexscreener.token(wrapped, chain);
+    if (market && market.chainId === chain && Number(market.priceUsd) > 0) {
+      const price = Number(market.priceUsd);
+      nativePriceCache.set(chain, { at: Date.now(), price });
+      return price;
+    }
+  } catch {}
+  return null;
+}
+
+/** Whether this chain can size a buy at all (needs a resolvable native price). */
+export function canPriceNative(chain) {
+  return Object.hasOwn(WRAPPED_NATIVE, chain);
+}
+
+// --- Risk guards ------------------------------------------------------------
+
+/**
+ * Native coin that must stay UNSPENT so the exit swap can still pay its own
+ * gas. A wallet that spends its last wei on the entry swap can never sell —
+ * the position becomes a stuck bag. Mirrors the Solana executor's
+ * HOT_WALLET_FEE_RESERVE_LAMPORTS (0.005 SOL).
+ */
+export const EVM_FEE_RESERVE_NATIVE = 0.005;
+
+/** Hard ceiling per trade; env-overridable like HOT_WALLET_MAX_USD_PER_TRADE. */
+const DEFAULT_MAX_USD_PER_TRADE = 50;
+export function checkTradeSize(usdAmount) {
+  const cap = Number(process.env.HOT_WALLET_MAX_USD_PER_TRADE) || DEFAULT_MAX_USD_PER_TRADE;
+  const val = Number(usdAmount);
+  if (!Number.isFinite(val) || val <= 0) return { ok: false, cap, reason: 'usdAmount tidak valid' };
+  if (val > cap) return { ok: false, cap, reason: `Melebihi batas maksimal $${cap} USD per transaksi` };
+  return { ok: true, cap };
+}
+
+/**
+ * Can the wallet actually pay for a BUY of `usdAmount` on `chain` and still
+ * keep a gas reserve for the eventual exit?
+ *
+ * The paper ledger says "plenty"; the MetaMask balance is the only real number.
+ * Returns { ok, balanceNative, buyUsd, reserveNative, reason }.
+ */
+export async function checkEvmAffordability(address, usdAmount, { nativeUsd = null, chain = 'base' } = {}) {
+  const price = Number(nativeUsd) > 0 ? Number(nativeUsd) : await getNativeUsdPrice(chain);
+  const balanceNative = await getEvmBalanceNative(address, chain).catch(() => null);
+  if (balanceNative === null) {
+    return { ok: false, balanceNative: 0, buyUsd: 0, reserveNative: EVM_FEE_RESERVE_NATIVE, reason: 'NO_BALANCE' };
+  }
+  if (!price) {
+    return { ok: false, balanceNative, buyUsd: 0, reserveNative: EVM_FEE_RESERVE_NATIVE, reason: 'NO_PRICE' };
+  }
+  const wanted = Number(usdAmount);
+  if (!Number.isFinite(wanted) || wanted <= 0) {
+    return { ok: false, balanceNative, buyUsd: 0, reserveNative: EVM_FEE_RESERVE_NATIVE, reason: 'BAD_AMOUNT' };
+  }
+  const spendableUsd = Math.max(0, balanceNative - EVM_FEE_RESERVE_NATIVE) * price;
+  if (spendableUsd <= 0) {
+    return { ok: false, balanceNative, buyUsd: 0, reserveNative: EVM_FEE_RESERVE_NATIVE, reason: 'NO_SPENDABLE' };
+  }
+  if (wanted > spendableUsd) {
+    return { ok: false, balanceNative, buyUsd: spendableUsd, reserveNative: EVM_FEE_RESERVE_NATIVE, reason: 'LOW_BALANCE' };
+  }
+  return { ok: true, balanceNative, buyUsd: wanted, reserveNative: EVM_FEE_RESERVE_NATIVE, reason: 'OK' };
 }

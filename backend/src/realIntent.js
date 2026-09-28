@@ -7,23 +7,25 @@
 // persistence, races, swap binding, and wallet binding.
 import { randomBytes, randomUUID } from 'crypto';
 import { loadUserState, touch, registerStateProvider } from './persistence.js';
-import { buildBindMessage, verifyEd25519 } from './ed25519.js';
-import { reducePositionAmount, addMirroredPosition, updatePositionMetadata, clearPositions } from './wallet.js';
+import { buildBindMessage, verifyEvmSignature } from './evmBind.js';
+import { reducePositionAmount, addMirroredPosition, updatePositionMetadata } from './wallet.js';
 
 const INTENT_TTL_MS = 30 * 60 * 1000;
 const CLAIM_TTL_MS = 10 * 60 * 1000;
 const BIND_NONCE_TTL_MS = 5 * 60 * 1000;
-const realStates = new Map(); // userId -> { realMode, realAuto, boundWallet, bindNonce, intents }
+// EVM chains this build can execute. Anything else can never be filled: the
+// intent would sit 'open' forever and — via the buy-dedup guard — permanently
+// block fresh signals for that token.
+const SUPPORTED_CHAINS = new Set([
+  'base', 'ethereum', 'arbitrum', 'bsc', 'optimism', 'polygon', 'avalanche',
+]);
+const realStates = new Map(); // userId -> { realMode, boundWallet, bindNonce, intents }
 
 function stateFor(userId) {
   if (realStates.has(userId)) return realStates.get(userId);
   const saved = loadUserState(userId) ?? {};
   const state = {
     realMode: Boolean(saved.realMode),
-    realAuto: Boolean(saved.realAuto && saved.realMode),
-    // Hot-wallet auto: the server signs + broadcasts with the encrypted
-    // keystore, so no Phantom popup is needed. Only meaningful in real mode.
-    hotWalletAuto: Boolean(saved.hotWalletAuto && saved.realMode),
     boundWallet: typeof saved.boundWallet === 'string' ? saved.boundWallet : null,
     bindNonce: typeof saved.bindNonce === 'object' && typeof saved.bindNonce?.value === 'string' ? saved.bindNonce : null,
     intents: Array.isArray(saved.realIntents) ? saved.realIntents : [],
@@ -46,14 +48,15 @@ function liveIntents(state) {
       changed = true;
     }
     // Auto-cancel intents for chains this app cannot execute. Execution is
-    // Solana-only (@solana/web3.js + Jupiter), so a non-Solana intent can never
-    // be filled: it would sit 'open' forever and — via the buy-dedup guard —
-    // permanently block fresh signals for that token. Only cancel when the chain
-    // is a known, non-Solana string; a missing chainId is left alone (older
-    // Solana intents predate the field, and cancelling those would be wrong).
+    // EVM-only (1inch + MetaMask), so a non-EVM intent can never be filled:
+    // it would sit 'open' forever and — via the buy-dedup guard — permanently
+    // block fresh signals for that token. A missing chainId is left alone
+    // (pre-field intents have no chain to judge, and cancelling a chain-less
+    // intent would be guessing).
     if (
       (intent.status === 'open' || intent.status === 'active')
-      && typeof intent.chainId === 'string' && intent.chainId !== '' && intent.chainId !== 'solana'
+      && typeof intent.chainId === 'string' && intent.chainId !== ''
+      && !SUPPORTED_CHAINS.has(intent.chainId.toLowerCase())
     ) {
       intent.status = 'cancelled';
       intent.resolvedAt = now;
@@ -76,8 +79,6 @@ registerStateProvider((userId) => {
   if (changed) state.intents = intents;
   return {
     realMode: Boolean(state.realMode),
-    realAuto: Boolean(state.realAuto && state.realMode),
-    hotWalletAuto: Boolean(state.hotWalletAuto && state.realMode),
     boundWallet: state.boundWallet,
     bindNonce: state.bindNonce,
     realIntents: intents.slice(-100),
@@ -91,21 +92,8 @@ export function isRealMode(userId) {
 export function setRealMode(userId, on) {
   const state = stateFor(userId);
   state.realMode = Boolean(on);
-  if (!state.realMode) state.realAuto = false;
   touch(userId);
-  return { realMode: state.realMode, realAuto: state.realAuto };
-}
-
-export function isRealAuto(userId) {
-  const state = stateFor(userId);
-  return Boolean(state.realMode && state.realAuto);
-}
-
-export function setRealAuto(userId, on) {
-  const state = stateFor(userId);
-  state.realAuto = Boolean(on) && state.realMode;
-  touch(userId);
-  return { realAuto: state.realAuto };
+  return { realMode: state.realMode };
 }
 
 export function getBoundWallet(userId) {
@@ -114,17 +102,17 @@ export function getBoundWallet(userId) {
 
 /**
  * Issue a fresh single-use bind challenge (anti-replay). The client signs the
- * returned message in Phantom; bindWallet consumes the nonce exactly once.
+ * returned message in MetaMask; bindWallet consumes the nonce exactly once.
  */
-export function createBindChallenge(userId, publicKey) {
+export function createBindChallenge(userId, address) {
   const state = stateFor(userId);
   const nonce = randomBytes(16).toString('hex');
   state.bindNonce = { value: nonce, exp: Date.now() + BIND_NONCE_TTL_MS };
   touch(userId);
-  return { message: buildBindMessage(userId, publicKey, nonce) };
+  return { message: buildBindMessage(userId, address, nonce) };
 }
 
-export function bindWallet(userId, publicKey, signature) {
+export function bindWallet(userId, address, signature) {
   const state = stateFor(userId);
   const challenge = state.bindNonce;
   if (!challenge || typeof challenge.value !== 'string') {
@@ -135,12 +123,12 @@ export function bindWallet(userId, publicKey, signature) {
     touch(userId);
     throw new Error('Challenge bind kadaluarsa — minta pesan baru');
   }
-  const message = buildBindMessage(userId, publicKey, challenge.value);
-  if (!verifyEd25519(publicKey, message, signature)) throw new Error('Signature wallet tidak valid');
+  const message = buildBindMessage(userId, address, challenge.value);
+  if (!verifyEvmSignature(address, message, signature)) throw new Error('Signature wallet tidak valid');
   state.bindNonce = null; // single-use: a captured signature cannot be replayed
-  state.boundWallet = publicKey;
+  state.boundWallet = address;
   touch(userId);
-  return { bound: true, publicKey };
+  return { bound: true, address };
 }
 
 export function assertBoundWallet(userId, publicKey) {
@@ -190,7 +178,8 @@ export function setRealIntentStatus(userId, intentId, status, claimToken = null)
     || (from === 'active' && (status === 'done' || status === 'open'));
   if (!allowed) throw new Error(`transisi tidak valid: ${from} -> ${status}`);
   if (status === 'active') {
-    if (from !== 'open') throw new Error('intent already claimed');
+    // `from` is provably 'open' here: the gate above only admits open->active
+    // for this branch (an earlier "already claimed" guard was unreachable).
     intent.claimToken = claimToken || randomUUID();
     intent.claimedAt = Date.now();
   } else if (from === 'active' && intent.claimToken && claimToken !== intent.claimToken) {
@@ -203,6 +192,10 @@ export function setRealIntentStatus(userId, intentId, status, claimToken = null)
     // Keep the virtual book aligned with confirmed real-wallet fills. This
     // prevents repeated real exits and lets the guardian protect real buys.
     if (intent.side === 'sell') {
+      // Cost basis must be captured BEFORE the reduce — afterwards the entry
+      // is gone and the realized PnL is unrecoverable.
+      const costUsd = (Number(intent.estTokens) || 0) * (Number(intent.entryAvgPrice) || Number(intent.intentPrice) || 0);
+      const proceedsUsd = (Number(intent.estTokens) || 0) * (Number(intent.intentPrice) || 0);
       reducePositionAmount(userId, intent.tokenAddress, intent.estTokens);
       // A confirmed TP1 (50% partial) arms the moonbag TP2. Doing this here —
       // not at emit time — means a user-cancelled TP1 never triggers a full
@@ -210,10 +203,16 @@ export function setRealIntentStatus(userId, intentId, status, claimToken = null)
       if (intent.source === 'TP1') {
         updatePositionMetadata(userId, intent.tokenAddress, { tp1Hit: true });
       }
+      // Realized PnL is booked HERE, on confirmation — not when the intent was
+      // emitted. An intent the user never approved is a proposal, not a trade,
+      // and counting it would inflate the win rate and total profit with
+      // phantom round trips. recordRealized dedups on the intent id, so a
+      // retried confirmation cannot double-count.
+      recordRealizedOnDone(userId, intent, proceedsUsd - costUsd);
     } else if (intent.side === 'buy') {
-      // Jupiter's quote output is not persisted on the intent. `estTokens` is
+      // The swap's actual output is not persisted on the intent. `estTokens` is
       // the conservative model estimate, used only for guardian bookkeeping;
-      // the UI still displays on-chain balances as the source of truth.
+      // the UI displays on-chain balances as the source of truth.
       addMirroredPosition(userId, {
         tokenAddress: intent.tokenAddress,
         symbol: intent.symbol,
@@ -230,29 +229,30 @@ export function setRealIntentStatus(userId, intentId, status, claimToken = null)
   return intent;
 }
 
-/** Set hot-wallet auto: server signs + broadcasts intents without Phantom. */
-export function setHotWalletAuto(userId, enabled) {
-  const state = stateFor(userId);
-  const on = Boolean(enabled && state.realMode);
-  // Turning hot-wallet auto ON makes the on-chain wallet the only source of
-  // truth, so leftover paper positions are dropped from the ledger. Kept
-  // otherwise, they blend with mirrored real fills: the guardian guards a
-  // position the wallet never held and tries to sell it forever.
-  if (on && !state.hotWalletAuto) {
-    try {
-      clearPositions(userId);
-    } catch (e) {
-      console.warn(`[realIntent] clear positions on hot-wallet-auto: ${e.message}`);
-    }
+/**
+ * Book a confirmed real exit into the autopilot stats + decision memory.
+ *
+ * Lives here rather than in the guardian tick because the guardian no longer
+ * knows whether an intent was ever approved — only this confirmation path
+ * does. Imported lazily: aiAgent.js imports realIntent.js, so a static import
+ * would be a cycle.
+ */
+function recordRealizedOnDone(userId, intent, pnlUsd) {
+  try {
+    const mod = autopilotModule;
+    if (!mod?.recordRealized) return;
+    mod.recordRealized(userId, { pnlUsd, intentId: intent.id, key: intent.id });
+    mod.logRealizedExit?.(userId, intent, pnlUsd);
+  } catch {
+    // A stats-bookkeeping failure must never fail the state transition — the
+    // trade genuinely executed, and the position mirror above already applied.
   }
-  state.hotWalletAuto = on;
-  touch(userId);
-  return { ok: true, hotWalletAuto: state.hotWalletAuto };
 }
 
-/** Get hot-wallet auto status. */
-export function isHotWalletAuto(userId) {
-  return stateFor(userId).hotWalletAuto;
+/** Set by aiAgent.js at import time; null when the agent module is absent. */
+let autopilotModule = null;
+export function registerAutopilotModule(mod) {
+  autopilotModule = mod;
 }
 
 /**
@@ -287,10 +287,13 @@ export function resolveIntentAsDone(userId, intentId, { force = false } = {}) {
     // Apply the same side-effects the claim-based path applies (persistence
     // mirrors the intent into the virtual ledger, so the two must agree).
     if (intent.side === 'sell') {
+      const costUsd = (Number(intent.estTokens) || 0) * (Number(intent.entryAvgPrice) || Number(intent.intentPrice) || 0);
+      const proceedsUsd = (Number(intent.estTokens) || 0) * (Number(intent.intentPrice) || 0);
       reducePositionAmount(userId, intent.tokenAddress, intent.estTokens);
       if (intent.source === 'TP1') {
         updatePositionMetadata(userId, intent.tokenAddress, { tp1Hit: true });
       }
+      recordRealizedOnDone(userId, intent, proceedsUsd - costUsd);
     } else if (intent.side === 'buy') {
       addMirroredPosition(userId, {
         tokenAddress: intent.tokenAddress,

@@ -3,7 +3,7 @@ import { api, Market } from '../api/client';
 import { usePolling } from '../hooks/usePolling';
 import { IconArrowDown, IconArrowUp, IconInfo } from '../components/Icons';
 import { fmt } from '../lib/format';
-import { useRealWallet } from '../components/RealWalletContext';
+import { useEvmWallet } from '../components/EvmWalletContext';
 import { RealTradeForm } from '../components/RealTradeForm';
 import { RealWalletBalance } from '../components/RealWalletBalance';
 
@@ -12,11 +12,11 @@ interface Props {
 }
 
 export function Trade({ prefill }: Props) {
-  const { realMode, loaded } = useRealWallet();
+  const { realMode, loaded } = useEvmWallet();
   const [side, setSide] = useState<'buy' | 'sell'>('buy');
   const [orderType, setOrderType] = useState<'market' | 'limit'>('market');
   const [tokenAddr, setTokenAddr] = useState('');
-  const [chain, setChain] = useState('solana');
+  const [chain, setChain] = useState('base');
   const [amountUsd, setAmountUsd] = useState('');
   const [amountTokens, setAmountTokens] = useState('');
   const [targetPrice, setTargetPrice] = useState('');
@@ -162,7 +162,7 @@ export function Trade({ prefill }: Props) {
   }
 
   // REAL mode → this page trades real funds via the unified form (Jupiter +
-  // Phantom). The virtual form below is not rendered in this branch (its poll
+  // MetaMask). The virtual form below is not rendered in this branch (its poll
   // short-circuits via the realMode guard above). User: "implementasikan kalo
   // user trade pake real wallet".
   if (realMode) {
@@ -172,15 +172,15 @@ export function Trade({ prefill }: Props) {
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4, flexWrap: 'wrap' }}>
             <h1 style={{ margin: 0 }}>Trade</h1>
             <span className="chip" style={{ background: 'var(--down-bg)', color: 'var(--down)', fontSize: 11, fontWeight: 700, border: '1px solid rgba(239,68,68,.4)' }}>
-              REAL · PHANTOM
+              REAL · METAMASK
             </span>
           </div>
-          <p>Dana asli via Jupiter + Phantom — server tidak pernah memegang private key, kamu approve tiap transaksi di wallet. Ganti ke virtual lewat banner atas atau panel Real Wallet.</p>
+          <p>Dana asli via 1inch + MetaMask — server tidak pernah memegang private key, kamu approve tiap transaksi di wallet. Ganti ke virtual lewat banner atas atau panel Real Wallet.</p>
         </div>
 
         {/* Class (not inline) so the ≤1024px media query can stack it on mobile. */}
         <div className="responsive-split">
-          <RealTradeForm prefill={prefill} watchlist={watchlist} />
+          <RealTradeForm />
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
             <div className="card" style={{ padding: 18 }}>
@@ -190,10 +190,10 @@ export function Trade({ prefill }: Props) {
 
             <div className="card" style={{ padding: 18, fontSize: 13, color: 'var(--muted)', lineHeight: 1.6 }}>
               <strong style={{ color: 'var(--text)', display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}><IconInfo size={15} /> Cara Kerja Real Trading:</strong>
-              • <strong>Market Order:</strong> Quote Jupiter → konfirmasi → sign Phantom → tx disimulasikan dulu sebelum dikirim.<br />
+              • <strong>Buat intent</strong> → approve di MetaMask → tx dikirim on-chain (dibangun 1inch, ditandatangani wallet kamu).<br />
               • <strong>Limit order &amp; TP/SL otomatis</strong> hanya tersedia di mode virtual (paper).<br />
-              • <strong>BUY</strong> memakai SOL (sisakan ~0.02 SOL untuk gas); <strong>SELL</strong> memakai jumlah token dari wallet.<br />
-              • Slippage maksimum 5%. Price impact &gt;3% diberi peringatan merah.
+              • <strong>BUY</strong> memakai ETH (sisakan ~0.005 ETH untuk gas); <strong>SELL</strong> memakai jumlah token dari wallet.<br />
+              • Slippage dikunci server-side maksimum 1% untuk intent otomatis.
             </div>
           </div>
         </div>

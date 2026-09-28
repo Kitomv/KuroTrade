@@ -7,10 +7,8 @@ import { fmt } from '../lib/format';
 import { useToast } from '../components/ToastProvider';
 import { useConfirm } from '../components/ConfirmDialog';
 import { StaleBadge } from '../components/StaleBadge';
-import { useRealWallet } from '../components/RealWalletContext';
-import { useHotWallet } from '../components/HotWalletContext';
+import { useEvmWallet } from '../components/EvmWalletContext';
 import { RealWalletPortfolio } from '../components/RealWalletPortfolio';
-import { HotWalletPortfolio } from '../components/HotWalletPortfolio';
 import { PendingIntents } from '../components/RealTradePanel';
 
 export interface PortfolioData {
@@ -23,9 +21,10 @@ export interface PortfolioData {
 }
 
 export function Portfolio() {
-  const { realMode, realAuto, connected, isBound } = useRealWallet();
-  const { status: hotStatus } = useHotWallet();
-  const hotExists = Boolean(hotStatus?.exists);
+  const {
+    realMode, connected, isBound,
+    openIntents, approvingId, approveError, approveIntent, cancelIntent,
+  } = useEvmWallet();
   // The summary is the same in both modes — keep polling the virtual ledger so
   // the page never goes blank when real mode is switched on.
   const p = usePolling<PortfolioData | undefined>(() => api.portfolio(), 2_500, []);
@@ -40,6 +39,10 @@ export function Portfolio() {
   const [exporting, setExporting] = useState<string | null>(null);
   const [loadingMoreOrders, setLoadingMoreOrders] = useState(false);
   const [olderOrders, setOlderOrders] = useState<Order[]>([]);
+  // Position table controls. With a dozen open positions the old fixed order
+  // (server order) meant finding the biggest loser required reading every row.
+  const [posSort, setPosSort] = useState<'value' | 'pnl' | 'symbol'>('value');
+  const [posQuery, setPosQuery] = useState('');
   const toast = useToast();
   const confirmAction = useConfirm();
 
@@ -97,38 +100,6 @@ export function Portfolio() {
 
   const w: Wallet = wallet ?? { balance: 100, available: 100, initialBalance: 100, totalValue: 100, totalPositionValue: 0, unrealizedPnl: 0, realizedPnl: 0, reservedUsd: 0 };
 
-  const handleReset = async () => {
-    // Step 1: numeric input (replaces prompt()).
-    const input = await confirmAction({
-      title: 'Reset Saldo Virtual',
-      message: 'Masukkan baseline saldo baru. Semua posisi & order akan dihapus; PnL % berikutnya dihitung dari baseline ini.',
-      confirmLabel: 'Lanjut',
-      input: { label: 'Saldo awal (USDC)', type: 'number', placeholder: '50', initial: String(w.initialBalance), required: true },
-    });
-    if (!input) return;
-    const amount = parseFloat(String(input));
-    if (isNaN(amount) || amount <= 0) { setErr('Jumlah tidak valid'); return; }
-    // Step 2: danger confirmation.
-    const ok = await confirmAction({
-      title: 'Konfirmasi Reset',
-      message: `Reset saldo ke $${amount.toFixed(2)} USDC? Semua posisi, order, dan riwayat akan dihapus.`,
-      confirmLabel: 'Ya, Reset',
-      danger: true,
-    });
-    if (!ok) return;
-    setLoadingReset(true);
-    setErr('');
-    try {
-      await api.resetWallet(amount);
-      setOlderOrders([]);
-      toast.showToast(`Saldo direset ke $${amount.toFixed(2)} USDC`, 'success');
-    } catch (e: any) {
-      setErr(e.message ?? 'Gagal reset wallet');
-    } finally {
-      setLoadingReset(false);
-    }
-  };
-
   const myPositions = positions ?? [];
   const allOrders = orders ?? [];
   const filledOrders = allOrders.filter((o) => o.status === 'filled');
@@ -168,6 +139,74 @@ export function Portfolio() {
     })
     .sort((a, b) => b.value - a.value);
 
+  // Sorted + filtered view of the position table. Sorting is client-side over
+  // the already-polled payload, so switching it costs no request.
+  const displayPositions = (() => {
+    const q = posQuery.trim().toLowerCase();
+    const filtered = q
+      ? myPositions.filter((p) =>
+          `${p.symbol ?? ''} ${p.name ?? ''} ${p.tokenAddress}`.toLowerCase().includes(q))
+      : myPositions;
+    const pnlOf = (p: Position) => {
+      const cur = p.currentPrice ?? p.avgBuyPrice;
+      return p.amount * cur - p.totalCost;
+    };
+    const sorted = [...filtered];
+    if (posSort === 'value') {
+      sorted.sort((a, b) => b.amount * (b.currentPrice ?? b.avgBuyPrice) - a.amount * (a.currentPrice ?? a.avgBuyPrice));
+    } else if (posSort === 'pnl') {
+      sorted.sort((a, b) => pnlOf(b) - pnlOf(a));
+    } else {
+      sorted.sort((a, b) => (a.symbol ?? '').localeCompare(b.symbol ?? ''));
+    }
+    return sorted;
+  })();
+
+  // Declared here, not above: it reads `myPositions`/`displayFilledOrders`,
+  // which are `const` further down. A handler defined before them captures
+  // them in the TDZ and throws ReferenceError the moment it is clicked.
+  const handleReset = async () => {
+    const input = await confirmAction({
+      title: 'Reset Saldo Virtual',
+      message: 'Masukkan baseline saldo baru. Semua posisi & order akan dihapus; PnL % berikutnya dihitung dari baseline ini.',
+      confirmLabel: 'Lanjut',
+      input: { label: 'Saldo awal (USDC)', type: 'number', placeholder: '50', initial: String(w.initialBalance), required: true },
+    });
+    if (!input) return;
+    const amount = parseFloat(String(input));
+    if (isNaN(amount) || amount <= 0) { setErr('Jumlah tidak valid'); return; }
+    // Spell out exactly what is destroyed — the button label said "Set
+    // Baseline", which does not advertise that trade history goes with it.
+    const ok = await confirmAction({
+      title: 'Hapus Semua Data Trading?',
+      message: (
+        <>
+          Saldo akan diset ke <strong>{fmt.usd(amount)}</strong> dan
+          <strong style={{ color: 'var(--down)' }}> tidak bisa dikembalikan</strong>:
+          <ul style={{ margin: '8px 0 0', paddingLeft: 18 }}>
+            <li>{myPositions.length} posisi aktif dihapus</li>
+            <li>{displayFilledOrders.length} riwayat transaksi dihapus</li>
+            <li>Riwayat PnL direset ke nol</li>
+          </ul>
+        </>
+      ),
+      confirmLabel: 'Hapus & Reset',
+      danger: true,
+    });
+    if (!ok) return;
+    setLoadingReset(true);
+    setErr('');
+    try {
+      await api.resetWallet(amount);
+      setOlderOrders([]);
+      toast.showToast(`Saldo direset ke ${fmt.usd(amount)}`, 'success');
+    } catch (e: any) {
+      setErr(e.message ?? 'Gagal reset wallet');
+    } finally {
+      setLoadingReset(false);
+    }
+  };
+
   if (realMode) {
     // REAL mode → the page shows the on-chain wallet (balances + swap dialog),
     // not the virtual paper-trading ledger.
@@ -177,15 +216,22 @@ export function Portfolio() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4, flexWrap: 'wrap' }}>
             <h1 style={{ margin: 0 }}>Portfolio</h1>
             <span className="chip" style={{ background: 'var(--down-bg)', color: 'var(--down)', fontSize: 11, fontWeight: 700, border: '1px solid rgba(239,68,68,.4)' }}>
-              REAL · DANA ASLI{realAuto ? ' · AUTO' : ''}
+              REAL · DANA ASLI
             </span>
           </div>
           <p>Detail wallet on-chain (dana asli). Ganti ke virtual lewat panel Real Wallet di sidebar.</p>
         </div>
 
-        {/* Hot wallet active → show ITS on-chain books (server-side), never Phantom. */}
-        {hotExists ? <HotWalletPortfolio /> : <RealWalletPortfolio />}
-        <PendingIntents />
+        {/* The bound MetaMask address is the only real wallet — there is no
+            server-side wallet whose books could disagree with it. */}
+        <RealWalletPortfolio />
+        <PendingIntents
+          intents={openIntents}
+          approvingId={approvingId}
+          approveError={approveError}
+          onApprove={approveIntent}
+          onCancel={cancelIntent}
+        />
       </>
     );
   }
@@ -196,10 +242,10 @@ export function Portfolio() {
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
             <h1>Portfolio</h1>
-            <span className="chip" style={{ background: 'rgba(34, 197, 94, .12)', color: 'var(--up)', fontSize: 11, fontWeight: 700, border: '1px solid rgba(34, 197, 94, .3)', boxShadow: '0 0 12px rgba(34,197,94,.2)' }}>
+            <span className="chip" style={{ background: 'var(--up-bg)', color: 'var(--up)', fontSize: 10.5 }}>
               LIVE PnL (2s)
             </span>
-            <span className="chip" style={{ background: 'rgba(245, 158, 11, .15)', color: 'var(--accent)', fontSize: 11, boxShadow: '0 0 10px rgba(245,158,11,.15)' }}>
+            <span className="chip" style={{ background: 'var(--accent-dim)', color: 'var(--accent)', fontSize: 10.5 }}>
               VIRTUAL {fmt.usd(w.initialBalance)}
             </span>
             <StaleBadge stale={p.stale} />
@@ -213,7 +259,7 @@ export function Portfolio() {
           <button className="btn" onClick={() => handleExport('positions')} disabled={exporting === 'positions'} style={{ fontSize: 13 }}>
             {exporting === 'positions' ? 'Mengunduh…' : 'Export Posisi CSV'}
           </button>
-          <button className="btn" onClick={handleReset} disabled={loadingReset} style={{ background: 'rgba(239, 68, 68, .14)', borderColor: 'rgba(239, 68, 68, .4)', color: 'var(--down)' }}>
+          <button className="btn" onClick={handleReset} disabled={loadingReset} style={{ background: 'var(--down-bg)', borderColor: 'var(--down)', color: 'var(--down)' }}>
             {loadingReset ? 'Resetting…' : 'Set Baseline (Reset)'}
           </button>
         </div>
@@ -232,11 +278,11 @@ export function Portfolio() {
       {wallet !== undefined && (
         <div className="kpi-grid">
           <KpiCard label="Total Portofolio" value={fmt.usd(w.totalValue)} sub={returnMeaningful ? `${totalReturn >= 0 ? '+' : ''}${totalReturn.toFixed(2)}% dari baseline` : `baseline ${fmt.usd(w.initialBalance)}`} variant={returnMeaningful ? (totalReturn >= 0 ? 'up' : 'down') : undefined} />
-          <KpiCard label="Saldo Tersedia" value={fmt.usd(w.available)} sub={w.reservedUsd > 0 ? `${fmt.usd(w.reservedUsd)} tereservasi limit` : `${myPositions.length} posisi aktif`} />
-          <KpiCard label="Nilai Posisi" value={fmt.usd(w.totalPositionValue)} sub={`${myPositions.length} token di portfolio`} />
-          <KpiCard label="Unrealized PnL" value={fmt.usd(w.unrealizedPnl)} sub="Fluktuasi harga live" variant={w.unrealizedPnl >= 0 ? 'up' : 'down'} />
-          <KpiCard label="Realized PnL" value={fmt.usd(w.realizedPnl)} sub="Hasil jual / TP yang terkunci" variant={w.realizedPnl >= 0 ? 'up' : 'down'} />
-          <KpiCard label="Total PnL %" value={returnLabel} sub={`vs saldo awal ${fmt.usd(w.initialBalance)}`} variant={returnMeaningful ? (totalReturn >= 0 ? 'up' : 'down') : undefined} />
+          <KpiCard label="Kas Tersedia" value={fmt.usd(w.available)} sub={w.reservedUsd > 0 ? `${fmt.usd(w.reservedUsd)} terkunci di limit order` : `${fmt.usd(w.totalPositionValue)} terdeploy ke ${myPositions.length} posisi`} />
+          <KpiCard label="PnL Terbuka" value={fmt.usd(w.totalPositionValue)} sub={`${myPositions.length} token di portfolio`} />
+          <KpiCard label="Unrealized PnL (mengambang)" value={fmt.usd(w.unrealizedPnl)} sub={allocations.length > 0 ? `mengambang · ${allocations[0].symbol} ${allocations[0].pct.toFixed(0)}% dari posisi` : 'mengambang · belum ada posisi'} variant={w.unrealizedPnl >= 0 ? 'up' : 'down'} />
+          <KpiCard label="Realized PnL (terkunci)" value={fmt.usd(w.realizedPnl)} sub="Hasil jual / TP yang terkunci" variant={w.realizedPnl >= 0 ? 'up' : 'down'} />
+          <KpiCard label="Total PnL Persen" value={returnLabel} sub={`vs saldo awal ${fmt.usd(w.initialBalance)}`} variant={returnMeaningful ? (totalReturn >= 0 ? 'up' : 'down') : undefined} />
         </div>
       )}
 
@@ -253,7 +299,7 @@ export function Portfolio() {
                 key={a.tokenAddress}
                 style={{
                   width: `${a.pct}%`,
-                  background: ['var(--accent)', '#38bdf8', 'var(--cta)', 'var(--up)', '#f472b6'][i % 5],
+                  background: ['var(--accent)', 'var(--accent2)', '#a8763a', 'var(--up)', 'var(--down)'][i % 5],
                   transition: 'width .5s ease',
                 }}
                 title={`${a.symbol} ${a.pct.toFixed(1)}%`}
@@ -263,7 +309,7 @@ export function Portfolio() {
           <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 12 }}>
             {allocations.map((a, i) => (
               <div key={a.tokenAddress} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
-                <span style={{ width: 10, height: 10, borderRadius: 3, background: ['var(--accent)', '#38bdf8', 'var(--cta)', 'var(--up)', '#f472b6'][i % 5] }} />
+                <span style={{ width: 9, height: 9, background: ['var(--accent)', 'var(--accent2)', '#a8763a', 'var(--up)', 'var(--down)'][i % 5] }} />
                 <strong>{a.symbol}</strong>
                 <span style={{ color: 'var(--muted)' }}>{a.pct.toFixed(1)}%</span>
                 <span style={{ color: 'var(--muted)' }}>· {fmt.usd(a.value)}</span>
@@ -312,7 +358,7 @@ export function Portfolio() {
                       <td className="num">{Number.isFinite(Number(o.amount)) ? Number(o.amount).toFixed(4) : '—'}</td>
                       <td className="num">{Number.isFinite(Number(o.usdAmount)) ? fmt.usd(Number(o.usdAmount)) : '—'}</td>
                       <td style={{ textAlign: 'right' }}>
-                        <button className="btn icon" style={{ color: 'var(--down)', background: 'rgba(239, 68, 68, .1)' }} onClick={() => handleCancelOrder(o.id)}>
+                        <button className="btn icon" style={{ color: 'var(--down)', background: 'var(--down-bg)' }} onClick={() => handleCancelOrder(o.id)}>
                           Batal
                         </button>
                       </td>
@@ -327,27 +373,57 @@ export function Portfolio() {
 
       {/* Posisi Aktif */}
       <div className="card" style={{ marginBottom: 24 }}>
-        <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--border)', fontWeight: 600, fontSize: 14 }}>
-          Posisi Aktif ({myPositions.length})
+        <div style={{ padding: '12px 20px', borderBottom: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <span style={{ fontWeight: 600, fontSize: 14 }}>
+            Posisi Aktif ({displayPositions.length}
+            {posQuery && displayPositions.length !== myPositions.length ? ` / ${myPositions.length}` : ''})
+          </span>
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+            <input
+              className="input"
+              type="search"
+              placeholder="cari token…"
+              value={posQuery}
+              onChange={(e) => setPosQuery(e.target.value)}
+              style={{ minHeight: 30, padding: '5px 9px', fontSize: 12, width: 150 }}
+              aria-label="Cari posisi"
+            />
+            {(['value', 'pnl', 'symbol'] as const).map((k) => (
+              <button
+                key={k}
+                type="button"
+                onClick={() => setPosSort(k)}
+                aria-pressed={posSort === k}
+                className="chip"
+                style={{
+                  cursor: 'pointer',
+                  background: posSort === k ? 'var(--accent-dim)' : 'var(--panel-2)',
+                  color: posSort === k ? 'var(--accent)' : 'var(--muted)',
+                  borderColor: posSort === k ? 'var(--accent)' : 'var(--rule)',
+                }}
+              >
+                {k === 'value' ? 'Nilai' : k === 'pnl' ? 'PnL' : 'A-Z'}
+              </button>
+            ))}
+          </div>
         </div>
         <div className="table-wrap">
           <table>
             <thead>
               <tr>
                 <th>Token</th>
-                <th className="num">Amount</th>
-                <th className="num">Avg Buy</th>
-                <th className="num">Current</th>
-                <th className="num">Highest</th>
-                <th className="num">Drawdown</th>
+                <th className="num">Jumlah</th>
+                <th className="num">Avg Beli</th>
+                <th className="num">Harga Kini</th>
+                <th className="num">Peak / Drawdown</th>
                 <th className="num">Nilai</th>
-                <th className="num">PnL (USD)</th>
-                <th>PnL %</th>
+                <th className="num">PnL</th>
+                <th className="num">PnL %</th>
                 <th></th>
               </tr>
             </thead>
             <tbody>
-              {myPositions.map((p) => {
+              {displayPositions.map((p) => {
                 const current = p.currentPrice ?? p.avgBuyPrice;
                 const value = p.amount * current;
                 const unrealizedPnl = value - p.totalCost;
@@ -369,19 +445,21 @@ export function Portfolio() {
                     <td className="num">{p.amount.toFixed(4)}</td>
                     <td className="num">{fmt.usd(p.avgBuyPrice)}</td>
                     <td className="num">{fmt.usd(current)}</td>
-                    <td className="num">{fmt.usd(highest)}</td>
+                    {/* Peak and drawdown answer one question ("how far off the
+                        high are we?"), so they share a cell instead of two. */}
                     <td className="num">
-                      <span className={`badge ${drawdown < 0 ? 'down' : 'flat'}`}>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12.5 }}>{fmt.usd(highest)}</div>
+                      <div style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: drawdown < -5 ? 'var(--down)' : 'var(--dim)' }}>
                         {drawdown.toFixed(1)}%
-                      </span>
+                      </div>
                     </td>
                     <td className="num">{fmt.usd(value)}</td>
                     <td className="num">
-                      <span className={`badge ${isUp ? 'up' : 'down'}`} style={{ fontWeight: 700 }}>
+                      <span className={`badge ${isUp ? 'up' : 'down'}`} style={{ fontWeight: 600 }}>
                         {isUp ? '+' : ''}{fmt.usd(unrealizedPnl)}
                       </span>
                     </td>
-                    <td>
+                    <td className="num">
                       <span className={`badge ${isUp ? 'up' : 'down'}`}>
                         {isUp ? '+' : ''}{pnlPct.toFixed(2)}%
                       </span>
@@ -391,7 +469,7 @@ export function Portfolio() {
                         className="btn icon"
                         onClick={() => handleSell(p)}
                         disabled={selling === p.tokenAddress}
-                        style={{ color: 'var(--down)', background: 'rgba(239, 68, 68, .1)' }}
+                        style={{ color: 'var(--down)', background: 'var(--down-bg)' }}
                       >
                         {selling === p.tokenAddress ? 'Menjual…' : 'Jual'}
                       </button>
@@ -406,6 +484,11 @@ export function Portfolio() {
           <div className="empty" style={{ padding: 32 }}>
             <IconBriefcase size={32} />
             Belum ada posisi. Beli token dari halaman Trade.
+          </div>
+        )}
+        {myPositions.length > 0 && !displayPositions.length && (
+          <div className="empty" style={{ padding: 32 }}>
+            Tidak ada posisi yang cocok dengan &quot;{posQuery}&quot;.
           </div>
         )}
       </div>

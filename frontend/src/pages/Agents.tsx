@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { api, AgentReport, AutopilotConfig, LLMConfig, LLMProviderEntry } from '../api/client';
 import { usePolling } from '../hooks/usePolling';
 import { EquityChart } from '../components/EquityChart';
@@ -9,15 +9,15 @@ import { useToast } from '../components/ToastProvider';
 import { useConfirm } from '../components/ConfirmDialog';
 import { StaleBadge } from '../components/StaleBadge';
 import { RealTradeForm } from '../components/RealTradeForm';
-import { useHotWallet } from '../components/HotWalletContext';
-import { shortAddr } from '../lib/solana';
-import type { Page } from '../api/client';
+import { useEvmWallet } from '../components/EvmWalletContext';
+import { shortAddr } from '../lib/evm';
+import type { Page, AutopilotGuardedPosition } from '../api/client';
 
 const logTags = ['ALL', 'BUY', 'TP', 'SELL', 'SL', 'WARN', 'SCAN', 'ROTATE', 'CONFIG'] as const;
 type LogTag = (typeof logTags)[number];
 
 export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
-  const hotWallet = useHotWallet();
+  const { connected, isBound, boundWallet, openIntents } = useEvmWallet();
   const [tokenAddr, setTokenAddr] = useState('');
   const [analyzing, setAnalyzing] = useState(false);
   const [report, setReport] = useState<AgentReport | null>(null);
@@ -30,6 +30,13 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
   const [showConfig, setShowConfig] = useState(false);
   const [showLLMModal, setShowLLMModal] = useState(false);
   const [tagFilter, setTagFilter] = useState<LogTag>('ALL');
+  const [logSearch, setLogSearch] = useState('');
+  // Auto-follow the tail only while the reader is already at the bottom.
+  // Unconditionally scrolling on every new line made the feed impossible to
+  // read: the guardian logs every 5s, so any attempt to scroll back was
+  // yanked forward again before the line could be finished.
+  const [followLogs, setFollowLogs] = useState(true);
+  const [unseenLogs, setUnseenLogs] = useState(0);
   const toast = useToast();
   const confirmAction = useConfirm();
 
@@ -76,6 +83,20 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
   const [llmTestResult, setLlmTestResult] = useState<Record<number, { ok: boolean; text: string } | undefined>>({});
 
   const logsEndRef = useRef<HTMLDivElement>(null);
+  const logScrollRef = useRef<HTMLDivElement>(null);
+
+  // Re-engage follow mode once the reader scrolls back to the bottom.
+  const handleLogScroll = useCallback(() => {
+    const el = logScrollRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+    if (atBottom && !followLogs) {
+      setFollowLogs(true);
+      setUnseenLogs(0);
+    } else if (!atBottom && followLogs) {
+      setFollowLogs(false);
+    }
+  }, [followLogs]);
 
   useEffect(() => {
     if (autopilot) {
@@ -103,6 +124,14 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
   // `logsEndRef` anchored to the newest line (it is the last child).
   const visibleLogs = (autopilot?.logs ?? [])
     .filter((l) => tagFilter === 'ALL' || l.tag === tagFilter)
+    .filter((l) => {
+      const q = logSearch.trim().toLowerCase();
+      if (!q) return true;
+      // Search the message AND the structured details — a symbol often lives
+      // in details only, so a message-only search would miss the intent rows.
+      const hay = `${l.msg} ${l.details ? JSON.stringify(l.details) : ''}`.toLowerCase();
+      return hay.includes(q);
+    })
     .slice()
     .sort((a, b) => a.ts - b.ts);
 
@@ -131,9 +160,23 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
     return () => { cancelled = true; stop(); document.removeEventListener('visibilitychange', onVisibility); };
   }, []);
 
+  // Keyed on the RAW log count, not the filtered length: changing a filter or
+  // the search box changes `visibleLogs.length` without any new activity, which
+  // would inflate the "N baru" badge with lines that are not actually new.
+  // `seenCountRef` records how many entries were on screen when the reader was
+  // last at the bottom, so the badge counts exactly the difference — toggling
+  // follow mode alone must not fabricate an unread line.
+  const rawLogCount = autopilot?.logs?.length ?? 0;
+  const seenCountRef = useRef(0);
   useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  }, [visibleLogs.length]);
+    if (followLogs) {
+      logsEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      seenCountRef.current = rawLogCount;
+      setUnseenLogs(0);
+    } else {
+      setUnseenLogs(Math.max(0, rawLogCount - seenCountRef.current));
+    }
+  }, [rawLogCount, followLogs]);
 
   useEffect(() => {
     if (llmInfo) {
@@ -303,7 +346,7 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
 
     if (realMode) {
       // Real mode → open RealTradeForm modal with token/amount prefilled.
-      // RealTradeForm will handle quote → swap → Phantom sign → broadcast.
+      // RealTradeForm handles quote → intent → MetaMask sign → broadcast.
       setRadarTrade({
         ...report,
         token: { ...token, symbol: token.symbol, name: token.name, chainId: token.chainId, priceUsd: verdict.entryPrice },
@@ -356,7 +399,7 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
     lastScanAt: null,
     guardedPositionsCount: 0,
     guardedPositions: [],
-    stats: { totalScans: 0, totalTrades: 0, profitableTrades: 0, totalProfitUsd: 0, winRate: 0, autoExecutedTrades: 0 },
+    stats: { totalScans: 0, totalTrades: 0, profitableTrades: 0, totalProfitUsd: 0, winRate: 0 },
     logs: [],
   };
 
@@ -365,7 +408,7 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
     ? ap.status === 'SCANNING'
       ? 'var(--accent)'
       : ap.status === 'GUARDIAN'
-      ? '#38bdf8'
+      ? 'var(--accent2)'
       : 'var(--up)'
     : 'var(--muted)';
 
@@ -387,9 +430,9 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
             <span
               className="chip"
               style={{
-                background: activeLLM.hasKey ? 'rgba(245, 158, 11, .15)' : 'var(--panel-2)',
+                background: activeLLM.hasKey ? 'var(--accent-dim)' : 'var(--panel-2)',
                 color: activeLLM.hasKey ? 'var(--accent)' : 'var(--muted)',
-                border: `1px solid ${activeLLM.hasKey ? 'rgba(245, 158, 11, .4)' : 'var(--border)'}`,
+                border: `1px solid ${activeLLM.hasKey ? 'var(--accent)' : 'var(--border)'}`,
                 cursor: 'pointer',
               }}
               onClick={() => setShowLLMModal(true)}
@@ -420,9 +463,9 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
           <button
             className="btn"
             style={{
-              background: isRunning ? 'rgba(239, 68, 68, .16)' : 'rgba(34, 197, 94, .18)',
+              background: isRunning ? 'var(--down-bg)' : 'var(--up-bg)',
               color: isRunning ? 'var(--down)' : 'var(--up)',
-              borderColor: isRunning ? 'rgba(239, 68, 68, .4)' : 'rgba(34, 197, 94, .4)',
+              borderColor: isRunning ? 'var(--down)' : 'var(--up)',
               fontWeight: 700,
               padding: '10px 20px',
               fontSize: 14,
@@ -627,7 +670,7 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
           <div style={{ display: 'flex', gap: 18, alignItems: 'center' }}>
             <div style={{ textAlign: 'right' }}>
               <div style={{ fontSize: 11, color: 'var(--muted)', textTransform: 'uppercase', fontWeight: 600 }}>Posisi Diproteksi</div>
-              <div style={{ fontSize: 17, fontWeight: 700, color: ap.guardedPositionsCount > 0 ? '#38bdf8' : 'var(--text)' }}>
+              <div style={{ fontSize: 17, fontWeight: 700, color: ap.guardedPositionsCount > 0 ? 'var(--accent2)' : 'var(--text)' }}>
                 {ap.guardedPositionsCount} Token
               </div>
             </div>
@@ -725,16 +768,12 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
       {/* KPI Monitoring Tiles */}
       <div className="kpi-grid">
         <div className="card kpi">
-          <div className="label">Auto-Trades Dieksekusi</div>
-          <div className="value">
-            {realMode
-              ? (ap.stats?.autoExecutedTrades ?? 0)
-              : (ap.stats?.totalTrades ?? 0)} Order
-          </div>
+          <div className="label">Round Trip Selesai</div>
+          <div className="value">{ap.stats?.totalTrades ?? 0} Order</div>
           <div className="sub">
             {realMode
-              ? `${ap.stats?.autoExecutedTrades ?? 0} broadcast hot wallet (BUY+SELL)`
-              : `${ap.stats?.totalTrades ?? 0} round trip selesai`}
+              ? 'exit yang kamu approve di MetaMask'
+              : 'round trip paper trading'}
           </div>
         </div>
         <div className="card kpi">
@@ -747,11 +786,15 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
           </div>
         </div>
         <div className="card kpi">
-          <div className="label">Position Guardian Status</div>
-          <div className="value" style={{ color: ap.guardedPositionsCount > 0 ? '#38bdf8' : 'var(--muted)' }}>
-            {ap.guardedPositionsCount > 0 ? 'AKTIF MELINDUNGI' : 'TIDAK ADA POSISI'}
+          <div className="label">Diproteksi Guardian</div>
+          <div className="value" style={{ color: ap.guardedPositionsCount > 0 ? 'var(--accent2)' : 'var(--muted)' }}>
+            {ap.guardedPositionsCount}
           </div>
-          <div className="sub">{ap.guardedPositionsCount} token open di portfolio</div>
+          <div className="sub">
+            {ap.guardedPositionsCount > 0
+              ? `dari maks ${ap.maxOpenPositions ?? 3} slot · TP/SL otomatis`
+              : 'belum ada posisi terbuka'}
+          </div>
         </div>
         <div className="card kpi">
           <div className="label">AI Model Engine</div>
@@ -803,20 +846,21 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
                         </span>
                       </td>
                       <td>
-                        <div style={{ fontSize: 11, color: 'var(--muted)' }}>
-                          <span style={{ color: 'var(--up)' }}>TP: ${p.tpPrice.toFixed(4)}</span> | <span style={{ color: 'var(--down)' }}>SL: ${p.slPrice.toFixed(4)}</span>
-                        </div>
+                        {/* Progress to target answers "how far to go?" — the raw
+                            TP/SL prices alone made the reader do the arithmetic.
+                            The bar spans SL→TP with the live price marked. */}
+                        <TargetBar p={p} />
                         {p.status === 'TRAILING_ACTIVE' && (
-                          <div style={{ marginTop: 2 }}>
-                            <span className="chip" style={{ fontSize: 10, padding: '1px 6px', background: 'rgba(56, 189, 248, .15)', color: '#38bdf8', border: '1px solid rgba(56, 189, 248, .4)' }}>
-                              <IconLock size={12} /> Trailing Lock ({p.highestPrice ? `Peak $${p.highestPrice.toFixed(4)}` : 'Active'})
+                          <div style={{ marginTop: 3 }}>
+                            <span className="chip" style={{ fontSize: 9.5, padding: '1px 6px', background: 'rgba(122, 158, 143, .14)', color: 'var(--accent2)', border: '1px solid rgba(122, 158, 143, .4)' }}>
+                              <IconLock size={12} /> Trailing {p.highestPrice ? `· peak $${p.highestPrice.toFixed(4)}` : ''}
                             </span>
                           </div>
                         )}
                         {p.status === 'MOONBAG_RUNNER' && (
-                          <div style={{ marginTop: 2 }}>
-                            <span className="chip" style={{ fontSize: 10, padding: '1px 6px', background: 'rgba(168, 85, 247, .15)', color: '#c084fc', border: '1px solid rgba(168, 85, 247, .4)' }}>
-                              <IconRocket size={12} /> Moonbag 50% Running
+                          <div style={{ marginTop: 3 }}>
+                            <span className="chip" style={{ fontSize: 9.5, padding: '1px 6px', background: 'var(--accent-dim)', color: 'var(--accent)', border: '1px solid rgba(232, 163, 61, .4)' }}>
+                              <IconRocket size={12} /> Moonbag 50%
                             </span>
                           </div>
                         )}
@@ -835,31 +879,34 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
           )}
         </div>
 
-        {/* Real-Time Terminal Activity Feed */}
-        <div className="card" style={{ display: 'flex', flexDirection: 'column', background: '#070b18', border: '1px solid #1e293b' }}>
-          <div style={{ padding: '12px 18px', borderBottom: '1px solid #1e293b', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+        {/* Terminal activity feed — the one place a real terminal is the right
+            metaphor, so it gets the full monospace treatment. */}
+        <div className="card" style={{ display: 'flex', flexDirection: 'column', background: 'var(--bg-2)' }}>
+          <div style={{ padding: '11px 16px', borderBottom: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ color: '#22c55e', fontSize: 12 }}>●</span>
-              <strong style={{ fontSize: 13, fontFamily: 'var(--font-heading)', color: '#94a3b8', letterSpacing: '.05em' }}>
+              <span style={{ color: 'var(--up)', fontSize: 10, lineHeight: 1 }}>●</span>
+              <strong style={{ fontSize: 11, fontFamily: 'var(--font-heading)', color: 'var(--muted)', letterSpacing: '.14em' }}>
                 TERMINAL ACTIVITY FEED
               </strong>
-              <span style={{ color: '#64748b', fontSize: 11 }}>({visibleLogs.length} log)</span>
+              <span style={{ color: 'var(--dim)', fontSize: 10.5, fontFamily: 'var(--font-mono)' }}>{visibleLogs.length} log</span>
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 3, flexWrap: 'wrap' }}>
               {logTags.map((t) => (
                 <button
                   key={t}
                   onClick={() => setTagFilter(t)}
+                  aria-pressed={tagFilter === t}
                   style={{
-                    background: tagFilter === t ? 'rgba(56, 189, 248, .2)' : 'transparent',
-                    color: tagFilter === t ? '#38bdf8' : '#64748b',
-                    border: tagFilter === t ? '1px solid rgba(56,189,248,.4)' : '1px solid transparent',
-                    borderRadius: 4,
-                    fontSize: 10,
-                    padding: '2px 7px',
+                    background: tagFilter === t ? 'var(--accent-dim)' : 'transparent',
+                    color: tagFilter === t ? 'var(--accent)' : 'var(--dim)',
+                    border: tagFilter === t ? '1px solid var(--accent)' : '1px solid transparent',
+                    borderRadius: 2,
+                    fontSize: 9.5,
+                    padding: '2px 6px',
                     cursor: 'pointer',
-                    fontFamily: 'monospace',
-                    fontWeight: 700,
+                    fontFamily: 'var(--font-mono)',
+                    fontWeight: 600,
+                    letterSpacing: '.04em',
                   }}
                 >
                   {t}
@@ -867,55 +914,107 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
               ))}
               <button
                 onClick={handleClearLogs}
-                style={{ background: 'none', border: 'none', color: '#64748b', cursor: 'pointer', fontSize: 11, textDecoration: 'underline', marginLeft: 8 }}
+                style={{ background: 'none', border: 'none', color: 'var(--dim)', cursor: 'pointer', fontSize: 10.5, textDecoration: 'underline', marginLeft: 6, fontFamily: 'var(--font-body)' }}
               >
-                Clear Log
+                Clear
               </button>
             </div>
           </div>
 
-          <div style={{ padding: 14, flex: 1, maxHeight: 260, overflowY: 'auto', fontFamily: 'monospace', fontSize: 12, lineHeight: 1.6 }}>
-            {visibleLogs.map((l) => {
+          {/* Search across message + structured details. */}
+          <div style={{ padding: '9px 16px', borderBottom: '1px solid var(--rule)', display: 'flex', gap: 8, alignItems: 'center' }}>
+            <input
+              className="input"
+              type="search"
+              placeholder="cari simbol, intent id, atau teks…"
+              value={logSearch}
+              onChange={(e) => setLogSearch(e.target.value)}
+              style={{ minHeight: 32, padding: '6px 10px', fontSize: 12 }}
+              aria-label="Cari log"
+            />
+            {logSearch && (
+              <button
+                onClick={() => setLogSearch('')}
+                style={{ background: 'none', border: 'none', color: 'var(--dim)', cursor: 'pointer', fontSize: 11, whiteSpace: 'nowrap' }}
+              >
+                Reset
+              </button>
+            )}
+          </div>
+
+          <div
+            ref={logScrollRef}
+            onScroll={handleLogScroll}
+            style={{ padding: 13, flex: 1, maxHeight: 268, overflowY: 'auto', fontFamily: 'var(--font-mono)', fontSize: 11.5, lineHeight: 1.65 }}
+          >
+            {visibleLogs.map((l, i) => {
               const tagColor =
                 l.tag === 'BUY' || l.tag === 'TP'
-                  ? '#22c55e'
+                  ? 'var(--up)'
                   : l.tag === 'SELL' || l.tag === 'SL'
-                  ? '#ef4444'
+                  ? 'var(--down)'
                   : l.tag === 'WARN'
-                  ? '#f59e0b'
+                  ? 'var(--accent)'
                   : l.tag === 'ROTATE'
-                  ? '#c084fc'
-                  : '#38bdf8';
+                  ? 'var(--accent2)'
+                  : 'var(--muted)';
 
               return (
-                <div key={l.id} style={{ marginBottom: 6, display: 'flex', gap: 8, alignItems: 'flex-start' }}>
-                  <span style={{ color: '#475569', flexShrink: 0 }}>
-                    [{new Date(l.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}]
+                <div key={l.id} style={{ marginBottom: 5, display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+                  <span style={{ color: 'var(--dim)', flexShrink: 0 }}>
+                    {new Date(l.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
                   </span>
                   <span
                     style={{
-                      background: `${tagColor}22`,
                       color: tagColor,
-                      padding: '1px 6px',
-                      borderRadius: 4,
-                      fontWeight: 700,
-                      fontSize: 10,
+                      borderLeft: `2px solid ${tagColor}`,
+                      paddingLeft: 5,
+                      fontWeight: 600,
+                      fontSize: 9.5,
                       flexShrink: 0,
+                      letterSpacing: '.05em',
+                      minWidth: 44,
                     }}
                   >
                     {l.tag}
                   </span>
-                  <span style={{ color: '#cbd5e1', wordBreak: 'break-word' }}>{l.msg}</span>
+                  <span style={{ color: 'var(--text)', wordBreak: 'break-word', opacity: .92, flex: 1 }}>{l.msg}</span>
+                  <LogDetails details={l.details} />
+                  {/* Only the newest line is highlighted; older ones stay flat so
+                      the eye tracks the live edge instead of a wall of amber. */}
+                  {i === visibleLogs.length - 1 && followLogs && (
+                    <span style={{ color: 'var(--accent)', flexShrink: 0, fontSize: 9 }}>▍</span>
+                  )}
                 </div>
               );
             })}
             {!visibleLogs.length && (
-              <div style={{ color: '#475569', textAlign: 'center', padding: '30px 0' }}>
-                {tagFilter !== 'ALL' ? `[No ${tagFilter} logs]` : '[Terminal Ready] Menunggu sinyal Auto-Pilot...'}
+              <div style={{ color: 'var(--dim)', textAlign: 'center', padding: '30px 0' }}>
+                {logSearch
+                  ? `[No match] "${logSearch}"`
+                  : tagFilter !== 'ALL'
+                    ? `[No ${tagFilter} logs]`
+                    : '[Terminal Ready] Menunggu sinyal Auto-Pilot...'}
               </div>
             )}
             <div ref={logsEndRef} />
           </div>
+
+          {/* Resumes following the tail after the reader scrolled away. */}
+          {!followLogs && unseenLogs > 0 && (
+            <div style={{ padding: '6px 16px', borderTop: '1px solid var(--rule)', textAlign: 'right' }}>
+              <button
+                onClick={() => {
+                  setFollowLogs(true);
+                  setUnseenLogs(0);
+                }}
+                className="btn"
+                style={{ minHeight: 26, padding: '2px 10px', fontSize: 11, fontFamily: 'var(--font-mono)' }}
+              >
+                ↓ {unseenLogs} baru — kembali ke live
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
@@ -928,25 +1027,25 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
         <EquityChart points={ap.pnlHistory ?? []} />
       </div>
 
-      {/* Hot-wallet status is read-only here on purpose: create/import/auto-execute
-          live on the Pengaturan page so a stray click can't move real funds
-          mid-session. This strip only reports what the autopilot is doing. */}
+      {/* Execution surface: the autopilot proposes, the user approves. This
+          strip is read-only — signing happens in MetaMask, never here. */}
       <div className="card" style={{ padding: 14, marginBottom: 24, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 12 }}>
         <IconKey size={14} />
-        <strong style={{ fontSize: 13 }}>Hot Wallet</strong>
+        <strong style={{ fontSize: 13 }}>Eksekusi</strong>
         <span
           className="chip"
           style={{
-            background: hotWallet.paused ? 'rgba(239,68,68,.16)' : hotWallet.autoEnabled ? 'var(--up-bg)' : 'var(--panel-2)',
-            color: hotWallet.paused ? 'var(--down)' : hotWallet.autoEnabled ? 'var(--up)' : 'var(--muted)',
+            background: !connected ? 'var(--panel-2)' : !isBound ? 'rgba(245,158,11,.16)' : 'var(--up-bg)',
+            color: !connected ? 'var(--muted)' : !isBound ? 'var(--accent)' : 'var(--up)',
             fontSize: 10, fontWeight: 700,
           }}
         >
-          {hotWallet.paused ? 'PAUSED' : !hotWallet.status?.exists ? 'BELUM ADA' : hotWallet.autoEnabled ? 'AUTO-EXECUTE ON' : 'AUTO-EXECUTE OFF'}
+          {!connected ? 'BELUM CONNECT' : !isBound ? 'BELUM BIND' : 'APPROVE DI METAMASK'}
         </span>
-        {hotWallet.status?.exists && (
+        {isBound && boundWallet && (
           <span style={{ color: 'var(--muted)' }}>
-            {hotWallet.balanceSol.toFixed(4)} SOL · {shortAddr(hotWallet.status.publicKey ?? '', 4)}
+            {shortAddr(boundWallet, 4)}
+            {openIntents.length > 0 && ` · ${openIntents.length} intent menunggu approve`}
           </span>
         )}
         <span style={{ color: 'var(--muted)' }}>Kelola di halaman</span>
@@ -955,30 +1054,11 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
         </button>
       </div>
 
-      {/* Radar → swap prefill (real mode): click Trade on a radar row to open
-          the swap form with the token already selected — no intent queue. */}
+      {/* Radar → trade form (real mode): the user picks the token in the form
+          itself; the radar row only opens the dialog. */}
       {radarTrade && (
         <Modal title={`Trade ${radarTrade.token.symbol} (Dana Asli)`} onClose={() => setRadarTrade(null)} maxWidth={560}>
-          <RealTradeForm
-            prefill={{ market: {
-              pairAddress: '',
-              tokenAddress: radarTrade.token.address,
-              symbol: radarTrade.token.symbol,
-              name: radarTrade.token.name ?? '',
-              chainId: radarTrade.token.chainId ?? 'solana',
-              dexId: radarTrade.token.dexId ?? '',
-              url: '',
-              priceUsd: radarTrade.token.priceUsd ?? 0,
-              icon: radarTrade.token.icon ?? null,
-              change24h: 0,
-              change5m: 0,
-              change1h: 0,
-              volume24h: 0,
-              liquidityUsd: 0,
-              fdv: 0,
-              txns24h: { buys: 0, sells: 0 },
-            }, nonce: Date.now() }}
-          />
+          <RealTradeForm />
         </Modal>
       )}
 
@@ -1242,7 +1322,7 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   <strong style={{ fontSize: 18, fontFamily: 'var(--font-heading)' }}>{report.token.symbol} ({report.token.chainId})</strong>
                   {report.llmPowered && (
-                    <span className="chip" style={{ background: 'rgba(245, 158, 11, .15)', color: 'var(--accent)', fontSize: 11 }}>
+                    <span className="chip" style={{ background: 'var(--accent-dim)', color: 'var(--accent)', fontSize: 10.5 }}>
                       <IconSparkles size={12} /> LLM: {report.llmProvider}
                     </span>
                   )}
@@ -1340,5 +1420,105 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
       )}
 
     </>
+  );
+}
+
+/**
+ * Structured fields the backend already sends on a log entry, rendered as a
+ * compact key:value tail. Before this, `details` was received and thrown away,
+ * so a PnL or fill price only existed inside the prose message — unreadable
+ * once the message got long, and impossible to search.
+ *
+ * Only a small allowlist is shown: dumping the raw object would bury the
+ * message under bookkeeping the reader does not act on.
+ */
+const DETAIL_KEYS = [
+  'pnlUsd', 'filledTokens', 'realPrice', 'estimatedPrice',
+  'balanceNative', 'buyUsd', 'usdAmount', 'cappedUsd',
+  'signature', 'intentId', 'symbol', 'reason',
+];
+
+function LogDetails({ details }: { details?: Record<string, unknown> }) {
+  if (!details) return null;
+  const parts: string[] = [];
+  for (const key of DETAIL_KEYS) {
+    const v = details[key];
+    if (v === undefined || v === null || v === '') continue;
+    if (typeof v === 'object') continue;
+    let shown: string;
+    if (key === 'pnlUsd' || key === 'realPrice' || key === 'estimatedPrice') {
+      const n = Number(v);
+      if (!Number.isFinite(n)) continue;
+      const sign = key === 'pnlUsd' && n >= 0 ? '+' : '';
+      const abs = Math.abs(n);
+      // Memecoin prices routinely sit below 1e-6, where toFixed(6) renders a
+      // flat "0.000000" and destroys the value. Step down in precision instead.
+      const digits = abs === 0 ? 2 : abs >= 1 ? 2 : abs >= 0.0001 ? 6 : 9;
+      shown = `${sign}$${n.toFixed(digits)}`;
+    } else if (key === 'signature' || key === 'intentId') {
+      // Truncate hashes/ids — the full value is never read at a glance and
+      // would push the row into a second line.
+      shown = String(v).slice(0, 10) + '…';
+    } else if (key === 'balanceNative' || key === 'filledTokens') {
+      const n = Number(v);
+      if (!Number.isFinite(n)) continue;
+      const abs = Math.abs(n);
+      shown = n.toFixed(abs >= 1 ? 4 : abs >= 0.0001 ? 6 : 9);
+    } else if (key === 'usdAmount' || key === 'buyUsd' || key === 'cappedUsd') {
+      const n = Number(v);
+      if (!Number.isFinite(n)) continue;
+      shown = `$${n.toFixed(2)}`;
+    } else {
+      shown = String(v).slice(0, 24);
+    }
+    parts.push(`${key}=${shown}`);
+    if (parts.length >= 3) break;
+  }
+  if (parts.length === 0) return null;
+  return (
+    <span
+      style={{
+        color: 'var(--dim)',
+        fontSize: 10,
+        flexShrink: 0,
+        whiteSpace: 'nowrap',
+        letterSpacing: '.02em',
+      }}
+      title={JSON.stringify(details)}
+    >
+      {parts.join(' · ')}
+    </span>
+  );
+}
+
+/**
+ * A guarded position's distance to its exit levels, drawn as a rule spanning
+ * SL → TP with a marker at the live price. Replaces two bare price labels that
+ * left the reader doing the arithmetic themselves.
+ */
+function TargetBar({ p }: { p: AutopilotGuardedPosition }) {
+  const { slPrice, tpPrice, currentPrice, avgBuyPrice } = p;
+  // A degenerate band (SL above TP, or a flat target) would divide by ~0 and
+  // throw the marker off-screen. Fall back to a plain price readout instead.
+  const band = tpPrice - slPrice;
+  if (!Number.isFinite(band) || band <= 0) {
+    return <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--font-mono)' }}>${currentPrice.toFixed(4)}</span>;
+  }
+  const pos = Math.min(100, Math.max(0, ((currentPrice - slPrice) / band) * 100));
+  // How much of the SL→TP move is already banked, measured from the entry.
+  const progress = Math.min(100, Math.max(0, ((currentPrice - avgBuyPrice) / band) * 100));
+
+  return (
+    <div style={{ minWidth: 132 }}>
+      <div style={{ position: 'relative', height: 5, background: 'var(--bg)', border: '1px solid var(--rule)' }}>
+        <div style={{ position: 'absolute', inset: 'auto 0 0 0', height: '100%', width: `${pos}%`, background: currentPrice >= avgBuyPrice ? 'var(--up-bg)' : 'var(--down-bg)' }} />
+        <div style={{ position: 'absolute', top: -2, bottom: -2, left: `${pos}%`, width: 1, background: 'var(--text)' }} />
+      </div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9.5, fontFamily: 'var(--font-mono)', color: 'var(--dim)', marginTop: 3 }}>
+        <span>SL ${slPrice.toFixed(4)}</span>
+        <span style={{ color: 'var(--muted)' }}>{progress.toFixed(0)}% ke TP</span>
+        <span>TP {tpPrice.toFixed(4)}</span>
+      </div>
+    </div>
   );
 }

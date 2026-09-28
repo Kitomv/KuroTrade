@@ -1,80 +1,57 @@
 // On-chain wallet detail for the Portfolio page, shown ONLY when real mode is
 // on (the virtual ledger is hidden then — real funds are what matters).
-// Balances come from RPC; the swap dialog reuses the existing RealTradeForm
-// rather than reimplementing quote → sign → broadcast.
+// Balances come from the backend, which prices the bound address server-side;
+// the swap dialog reuses RealTradeForm rather than reimplementing quote → sign.
 // Importers/callers: Portfolio.tsx (when realMode).
-// API/data: useWallet/useConnection RPC reads; RealTradeForm for swaps.
-// User instruction: "di menu porto juga, kalo real wallet aktif ya tampilin
-// detail real wallet bukan yang virtual" + "gas tambahin swap dialog juga".
+// API/data: GET /api/real/portfolio; RealTradeForm for swaps.
 import { useCallback, useEffect, useState } from 'react';
-import { useWallet, useConnection } from '@solana/wallet-adapter-react';
-import { PublicKey } from '@solana/web3.js';
+import { api } from '../api/client';
 import { Modal } from './Modal';
 import { RealTradeForm } from './RealTradeForm';
-import { useRealWallet } from './RealWalletContext';
+import { useEvmWallet } from './EvmWalletContext';
 import { IconAlert, IconLock } from './Icons';
-import { LAMPORTS_PER_SOL, shortAddr } from '../lib/solana';
+import { shortAddr } from '../lib/evm';
 
-const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-
-/** Known mints → display symbol (unknown mints fall back to the mint prefix). */
-const KNOWN_MINTS: Record<string, string> = {
-  So11111111111111111111111111111111111111112: 'SOL',
-  EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: 'USDC',
-  Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB: 'USDT',
-  DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263: 'BONK',
-  JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN: 'JUP',
-};
-
-interface HeldToken {
-  mint: string;
-  symbol: string;
-  uiAmount: number;
+interface Holding {
+  token: string;
+  amount: number;
   decimals: number;
+  priceUsd: number | null;
+  valueUsd: number | null;
 }
 
-export function RealWalletPortfolio() {
-  const { connected, publicKey } = useWallet();
-  const { connection } = useConnection();
-  const { isBound } = useRealWallet();
+/** Native coin below this cannot pay for an exit swap — the wallet is stuck. */
+const GAS_FLOOR = 0.005;
 
-  const [sol, setSol] = useState<number | null>(null);
-  const [tokens, setTokens] = useState<HeldToken[]>([]);
+export function RealWalletPortfolio() {
+  const { connected, isBound, address, chainId } = useEvmWallet();
+  const chain = 'base';
+
+  const [native, setNative] = useState<number | null>(null);
+  const [totalUsd, setTotalUsd] = useState<number | null>(null);
+  const [holdings, setHoldings] = useState<Holding[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState('');
   const [swapOpen, setSwapOpen] = useState(false);
 
   const load = useCallback(async () => {
-    if (!connected || !publicKey) { setSol(null); setTokens([]); setLoading(false); return; }
-    const pk = publicKey!; // guarded by connected check above
+    if (!connected || !address || !isBound) {
+      setNative(null); setHoldings([]); setTotalUsd(null); setLoading(false);
+      return;
+    }
     setLoading(true);
     try {
-      const [lamports, accounts] = await Promise.all([
-        connection.getBalance(pk),
-        connection.getParsedTokenAccountsByOwner(pk, { programId: TOKEN_PROGRAM_ID }),
-      ]);
-      setSol(lamports / LAMPORTS_PER_SOL);
-      const held: HeldToken[] = [];
-      for (const acc of accounts.value) {
-        const info = acc.account.data.parsed.info;
-        const uiAmount = Number(info.tokenAmount.uiAmount);
-        if (uiAmount > 0) {
-          held.push({
-            mint: info.mint,
-            symbol: KNOWN_MINTS[info.mint] ?? `${info.mint.slice(0, 4).toUpperCase()}…`,
-            uiAmount,
-            decimals: Number(info.tokenAmount.decimals),
-          });
-        }
-      }
-      setTokens(held.sort((a, b) => b.uiAmount - a.uiAmount));
+      const snap = await api.realPortfolio(chain);
+      setNative(snap.native);
+      setTotalUsd(snap.totalUsd);
+      setHoldings([...snap.holdings].sort((a, b) => (b.valueUsd ?? 0) - (a.valueUsd ?? 0)));
       setErr('');
-    } catch (e: any) {
-      setErr(e?.message ?? 'Gagal memuat saldo on-chain');
+    } catch (e: unknown) {
+      setErr(String((e as { message?: string })?.message ?? 'Gagal memuat saldo on-chain'));
     } finally {
       setLoading(false);
     }
-  }, [connected, publicKey, connection]);
+  }, [connected, address, isBound]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -82,7 +59,7 @@ export function RealWalletPortfolio() {
     return (
       <div className="card" style={{ padding: 20, marginBottom: 24 }}>
         <div className="empty" style={{ padding: 16 }}>
-          Connect Phantom untuk melihat detail wallet on-chain (dana asli).
+          Connect MetaMask untuk melihat detail wallet on-chain (dana asli).
         </div>
       </div>
     );
@@ -97,7 +74,7 @@ export function RealWalletPortfolio() {
             REAL
           </span>
           {!isBound && (
-            <span className="chip" style={{ background: 'rgba(245,158,11,.15)', color: 'var(--accent)', fontSize: 10 }}>
+            <span className="chip" style={{ background: 'var(--accent-dim)', color: 'var(--accent)', fontSize: 10.5 }}>
               Belum bind — swap dikunci
             </span>
           )}
@@ -122,44 +99,55 @@ export function RealWalletPortfolio() {
       <div style={{ padding: 20 }}>
         {err && <div className="error" style={{ marginBottom: 14 }}><IconAlert size={13} /> {err}</div>}
         {!isBound && (
-          <div className="error" style={{ marginBottom: 14, background: 'rgba(245,158,11,.14)', color: 'var(--accent)' }}>
+          <div className="error" style={{ marginBottom: 14, background: 'var(--accent-dim)', color: 'var(--accent)', borderColor: 'rgba(232, 163, 61, .4)' }}>
             <IconLock size={13} /> Bind wallet dulu (panel Real Wallet di sidebar) sebelum swap dana asli.
           </div>
         )}
 
         <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 10, wordBreak: 'break-all' }}>
-          {shortAddr(publicKey!.toBase58(), 6)}
+          {address ? shortAddr(address, 6) : '—'}
+          {chainId && chainId !== '0x2105' && (
+            <span style={{ color: 'var(--accent)' }}> · wallet di chain {chainId}, data di bawah untuk Base</span>
+          )}
         </div>
 
         <div className="kpi-grid">
           <div className="card kpi">
-            <div className="kpi-label">SOL (gas + trade)</div>
-            <div className="kpi-value">{sol === null ? '…' : sol.toFixed(4)}</div>
-            <div className="kpi-sub">{sol !== null && sol < 0.02 ? '⚠ di bawah biaya gas' : 'siap untuk transaksi'}</div>
+            <div className="kpi-label">ETH (gas + trade)</div>
+            <div className="kpi-value">{native === null ? '…' : native.toFixed(4)}</div>
+            <div className="kpi-sub">
+              {native !== null && native < GAS_FLOOR ? '⚠ di bawah biaya gas' : 'siap untuk transaksi'}
+            </div>
           </div>
           <div className="card kpi">
-            <div className="kpi-label">SPL Token</div>
-            <div className="kpi-value">{tokens.length}</div>
-            <div className="kpi-sub">posisi on-chain</div>
+            <div className="kpi-label">Total Nilai</div>
+            <div className="kpi-value">
+              {totalUsd === null ? '…' : `$${totalUsd.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}
+            </div>
+            <div className="kpi-sub">{holdings.length} token on-chain</div>
           </div>
         </div>
 
-        {tokens.length > 0 && (
+        {holdings.length > 0 && (
           <div className="table-wrap" style={{ marginTop: 16 }}>
             <table>
               <thead>
                 <tr>
                   <th>Token</th>
-                  <th>Mint</th>
+                  <th>Kontrak</th>
                   <th className="num">Jumlah</th>
+                  <th className="num">Nilai</th>
                 </tr>
               </thead>
               <tbody>
-                {tokens.map((t) => (
-                  <tr key={t.mint}>
-                    <td><strong>{t.symbol}</strong></td>
-                    <td style={{ fontSize: 11, color: 'var(--muted)' }}>{shortAddr(t.mint, 4)}</td>
-                    <td className="num">{t.uiAmount.toLocaleString(undefined, { maximumFractionDigits: 6 })}</td>
+                {holdings.map((t) => (
+                  <tr key={t.token}>
+                    <td><strong>{shortAddr(t.token, 4)}</strong></td>
+                    <td style={{ fontSize: 11, color: 'var(--muted)' }}>{shortAddr(t.token, 4)}</td>
+                    <td className="num">{t.amount.toLocaleString(undefined, { maximumFractionDigits: 6 })}</td>
+                    <td className="num">
+                      {t.valueUsd === null ? <span style={{ color: 'var(--muted)' }}>—</span> : `$${t.valueUsd.toFixed(2)}`}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -167,9 +155,9 @@ export function RealWalletPortfolio() {
           </div>
         )}
 
-        {!loading && tokens.length === 0 && (
+        {!loading && holdings.length === 0 && (
           <div className="empty" style={{ marginTop: 12 }}>
-            Belum ada SPL token di wallet ini. Kirim SOL ke alamat di atas untuk mulai trading.
+            Belum ada token ERC-20 di wallet ini. Kirim ETH ke alamat di atas untuk mulai trading.
           </div>
         )}
       </div>

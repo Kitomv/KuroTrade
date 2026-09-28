@@ -3,17 +3,16 @@
 // or drain a hot wallet while someone is trading. Also hosts Change Password and
 // Logout (moved out of the sidebar to reduce mis-clicks).
 // Importers/callers: App.tsx (page router + auth handlers). API: HotWalletPanel
-// via HotWalletContext, useRealWallet(), and the onChangePassword/onLogout props.
+// via HotWalletContext, useEvmWallet(), and the onChangePassword/onLogout props.
 // User instruction: "mending kasih menu pengaturan di side bar user buat nyimpen
 // menu hot wallet biar aman antisipasi salah pencet" + "change password juga sama
 // log out masukin menu pengaturan".
 import { useState } from 'react';
 import { Modal } from '../components/Modal';
-import { MultiChainWalletPanel } from '../components/MultiChainWalletPanel';
-import { useRealWallet } from '../components/RealWalletContext';
+import { useEvmWallet } from '../components/EvmWalletContext';
 import { useConfirm } from '../components/ConfirmDialog';
 import { useToast } from '../components/ToastProvider';
-import { IconAlert, IconGear, IconKey, IconShield, IconWallet } from '../components/Icons';
+import { IconAlert, IconGear, IconShield, IconWallet } from '../components/Icons';
 
 interface Props {
   username?: string;
@@ -23,7 +22,7 @@ interface Props {
 }
 
 export function Settings({ username, role, onChangePassword, onLogout }: Props) {
-  const { connected, isBound, realMode } = useRealWallet();
+  const { connected, isBound, realMode } = useEvmWallet();
   const confirmAction = useConfirm();
   const toast = useToast();
 
@@ -84,16 +83,11 @@ export function Settings({ username, role, onChangePassword, onLogout }: Props) 
         <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
           <IconAlert size={16} />
           <div style={{ fontSize: 13, lineHeight: 1.6 }}>
-            <strong>Hati-hati.</strong> Kontrol di halaman ini mengubah wallet yang dipakai autopilot
-            untuk bergerak dengan dana asli. Hot wallet tidak bisa dibuat ulang kalau sudah ada —
-            dana di alamat lama akan tidak bisa diakses.
+            <strong>Hati-hati.</strong> Autopilot mengusulkan trade, tetapi setiap transaksi
+            harus kamu <strong>approve sendiri di MetaMask</strong>. Backend tidak pernah
+            menyimpan private key dan tidak pernah menandatangani apa pun.
           </div>
         </div>
-      </div>
-
-      {/* Hot Wallet — Multi-chain tab switcher (Solana / Base) */}
-      <div style={{ marginBottom: 24 }}>
-        <MultiChainWalletPanel />
       </div>
 
       {/* Status ringkas */}
@@ -103,7 +97,7 @@ export function Settings({ username, role, onChangePassword, onLogout }: Props) 
         </div>
         <div style={{ padding: 20, display: 'grid', gap: 10, fontSize: 13 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <span style={{ color: 'var(--muted)' }}>Phantom</span>
+            <span style={{ color: 'var(--muted)' }}>MetaMask</span>
             <strong>{connected ? (isBound ? 'Terhubung & ter-bind' : 'Terhubung, belum bind') : 'Belum terhubung'}</strong>
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between' }}>
@@ -111,10 +105,8 @@ export function Settings({ username, role, onChangePassword, onLogout }: Props) 
             <strong>{realMode ? 'REAL (dana asli)' : 'VIRTUAL'}</strong>
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <span style={{ color: 'var(--muted)' }}>Eksekusi otomatis</span>
-            <strong style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-              <IconKey size={13} /> Hot Wallet (panel di atas)
-            </strong>
+            <span style={{ color: 'var(--muted)' }}>Eksekusi</span>
+            <strong>Approve manual di MetaMask</strong>
           </div>
         </div>
       </div>

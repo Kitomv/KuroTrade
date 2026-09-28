@@ -1,42 +1,38 @@
 // Compact on-chain balance summary for the global Real Wallet panel.
-// Importers/callers: RealWalletControl. Requires the hoisted wallet provider.
-// API/data: uses useWallet/useConnection + RPC; no backend API.
-// Data schema: in-memory <sol:number, tokens:number>.
-// User instruction: "yang di porto hilangin real walletnya" — move real UI to global panel.
+// Importers/callers: pages/Trade.tsx. Requires EvmWalletProvider.
+// API/data: reads the bound address's balance from GET /api/real/portfolio.
+// Data schema: in-memory <native:number, tokenCount:number>.
 import { useEffect, useState } from 'react';
-import { PublicKey } from '@solana/web3.js';
-import { useWallet, useConnection } from '@solana/wallet-adapter-react';
-
-const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+import { api } from '../api/client';
+import { useEvmWallet } from './EvmWalletContext';
 
 export function RealWalletBalance() {
-  const { connected, publicKey } = useWallet();
-  const { connection } = useConnection();
-  const [sol, setSol] = useState<number | null>(null);
-  const [tokens, setTokens] = useState(0);
+  const { connected, realMode } = useEvmWallet();
+  const [native, setNative] = useState<number | null>(null);
+  const [tokenCount, setTokenCount] = useState(0);
 
   useEffect(() => {
-    if (!connected || !publicKey) { setSol(null); setTokens(0); return; }
+    if (!connected || !realMode) { setNative(null); setTokenCount(0); return; }
     let cancelled = false;
     (async () => {
       try {
-        const [lamports, accounts] = await Promise.all([
-          connection.getBalance(publicKey),
-          connection.getParsedTokenAccountsByOwner(publicKey, { programId: TOKEN_PROGRAM_ID }),
-        ]);
+        const snap = await api.realPortfolio('base');
         if (cancelled) return;
-        setSol(lamports / 1_000_000_000);
-        setTokens(accounts.value.filter((a) => Number(a.account.data.parsed.info.tokenAmount.uiAmount) > 0).length);
-      } catch {}
+        setNative(snap.native);
+        setTokenCount(snap.holdings.length);
+      } catch {
+        // A missing bind or a dead RPC leaves the previous numbers in place —
+        // the panel surfaces those states elsewhere.
+      }
     })();
     return () => { cancelled = true; };
-  }, [connected, publicKey, connection]);
+  }, [connected, realMode]);
 
-  if (!connected) return null;
+  if (!connected || !realMode) return null;
   return (
     <div className="rwc-balance">
-      <span><b>{sol === null ? '…' : sol.toFixed(4)}</b> SOL</span>
-      <span><b>{tokens}</b> SPL token</span>
+      <span><b>{native === null ? '…' : native.toFixed(4)}</b> ETH</span>
+      <span><b>{tokenCount}</b> token</span>
     </div>
   );
 }

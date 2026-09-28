@@ -8,8 +8,12 @@ const MAX_CACHE_ENTRIES = 500; // hard cap: search queries vary endlessly, so th
 
 const cache = new Map(); // key -> { at, promise }
 
-function get(url, ttl = TTL) {
-  const hit = cache.get(url);
+// `cacheKey` exists because one URL can serve several logical queries: the
+// same wrapped-native address (0x4200…0006) is WETH on BOTH Base and Optimism,
+// so keying on the URL alone made the second chain read the first chain's
+// promise — a different asset's price under the same ticker.
+function get(url, ttl = TTL, cacheKey = url) {
+  const hit = cache.get(cacheKey);
   if (hit && Date.now() - hit.at < ttl) return hit.promise;
   const promise = (async () => {
     // `ponytail:` hard timeout — without it a slow/rate-limited DexScreener
@@ -24,8 +28,8 @@ function get(url, ttl = TTL) {
     const oldest = cache.keys().next().value;
     if (oldest !== undefined) cache.delete(oldest);
   }
-  cache.set(url, { at: Date.now(), promise });
-  promise.catch(() => cache.delete(url));
+  cache.set(cacheKey, { at: Date.now(), promise });
+  promise.catch(() => cache.delete(cacheKey));
   return promise;
 }
 
@@ -88,12 +92,29 @@ export const dexscreener = {
     return enriched;
   },
 
-  /** GET /latest/dex/tokens/{tokenAddress} — all pairs for a token, best pair normalized */
-  async token(tokenAddress) {
-    const data = await get(`${BASE}/latest/dex/tokens/${tokenAddress}`);
-    const pair = (data.pairs ?? [])[0];
-    if (!pair) return null;
-    return normalize(pair);
+  /**
+   * GET /latest/dex/tokens/{tokenAddress} — all pairs for a token.
+   *
+   * `chainId` picks the DEEPEST pair on that chain. The same ERC-20 (and the
+   * same wrapped-native address) trades on several chains at genuinely
+   * different prices, so taking `pairs[0]` — which DexScreener orders globally,
+   * not per chain — returns another chain's price for this chain's asset.
+   */
+  async token(tokenAddress, chainId = null) {
+    const data = await get(
+      `${BASE}/latest/dex/tokens/${tokenAddress}`,
+      TTL,
+      `tok:${tokenAddress.toLowerCase()}:${chainId ?? '*'}`,
+    );
+    const pairs = data.pairs ?? [];
+    if (pairs.length === 0) return null;
+    const scoped = chainId ? pairs.filter((p) => p?.chainId === chainId) : pairs;
+    const pool = scoped.length > 0 ? scoped : pairs;
+    let best = pool[0];
+    for (const p of pool) {
+      if ((p?.liquidity?.usd ?? 0) > (best?.liquidity?.usd ?? 0)) best = p;
+    }
+    return normalize(best);
   },
 
   /** GET /latest/dex/search?q= — search tokens (optional custom ttl for stable queries) */

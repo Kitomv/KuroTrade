@@ -7,7 +7,7 @@ import { fmt } from '../lib/format';
 
 export function Chart() {
   const [tokenAddr, setTokenAddr] = useState('');
-  const [chain, setChain] = useState('solana');
+  const [chain, setChain] = useState('base');
   const [history, setHistory] = useState<{ priceUsd: number; ts: number }[]>([]);
   const [isPaused, setIsPaused] = useState(false);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
@@ -146,7 +146,6 @@ export function Chart() {
             style={{ width: 140 }}
             aria-label="Pilih Chain"
           >
-            <option value="solana">Solana</option>
             <option value="base">Base</option>
             <option value="ethereum">Ethereum</option>
             <option value="arbitrum">Arbitrum</option>
@@ -196,7 +195,7 @@ export function Chart() {
               </span>
             )}
             {isPaused && (
-              <span className="chip" style={{ background: 'rgba(245,158,11,.15)', color: 'var(--accent)' }}>
+              <span className="chip" style={{ background: 'var(--accent-dim)', color: 'var(--accent)' }}>
                 <IconPause size={12} /> Paused
               </span>
             )}
@@ -228,21 +227,18 @@ export function Chart() {
             >
               <defs>
                 <linearGradient id="areaUp" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#22C55E" stopOpacity="0.25" />
-                  <stop offset="100%" stopColor="#22C55E" stopOpacity="0.0" />
+                  <stop offset="0%" stopColor="var(--up)" stopOpacity="0.16" />
+                  <stop offset="100%" stopColor="var(--up)" stopOpacity="0.0" />
                 </linearGradient>
                 <linearGradient id="areaDown" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#EF4444" stopOpacity="0.25" />
-                  <stop offset="100%" stopColor="#EF4444" stopOpacity="0.0" />
+                  <stop offset="0%" stopColor="var(--down)" stopOpacity="0.16" />
+                  <stop offset="100%" stopColor="var(--down)" stopOpacity="0.0" />
                 </linearGradient>
-                <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
-                  <feGaussianBlur in="SourceGraphic" stdDeviation="4" />
-                </filter>
               </defs>
 
-              {/* Grid lines */}
-              <line x1={pad.l} y1={pad.t} x2={pad.l + plotW} y2={pad.t} stroke="var(--border)" strokeDasharray="3 3" opacity="0.5" />
-              <line x1={pad.l} y1={pad.t + plotH / 2} x2={pad.l + plotW} y2={pad.t + plotH / 2} stroke="var(--border)" strokeDasharray="3 3" opacity="0.5" />
+              {/* Reference rules, then a solid baseline. A printed chart. */}
+              <line x1={pad.l} y1={pad.t} x2={pad.l + plotW} y2={pad.t} stroke="var(--rule)" strokeDasharray="2 4" />
+              <line x1={pad.l} y1={pad.t + plotH / 2} x2={pad.l + plotW} y2={pad.t + plotH / 2} stroke="var(--rule)" strokeDasharray="2 4" />
               <line x1={pad.l} y1={pad.t + plotH} x2={pad.l + plotW} y2={pad.t + plotH} stroke="var(--border)" />
               <line x1={pad.l} y1={pad.t} x2={pad.l} y2={pad.t + plotH} stroke="var(--border)" />
 
@@ -255,44 +251,40 @@ export function Chart() {
                   d={linePath}
                   fill="none"
                   stroke={strokeColor}
-                  strokeWidth={2.5}
+                  strokeWidth={1.75}
                   strokeLinecap="round"
                   strokeLinejoin="round"
                 />
               )}
 
-              {/* Glowing current-price pulse dot (skill recommendation) */}
+              {/* Square last-price marker — a terminal readout, not a glow. */}
               {lastPt && (
-                <>
-                  <circle
-                    cx={lastPt.x}
-                    cy={lastPt.y}
-                    r={8}
-                    fill={strokeColor}
-                    opacity={0.3}
-                    filter="url(#glow)"
-                  />
-                  <circle cx={lastPt.x} cy={lastPt.y} r={4.5} fill={strokeColor} />
-                </>
+                <rect
+                  x={lastPt.x - 3.5}
+                  y={lastPt.y - 3.5}
+                  width={7}
+                  height={7}
+                  fill={strokeColor}
+                />
               )}
 
               {/* Time axis */}
               {timeLabels.length === 2 && (
                 <>
-                  <text x={pad.l} y={svgH - 10} fill="var(--muted)" fontSize={11} fontFamily="var(--font-body)">
+                  <text x={pad.l} y={svgH - 10} fill="var(--dim)" fontSize={10.5} fontFamily="var(--font-mono)">
                     {timeLabels[0]}
                   </text>
-                  <text x={svgW - pad.r} y={svgH - 10} fill="var(--muted)" fontSize={11} textAnchor="end" fontFamily="var(--font-body)">
+                  <text x={svgW - pad.r} y={svgH - 10} fill="var(--dim)" fontSize={10.5} textAnchor="end" fontFamily="var(--font-mono)">
                     {timeLabels[1]}
                   </text>
                 </>
               )}
 
               {/* Price axis (Max, Mid, Min) */}
-              <text x={pad.l - 8} y={pad.t + 4} fill="var(--muted)" fontSize={11} textAnchor="end" fontFamily="var(--font-body)">
+              <text x={pad.l - 8} y={pad.t + 4} fill="var(--muted)" fontSize={10.5} textAnchor="end" fontFamily="var(--font-mono)">
                 {fmt.usd(max)}
               </text>
-              <text x={pad.l - 8} y={pad.t + plotH / 2 + 4} fill="var(--muted)" fontSize={11} textAnchor="end" fontFamily="var(--font-body)">
+              <text x={pad.l - 8} y={pad.t + plotH / 2 + 4} fill="var(--dim)" fontSize={10.5} textAnchor="end" fontFamily="var(--font-mono)">
                 {fmt.usd((max + min) / 2)}
               </text>
               <text x={pad.l - 8} y={pad.t + plotH + 4} fill="var(--muted)" fontSize={11} textAnchor="end" fontFamily="var(--font-body)">

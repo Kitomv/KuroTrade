@@ -1,82 +1,62 @@
-// Unit tests for EVM hot wallet (Base chain). Runs isolated from real keystores.
+// EVM execution-layer guards. The keystore tests are gone with the keystore:
+// there is no server-held private key any more, so what is worth testing are
+// the security boundaries that replaced it.
+// Run: node --test backend/src/evmWallet.test.mjs
 import { test } from 'node:test';
-import { randomBytes } from 'crypto';
-import { join } from 'path';
-import { mkdirSync, rmSync } from 'fs';
-import { tmpdir } from 'os';
+import assert from 'node:assert/strict';
+import { isAllowedRouter, isSupportedChain, checkTradeSize, listEvmChains } from './evmWallet.js';
 
-const TEMP_DIR = join(tmpdir(), `evm-test-${process.pid}`);
-mkdirSync(TEMP_DIR, { recursive: true });
-process.env.EVM_WALLET_KEYS_FILE = join(TEMP_DIR, 'evmwallets.json');
+const ROUTER = '0x111111125421cA6dc452d289314280a0f8842A65';
+const ATTACKER = '0x00000000000000000000000000000000deadbeef';
 
-const TEST_MASTER_KEY = randomBytes(32).toString('hex');
-process.env.MASTER_ENCRYPTION_KEY = TEST_MASTER_KEY;
+test('the 1inch router is accepted in any casing', () => {
+  assert.equal(isAllowedRouter(ROUTER), true);
+  assert.equal(isAllowedRouter(ROUTER.toLowerCase()), true);
+  assert.equal(isAllowedRouter(ROUTER.toUpperCase().replace('0X', '0x')), true);
+});
 
-import {
-  generateEvmWallet,
-  importEvmWallet,
-  getEvmWalletStatus,
-  decryptEvmWallet,
-} from './evmWallet.js';
+test('an arbitrary contract is NOT an allowed router', () => {
+  // This is the check that replaced approve(spender, MaxUint256) with an
+  // unvalidated spender. An aggregator response pointing anywhere else must be
+  // refused before it can become an allowance.
+  assert.equal(isAllowedRouter(ATTACKER), false);
+});
 
-test('generate & decrypt round-trip produces identical EVM address', () => {
-  const userId = `evm_user_${Date.now()}_a`;
-  const gen = generateEvmWallet(userId, TEST_MASTER_KEY);
-  if (!gen.address || !/^0x[0-9a-fA-F]{40}$/.test(gen.address)) {
-    throw new Error('Alamat EVM tidak valid');
-  }
-
-  const info = getEvmWalletStatus(userId);
-  if (!info.exists || info.address !== gen.address) {
-    throw new Error('Status address mismatch');
-  }
-
-  const wallet = decryptEvmWallet(userId, TEST_MASTER_KEY);
-  if (wallet.address.toLowerCase() !== gen.address.toLowerCase()) {
-    throw new Error('Decrypted wallet address mismatch');
+test('malformed router addresses are rejected, never thrown', () => {
+  for (const bad of ['', '0x', '0x123', null, undefined, 42, {}, ROUTER + 'ff', ROUTER.slice(0, -1)]) {
+    assert.equal(isAllowedRouter(bad), false, `should reject ${JSON.stringify(bad)}`);
   }
 });
 
-test('different users have isolated EVM keys under same master', () => {
-  const u1 = `evm_u1_${Date.now()}`;
-  const u2 = `evm_u2_${Date.now()}`;
-  const g1 = generateEvmWallet(u1, TEST_MASTER_KEY);
-  const g2 = generateEvmWallet(u2, TEST_MASTER_KEY);
-  if (g1.address.toLowerCase() === g2.address.toLowerCase()) {
-    throw new Error('Alamat harus berbeda per-user');
+test('supported chains match the executor config', () => {
+  for (const chain of ['base', 'ethereum', 'arbitrum', 'bsc', 'optimism', 'polygon', 'avalanche']) {
+    assert.equal(isSupportedChain(chain), true, `${chain} should be supported`);
   }
-
-  const w1 = decryptEvmWallet(u1, TEST_MASTER_KEY);
-  const w2 = decryptEvmWallet(u2, TEST_MASTER_KEY);
-  if (w1.address.toLowerCase() !== g1.address.toLowerCase()) throw new Error('u1 mismatch');
-  if (w2.address.toLowerCase() !== g2.address.toLowerCase()) throw new Error('u2 mismatch');
+  // Solana is no longer an execution target — this is the guard that stops an
+  // unfillable intent from being emitted and blocking buy-dedup forever.
+  assert.equal(isSupportedChain('solana'), false);
+  assert.equal(isSupportedChain('unknown-chain'), false);
+  assert.equal(isSupportedChain(undefined), false);
 });
 
-test('wrong master key rejects EVM decryption', () => {
-  const userId = `evm_wrong_${Date.now()}`;
-  generateEvmWallet(userId, TEST_MASTER_KEY);
-  const wrongKey = randomBytes(32).toString('hex');
-  try {
-    decryptEvmWallet(userId, wrongKey);
-    throw new Error('Harus menolak wrong key');
-  } catch (e) {
-    if (!String(e.message).includes('MASTER_ENCRYPTION_KEY tidak cocok')) throw e;
+test('listEvmChains exposes chainId + native symbol for every chain', () => {
+  const chains = listEvmChains();
+  assert.equal(chains.length, 7);
+  for (const c of chains) {
+    assert.ok(c.key && Number.isInteger(c.chainId) && c.native && c.explorer);
   }
+  assert.equal(chains.find((c) => c.key === 'base').chainId, 8453);
 });
 
-test('import private key (hex) preserves address', () => {
-  const userId = `evm_import_${Date.now()}`;
-  // Standard hardhat well-known private key for tests (0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80)
-  const pk = 'ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
-  const expectedAddr = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266'.toLowerCase();
-
-  const imported = importEvmWallet(userId, pk, TEST_MASTER_KEY);
-  if (imported.address.toLowerCase() !== expectedAddr) {
-    throw new Error(`Import address mismatch: ${imported.address} vs ${expectedAddr}`);
+test('trade size cap rejects zero, negative, NaN and oversized amounts', () => {
+  for (const bad of [0, -1, NaN, Infinity, null, 'abc']) {
+    assert.equal(checkTradeSize(bad).ok, false, `should reject ${String(bad)}`);
   }
-
-  const decrypted = decryptEvmWallet(userId, TEST_MASTER_KEY);
-  if (decrypted.address.toLowerCase() !== expectedAddr) {
-    throw new Error('Decrypted address mismatch');
-  }
+  assert.equal(checkTradeSize(10).ok, true);
+  assert.equal(checkTradeSize(10).cap, 50, 'default cap is $50');
+  // Above the default cap → refused with the cap echoed back so the caller can
+  // downsize instead of silently dropping the trade.
+  const over = checkTradeSize(500);
+  assert.equal(over.ok, false);
+  assert.equal(over.cap, 50);
 });

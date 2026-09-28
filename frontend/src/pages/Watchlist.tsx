@@ -59,7 +59,7 @@ export function Watchlist({ onUpdated }: { onUpdated: () => void }) {
           <input
             className="input"
             style={{ flex: 1, minWidth: 260 }}
-            placeholder="Token address (0x… atau Solana mint)"
+            placeholder="Token contract address (0x…)"
             value={addr}
             onChange={(e) => setAddr(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
@@ -72,7 +72,6 @@ export function Watchlist({ onUpdated }: { onUpdated: () => void }) {
             style={{ width: 150 }}
             aria-label="Pilih Blockchain"
           >
-            <option value="solana">Solana</option>
             <option value="base">Base</option>
             <option value="ethereum">Ethereum</option>
             <option value="arbitrum">Arbitrum</option>

@@ -18,15 +18,7 @@ import { Settings } from './pages/Settings';
 import { ToastProvider } from './components/ToastProvider';
 import { ConfirmProvider } from './components/ConfirmDialog';
 import { WalletModeBanner } from './components/WalletModeBanner';
-import { HotWalletProvider } from './components/HotWalletContext';
 import { EvmWalletProvider } from './components/EvmWalletContext';
-import { EmergencyPauseBanner } from './components/EmergencyPauseBanner';
-import React, { Suspense, lazy } from 'react';
-
-// Lazy so the ~590KB wallet+solana vendor chunks never load on the login screen.
-// Mounted once around the authed shell (not inside Portfolio) so navigating
-// between pages keeps the Phantom connection alive.
-const WalletProviderGate = lazy(() => import('./components/WalletProviderGate'));
 
 export function App() {
   const [authed, setAuthed] = useState<boolean>(() => Boolean(localStorage.getItem('trading_token')));
@@ -84,12 +76,7 @@ export function App() {
         {!authed
           ? <Login onLogin={(u) => { setUsername(u); localStorage.setItem('trading_username', u); setAuthed(true); }} />
           : (
-            <Suspense fallback={null}>
-              <WalletProviderGate>
-                {/* Hot-wallet state is shell-level: the panel (Portfolio/Agents)
-                    and the global emergency-pause banner share one poll. */}
-                <HotWalletProvider>
-                <EvmWalletProvider>
+            <EvmWalletProvider>
                 <div className={`shell${navOpen ? '' : ' nav-collapsed'}`}>
                   <Sidebar
                     page={page}
@@ -97,7 +84,6 @@ export function App() {
                     username={authed ? username : undefined}
                   />
                   <main className="main">
-                    <EmergencyPauseBanner />
                     <WalletModeBanner />
                     {/* Desktop-only collapse toggle; sits above page content. */}
                     <button
@@ -129,10 +115,7 @@ export function App() {
                     {page === 'settings' && <Settings username={username} role={role} onChangePassword={async (cur, next) => { await AUTH.changePassword(cur, next); }} onLogout={handleLogout} />}
                   </main>
                 </div>
-                </EvmWalletProvider>
-                </HotWalletProvider>
-              </WalletProviderGate>
-            </Suspense>
+            </EvmWalletProvider>
           )
         }
       </ConfirmProvider>

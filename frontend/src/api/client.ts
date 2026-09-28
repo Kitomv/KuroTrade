@@ -234,13 +234,11 @@ export interface AutopilotLog {
 
 export interface AutopilotStats {
   totalScans: number;
+  /** Completed round trips (PnL is only known at the exit). */
   totalTrades: number;
   profitableTrades: number;
   totalProfitUsd: number;
   winRate: number;
-  /** Orders actually broadcast by the hot wallet (BUY + SELL). Distinct from
-   *  `totalTrades`, which counts completed round trips so PnL is known. */
-  autoExecutedTrades: number;
 }
 
 export interface SignalHistoryEntry {
@@ -275,6 +273,24 @@ export interface RealIntent {
   llmPowered?: boolean;
   bullScore?: number | null;
   bearScore?: number | null;
+}
+
+/** Unsigned swap tx built by the backend for MetaMask to sign. */
+export interface BuiltSwapTx {
+  chain: string;
+  chainId: number;
+  /** Must be the allow-listed 1inch router — the client re-checks this. */
+  to: string;
+  data: string;
+  value: string;
+  gas: string | null;
+  /** True when `src` is an ERC-20 and an allowance must be granted first. */
+  needsApproval: boolean;
+  approveSpender: string | null;
+  /** Exact atomic amount to approve — never an unlimited grant. */
+  approveAmount: string | null;
+  slippageBps: number;
+  intentId?: string;
 }
 
 export interface SignalAccuracy {
@@ -484,7 +500,7 @@ export const api = {
     }),
   cancelOrder: (id: string) => req<Order>(`/api/orders/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
-  // Real-wallet pending intents (autopilot → user approves via Phantom)
+  // Real-wallet pending intents (autopilot → user approves via MetaMask)
   realIntents: () => req<RealIntent[]>('/api/real/intents'),
   realIntentStatus: (id: string, status: RealIntent['status'], claimToken?: string) =>
     req<RealIntent>(`/api/real/intents/${encodeURIComponent(id)}/status`, {
@@ -494,7 +510,7 @@ export const api = {
     }),
   realMode: () => req<{ realMode: boolean }>('/api/real/mode'),
   setRealMode: (realMode: boolean) =>
-    req<{ realMode: boolean; realAuto?: boolean }>('/api/real/mode', {
+    req<{ realMode: boolean }>('/api/real/mode', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ realMode }),
@@ -552,135 +568,54 @@ export const api = {
   adminDeleteUser: (id: string) =>
     req<{ ok: boolean }>(`/api/admin/users/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
-  // Real trading (Jupiter proxy — server builds tx, wallet signs)
-  realQuote: (data: { inputMint: string; outputMint: string; amount: number; slippageBps: number }) =>
-    req<{ inAmount: string; outAmount: string; priceImpactPct: string; routeLabels: string[]; slippageBps: number; rawQuote: unknown }>(
+  // Real trading — EVM via 1inch. The server builds the UNSIGNED tx; MetaMask
+  // signs it in the browser. No private key ever reaches the backend.
+  realQuote: (data: { src: string; dst: string; amount: string; chain?: string }) =>
+    req<{ inAmount?: string; outAmount?: string; priceImpactPct?: string; [k: string]: unknown }>(
       '/api/real/quote',
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) },
     ),
-  realSwapTx: (data: { quoteResponse?: unknown; intentId?: string; userPublicKey: string }) =>
-    req<{ swapTransaction: string; intentId?: string }>('/api/real/swap-tx', {
+  /** Unsigned swap tx for one intent. `to` must be the allow-listed 1inch router. */
+  realSwapTx: (data: { intentId: string; from: string; chain?: string }) =>
+    req<BuiltSwapTx>('/api/real/swap-tx', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
     }),
-  bindWallet: (data: { publicKey: string; signature: string }) =>
-    req<{ bound: boolean; publicKey: string }>('/api/real/bind', {
+  /** A user's manual trade becomes a normal intent, so it inherits every guard. */
+  manualIntent: (data: {
+    tokenAddress: string; symbol?: string; side: 'buy' | 'sell';
+    amountUsd: number; estTokens: number; intentPrice: number; chain?: string;
+  }) => req<RealIntent>('/api/real/manual-intent', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  }),
+  /** ERC-20 decimals resolved on-chain — required before sizing any sell. */
+  realDecimals: (token: string, chain = 'base') =>
+    req<{ token: string; chain: string; decimals: number }>(
+      `/api/real/evm/decimals?token=${encodeURIComponent(token)}&chain=${encodeURIComponent(chain)}`,
+    ),
+  bindWallet: (data: { address: string; signature: string }) =>
+    req<{ bound: boolean; address: string }>('/api/real/bind', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
     }),
-  /** Server-issued challenge the wallet must sign to bind (L1). */
-  bindMessage: (publicKey: string) =>
-    req<{ message: string }>(`/api/real/bind-message?publicKey=${encodeURIComponent(publicKey)}`),
+  /** Server-issued single-use challenge the wallet signs to bind. */
+  bindMessage: (address: string) =>
+    req<{ message: string }>(`/api/real/bind-message?address=${encodeURIComponent(address)}`),
   boundWallet: () => req<{ boundWallet: string | null }>('/api/real/bound'),
 
-  // Real-wallet auto-approve (removes the in-page Approve click; Phantom still signs each tx)
-  realAuto: () => req<{ realAuto: boolean }>('/api/real/auto'),
-  setRealAuto: (realAuto: boolean) =>
-    req<{ realAuto: boolean }>('/api/real/auto', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ realAuto }),
-    }),
-
-  // --- Hot Wallet (server-side signing for 24/7 autopilot) ---
-  /** Public metadata only — never returns the private key. */
-  hotWalletStatus: () =>
-    req<{ exists: boolean; publicKey: string | null; createdAt?: number; updatedAt?: number; network?: string }>(
-      '/api/real/hot-wallet/status',
+  /** On-chain reads for the bound MetaMask address (read-only views). */
+  realBalance: (chain = 'base') =>
+    req<{ address: string; chain: string; native: number; nativeUsd: number | null }>(
+      `/api/real/balance?chain=${encodeURIComponent(chain)}`,
     ),
-  hotWalletGenerate: () =>
-    req<{ ok: boolean; publicKey: string; createdAt: number }>('/api/real/hot-wallet/generate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    }),
-  hotWalletBalance: () =>
-    req<{ exists: boolean; publicKey: string | null; balanceSol: number }>('/api/real/hot-wallet/balance'),
-  /** Full on-chain portfolio snapshot (SOL + SPL holdings priced live).
-   *  `totalUsd` is computed server-side — the client must not re-derive the SOL
-   *  leg from /api/overview, whose `markets` list does not always contain SOL. */
-  hotWalletPortfolio: () =>
-    req<{ exists: boolean; address: string; solHeld: number; tokenCount: number; totalUsd: number | null; tokens: { mint: string; symbol: string; name: string | null; uiAmount: number; decimals: number; priceUsd: number | null; valueUsd: number | null }[] }>('/api/real/hot-wallet/portfolio'),
-  hotWalletWithdraw: (amountSol: number) =>
-    req<{ ok: boolean; signature: string; lamports: number; to: string; network: string }>('/api/real/hot-wallet/withdraw', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ amountSol }),
-    }),
-  /** Withdraw the full balance minus a fee buffer — server computes the amount. */
-  hotWalletWithdrawAll: () =>
-    req<{ ok: boolean; signature: string; lamports: number; to: string; network: string }>('/api/real/hot-wallet/withdraw-all', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    }),
-  /** Manual exit of an open position via the hot wallet (server-side sell). */
-  hotWalletSellPosition: (tokenAddress: string) =>
-    req<{ ok: boolean; intentId: string; signature: string; userPublicKey: string }>('/api/real/hot-wallet/sell-position', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tokenAddress }),
-    }),
-  hotWalletImport: (secretKey: number[]) =>
-    req<{ ok: boolean; publicKey: string; createdAt: number }>('/api/real/hot-wallet/import', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ secretKey }),
-    }),
-  /** Execute one open intent server-side (no Phantom popup). */
-  hotWalletExecuteIntent: (intentId: string) =>
-    req<{ ok: boolean; signature: string; userPublicKey: string; inAmount?: string; outAmount?: string }>(
-      '/api/real/hot-wallet/execute-intent',
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ intentId }),
-      },
-    ),
-  hotWalletAuto: () => req<{ autoEnabled: boolean }>('/api/real/hot-wallet/auto'),
-  setHotWalletAuto: (autoEnabled: boolean) =>
-    req<{ ok: boolean; autoEnabled: boolean }>('/api/real/hot-wallet/auto', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ autoEnabled }),
-    }),
-  hotWalletEmergencyPause: () => req<{ paused: boolean }>('/api/real/hot-wallet/emergency-pause'),
-  setHotWalletEmergencyPause: (paused: boolean) =>
-    req<{ ok: boolean; paused: boolean }>('/api/real/hot-wallet/emergency-pause', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ paused }),
-    }),
-
-  // --- EVM Hot Wallet (Base / multi-chain manual execution) ---
-  evmStatus: () =>
-    req<{ exists: boolean; address: string | null; createdAt?: number; updatedAt?: number }>('/api/real/evm/status'),
-  evmGenerate: () =>
-    req<{ ok: boolean; address: string; createdAt: number }>('/api/real/evm/generate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    }),
-  evmImport: (privateKey: string) =>
-    req<{ ok: boolean; address: string; createdAt: number }>('/api/real/evm/import', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ privateKey }),
-    }),
-  evmBalance: (chain: 'base' = 'base') =>
-    req<{ exists: boolean; address: string | null; balanceNative: string }>(`/api/real/evm/balance?chain=${chain}`),
-  evmQuote: (params: { src: string; dst: string; amount: string; chain?: string }) =>
-    req<any>('/api/real/evm/quote', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params),
-    }),
-  evmSwap: (params: { src: string; dst: string; amount: string; slippage?: number; chain?: string }) =>
-    req<{ ok: boolean; txHash: string; explorer: string; from: string; src: string; dst: string; amount: string }>('/api/real/evm/swap', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params),
-    }),
+  realPortfolio: (chain = 'base') =>
+    req<{
+      address: string; chain: string; native: number; nativeUsd: number | null;
+      tokenValueUsd: number; totalUsd: number | null;
+      holdings: { token: string; amount: number; decimals: number; priceUsd: number | null; valueUsd: number | null }[];
+    }>(`/api/real/portfolio?chain=${encodeURIComponent(chain)}`),
 };

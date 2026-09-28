@@ -7,10 +7,10 @@ import { useToast } from '../components/ToastProvider';
 import { useConfirm } from '../components/ConfirmDialog';
 import { Modal } from '../components/Modal';
 import { StaleBadge } from '../components/StaleBadge';
-import { useRealWallet } from '../components/RealWalletContext';
+import { useEvmWallet } from '../components/EvmWalletContext';
 
 export function Leaderboard({ role }: { role: 'admin' | 'user' }) {
-  const { realMode } = useRealWallet();
+  const { realMode } = useEvmWallet();
   const p = usePolling(() => api.leaderboard(), 15_000, []);
   const rows = p.data;
   const [adminUsers, setAdminUsers] = useState<AdminUser[] | null>(null);

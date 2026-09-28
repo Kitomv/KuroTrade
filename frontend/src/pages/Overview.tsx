@@ -6,7 +6,7 @@ import { IconBot, IconBolt, IconChartBar, IconDroplet, IconFire, IconGem, IconLa
 import { fmt } from '../lib/format';
 import { useToast } from '../components/ToastProvider';
 import { StaleBadge } from '../components/StaleBadge';
-import { useRealWallet } from '../components/RealWalletContext';
+import { useEvmWallet } from '../components/EvmWalletContext';
 
 interface Props {
   refreshWatchlist: () => void;
@@ -23,7 +23,7 @@ export function Overview({ refreshWatchlist, onNavigateTab }: Props) {
   const data = overview.data;
   const aiSignals = aiSignalsP.data;
 
-  const { realMode, connected, isBound } = useRealWallet();
+  const { realMode, connected, isBound } = useEvmWallet();
 
   const handlePin = async (m: Market) => {
     try {
@@ -88,9 +88,9 @@ export function Overview({ refreshWatchlist, onNavigateTab }: Props) {
       <div className="page-head" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 14 }}>
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
-            <span className="dot" style={{ width: 10, height: 10, background: '#22c55e', boxShadow: '0 0 14px #22c55e' }} />
+            <span className="dot" style={{ width: 8, height: 8, background: 'var(--up)' }} />
             <h1>DeFi Market Intelligence</h1>
-            <span className="chip" style={{ background: 'rgba(34, 197, 94, .12)', color: 'var(--up)', fontSize: 11, fontWeight: 700, boxShadow: '0 0 12px rgba(34,197,94,.25)' }}>
+            <span className="chip" style={{ background: 'var(--up-bg)', color: 'var(--up)', fontSize: 10.5 }}>
               DEXSCREENER LIVE
             </span>
             <StaleBadge stale={overview.stale || aiSignalsP.stale} />
@@ -100,15 +100,15 @@ export function Overview({ refreshWatchlist, onNavigateTab }: Props) {
 
         {/* Chain selector pills */}
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
-          {['all', 'solana', 'base', 'ethereum', 'bsc', 'arbitrum'].map((c) => (
+          {['all', 'base', 'ethereum', 'bsc', 'arbitrum'].map((c) => (
             <button
               key={c}
               className={`chip${selectedChain === c ? ' active' : ''}`}
               style={{
                 cursor: 'pointer',
-                background: selectedChain === c ? 'rgba(245, 158, 11, .2)' : 'var(--panel-2)',
+                background: selectedChain === c ? 'var(--accent-dim)' : 'var(--panel-2)',
                 color: selectedChain === c ? 'var(--accent)' : 'var(--muted)',
-                borderColor: selectedChain === c ? 'rgba(245, 158, 11, .4)' : 'transparent',
+                borderColor: selectedChain === c ? 'var(--accent)' : 'var(--rule)',
                 border: '1px solid',
                 textTransform: 'uppercase',
                 padding: '6px 12px',
@@ -144,8 +144,8 @@ export function Overview({ refreshWatchlist, onNavigateTab }: Props) {
         {realMode ? (
           <KpiCard
             label="Real Wallet"
-            value={!connected ? 'Phantom?' : !isBound ? 'Perlu Bind' : 'AKTIF'}
-            sub={!connected ? 'Connect untuk mode real' : !isBound ? 'Bind wallet di panel Real Wallet' : 'Dana asli — eksekusi via Phantom'}
+            value={!connected ? 'MetaMask?' : !isBound ? 'Perlu Bind' : 'AKTIF'}
+            sub={!connected ? 'Connect untuk mode real' : !isBound ? 'Bind wallet di panel Real Wallet' : 'Dana asli — approve di MetaMask'}
             variant={connected && isBound ? 'up' : undefined}
           />
         ) : (
@@ -164,9 +164,9 @@ export function Overview({ refreshWatchlist, onNavigateTab }: Props) {
           style={{
             padding: '16px 20px',
             marginBottom: 24,
-            background: 'linear-gradient(90deg, rgba(245,158,11,.12) 0%, rgba(139,92,246,.12) 100%)',
-            border: '1px solid rgba(245,158,11,.3)',
-            boxShadow: '0 0 18px rgba(245,158,11,.12)',
+            background: 'var(--accent-dim)',
+            border: '1px solid rgba(232, 163, 61, .3)',
+            boxShadow: 'none',
             display: 'flex',
             justifyContent: 'space-between',
             alignItems: 'center',
@@ -356,7 +356,7 @@ export function Overview({ refreshWatchlist, onNavigateTab }: Props) {
 function Sparkline({ points, isUp }: { points: number[]; isUp: boolean }) {
   const w = 70;
   const h = 22;
-  const color = isUp ? '#22c55e' : '#ef4444';
+  const color = isUp ? 'var(--up)' : 'var(--down)';
 
   const min = Math.min(...points, -1);
   const max = Math.max(...points, 1);

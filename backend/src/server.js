@@ -3,6 +3,7 @@
 // Multi-user: Bearer-token auth, per-user persisted state.
 
 import express from 'express';
+import { ethers } from 'ethers';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { existsSync, readdirSync } from 'fs';
@@ -22,19 +23,19 @@ import {
 } from './aiAgent.js';
 import { getLLMConfig, setLLMConfig, listModels, testConnection } from './llmClient.js';
 import {
-  isRealMode, setRealMode, isRealAuto, setRealAuto,
+  isRealMode, setRealMode,
   getRealIntents, getRealIntent, setRealIntentStatus, addRealIntent,
-  getBoundWallet, bindWallet, assertBoundWallet, buildBindMessage, createBindChallenge,
+  getBoundWallet, bindWallet, assertBoundWallet, createBindChallenge,
 } from './realIntent.js';
 import { verifyUser, createSession, getUser, destroySession, seedAdminFromEnv,
   changePassword, destroyOtherSessions, listUsers as listAuthUsers, getUserById, adminSetPassword, deleteUser } from './auth.js';
 import { flushAll, cleanupTempFiles } from './persistence.js';
 import { securityHeaders, redact, sanitizeError, ipRateLimit, userRateLimit, isSafeBaseUrl } from './security.js';
 import {
-  generateHotWallet, importHotWallet, getHotWalletPublicInfo, getMasterKey,
-  executeIntentWithHotWallet, isEmergencyPaused, setEmergencyPaused, resolveTokenDecimals,
-  getSolanaRpcUrl,
-} from './hotWallet.js';
+  listEvmChains, isSupportedChain, getChainConfig, getEvmBalanceNative,
+  getEvmTokenValue, getEvmTotalValue, getNativeUsdPrice, evmQuote, buildSwapTx,
+  resolveTokenDecimals, isAllowedRouter, getBoundEvmAddress,
+} from './evmWallet.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -220,167 +221,179 @@ app.get('/api/leaderboard', (req, res) => {
   res.json(rows);
 });
 
-// --- Real trading: Jupiter proxy (stateless, no private keys touch the server) ---
-const JUPITER_BASE = process.env.JUPITER_API_BASE || 'https://lite-api.jup.ag/swap/v1';
+// --- Real trading: EVM (1inch proxy — the server never signs) ---
+// The backend builds the UNSIGNED tx; MetaMask signs it in the browser via
+// eth_sendTransaction. No private key touches this process.
+const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 
-// Jupiter's aggregator only exists on mainnet — there is no devnet deployment.
-// On devnet the mints/route simply don't exist, so every swap would fail deep
-// inside Jupiter as an opaque 500. Fail fast with an actionable message instead.
-function jupiterNetworkGuard(res) {
-  const net = (process.env.NETWORK || 'mainnet').toLowerCase();
-  if (net !== 'mainnet') {
-    res.status(400).json({
-      error: `Jupiter hanya tersedia di mainnet (NETWORK=${net}). Swap dana asli tidak bisa dites di devnet — set NETWORK=mainnet di backend/.env untuk trading sungguhan.`,
-    });
-    return false;
+/** Reject an unknown chain before it reaches 1inch or the RPC layer. */
+function resolveChain(res, value) {
+  const chain = String(value ?? 'base').toLowerCase();
+  if (!isSupportedChain(chain)) {
+    res.status(400).json({ error: `Chain "${chain}" tidak didukung` });
+    return null;
   }
-  return true;
+  return chain;
 }
-const SOL_MINT = 'So11111111111111111111111111111111111111112';
-const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
-async function jupiterFetch(path, opts = {}) {
-  const { method = 'GET', body } = opts;
-  const res = await fetch(`${JUPITER_BASE}${path}`, {
-    method,
-    headers: {
-      ...(body ? { 'Content-Type': 'application/json' } : {}),
-      ...(process.env.JUPITER_API_KEY ? { 'x-api-key': process.env.JUPITER_API_KEY } : {}),
-    },
-    ...(body ? { body: JSON.stringify(body) } : {}),
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!res.ok) {
-    const errText = await res.text().catch(() => '');
-    throw new Error(`Jupiter ${res.status}: ${errText.slice(0, 200)}`);
-  }
-  return res.json();
-}
+app.get('/api/real/evm/chains', (_req, res) => {
+  res.json({ chains: listEvmChains() });
+});
 
 app.post('/api/real/quote', rateLimit('quote', 20), wrap(async (req, res) => {
-  if (!jupiterNetworkGuard(res)) return;
-  const { inputMint, outputMint, amount, slippageBps } = req.body ?? {};
-  if (!BASE58_RE.test(String(inputMint)) || !BASE58_RE.test(String(outputMint))) {
-    return res.status(400).json({ error: 'inputMint/outputMint harus alamat mint base58 valid' });
+  const { src, dst, amount } = req.body ?? {};
+  const chain = resolveChain(res, req.body?.chain);
+  if (!chain) return;
+  if (!EVM_ADDRESS_RE.test(String(src)) || !EVM_ADDRESS_RE.test(String(dst))) {
+    return res.status(400).json({ error: 'src/dst harus alamat 0x + 40 hex (native = 0xEeee…EEeE)' });
   }
-  const amt = Number(amount);
-  if (!Number.isFinite(amt) || amt <= 0) return res.status(400).json({ error: 'amount harus > 0 (satuan terkecil, mis. lamports)' });
-  const slip = Math.min(500, Math.max(1, Number(slippageBps) || 100)); // cap 5%
-  const q = await jupiterFetch(`/quote?inputMint=${encodeURIComponent(inputMint)}&outputMint=${encodeURIComponent(outputMint)}&amount=${Math.floor(amt)}&slippageBps=${slip}`, { method: 'GET' });
-  res.json({
-    inAmount: q.inAmount,
-    outAmount: q.outAmount,
-    priceImpactPct: q.priceImpactPct,
-    routeLabels: (q.routePlan ?? []).map((r) => r.swapInfo?.label).filter(Boolean),
-    slippageBps: slip,
-    rawQuote: q, // needed verbatim by /api/real/swap-tx
-  });
+  if (src.toLowerCase() === dst.toLowerCase()) {
+    return res.status(400).json({ error: 'src dan dst tidak boleh sama' });
+  }
+  res.json(await evmQuote({ src, dst, amount, chain }));
 }));
 
-// Token decimals cache for SELL atomic-unit conversion (audit C1 companion).
-// DexScreener normalize() lacks decimals; Jupiter's public token search API has it.
-const decimalsCache = new Map(); // mint -> { at, decimals }
-async function getTokenDecimals(mint) {
-  const hit = decimalsCache.get(mint);
-  if (hit && Date.now() - hit.at < 3_600_000) return hit.decimals;
-  try {
-    const res = await fetch(`https://lite-api.jup.ag/tokens/v2/search?query=${encodeURIComponent(mint)}`, { method: 'GET', signal: AbortSignal.timeout(8_000) });
-    if (!res.ok) throw new Error(`token api ${res.status}`);
-    const data = await res.json();
-    const found = (Array.isArray(data) ? data : []).find((t) => t.address === mint) ?? (Array.isArray(data) ? data[0] : null);
-    if (found && Number.isFinite(Number(found.decimals))) {
-      decimalsCache.set(mint, { at: Date.now(), decimals: Number(found.decimals) });
-      return Number(found.decimals);
-    }
-  } catch (e) {
-    console.warn(`[real] decimals lookup failed for ${mint}: ${e.message}`);
-  }
-  return null; // caller must refuse to guess
-}
+// Token decimals for SELL atomic-unit conversion. Resolved on-chain from the
+// token contract (authoritative) — never guessed: 9 for a 6-decimal token
+// over-sells by 1000x.
+app.get('/api/real/evm/decimals', rateLimit('quote', 60), wrap(async (req, res) => {
+  const chain = resolveChain(res, req.query.chain);
+  if (!chain) return;
+  const token = String(req.query.token ?? '');
+  if (!EVM_ADDRESS_RE.test(token)) return res.status(400).json({ error: 'token harus alamat 0x + 40 hex' });
+  const decimals = await resolveTokenDecimals(token, chain);
+  if (decimals === null) return res.status(404).json({ error: 'Gagal resolve desimal token — sell ditolak (mencegah salah unit)' });
+  res.json({ token, chain, decimals });
+}));
 
 app.post('/api/real/swap-tx', rateLimit('quote', 20), wrap(async (req, res) => {
-  if (!jupiterNetworkGuard(res)) return;
-  // Intent-bound swap (audit M3): with `intentId` the server rebuilds the quote
-  // from the stored intent (side, mints, amounts, slippage ≤ 1%) — the client
-  // cannot control what gets signed. Without it, manual flow still requires a
-  // bound wallet (L1) but trusts the client's quoteResponse.
-  const { quoteResponse, userPublicKey, intentId } = req.body ?? {};
-  if (!BASE58_RE.test(String(userPublicKey))) return res.status(400).json({ error: 'userPublicKey tidak valid' });
-  try { assertBoundWallet(req.userId, userPublicKey); } catch (e) { return res.status(403).json({ error: e.message }); }
+  // Intent-bound swap: the server rebuilds the swap from the STORED intent
+  // (side, token, amount, slippage ≤ 1%) — the client cannot control what gets
+  // signed. The manual path additionally requires a bound wallet.
+  const { intentId, from } = req.body ?? {};
+  const chain = resolveChain(res, req.body?.chain);
+  if (!chain) return;
+  if (!EVM_ADDRESS_RE.test(String(from))) return res.status(400).json({ error: 'from harus alamat 0x + 40 hex' });
+  try { assertBoundWallet(req.userId, String(from)); } catch (e) { return res.status(403).json({ error: e.message }); }
 
-  if (intentId) {
-    const intent = getRealIntent(req.userId, intentId);
-    if (!intent) return res.status(404).json({ error: 'Intent tidak ditemukan' });
-    if (intent.status !== 'active') return res.status(409).json({ error: 'Intent tidak aktif / sudah diklaim sesi lain' });
+  if (!intentId) return res.status(400).json({ error: 'intentId required' });
+  const intent = getRealIntent(req.userId, intentId);
+  if (!intent) return res.status(404).json({ error: 'Intent tidak ditemukan' });
+  if (intent.status !== 'active') return res.status(409).json({ error: 'Intent tidak aktif / sudah diklaim sesi lain' });
 
-    let inputMint, outputMint, amount;
-    if (intent.side === 'buy') {
-      const lamports = Number(intent.amountSol);
-      // C1: never fall back to treating a USDC budget as SOL.
-      if (!Number.isFinite(lamports) || lamports <= 0) {
-        return res.status(400).json({ error: 'Intent buy tanpa amountSol — buat ulang intent (unit lama tidak aman)' });
-      }
-      inputMint = SOL_MINT; outputMint = intent.tokenAddress; amount = Math.floor(lamports);
-    } else {
-      const decimals = await getTokenDecimals(intent.tokenAddress);
-      if (decimals === null) return res.status(400).json({ error: 'Gagal resolve desimal token — sell ditolak (mencegah salah unit)' });
-      const atomic = Math.floor(Number(intent.estTokens) * Math.pow(10, decimals));
-      if (!Number.isFinite(atomic) || atomic <= 0) return res.status(400).json({ error: 'Jumlah sell tidak valid' });
-      inputMint = intent.tokenAddress; outputMint = SOL_MINT; amount = atomic;
+  const NATIVE = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+  const intentChain = String(intent.chainId ?? chain).toLowerCase();
+  if (!isSupportedChain(intentChain)) {
+    return res.status(400).json({ error: `Intent dibuat untuk chain "${intentChain}" yang tidak didukung` });
+  }
+
+  let src, dst, amount;
+  if (intent.side === 'buy') {
+    const wei = String(intent.amountWei ?? '');
+    // Never fall back to treating a USD budget as native. An intent without a
+    // resolved wei amount predates the EVM migration and is unsafe to fill.
+    if (!/^\d+$/.test(wei) || wei === '0') {
+      return res.status(400).json({ error: 'Intent buy tanpa amountWei — buat ulang intent (unit lama tidak aman)' });
     }
-
-    const q = await jupiterFetch(`/quote?inputMint=${encodeURIComponent(inputMint)}&outputMint=${encodeURIComponent(outputMint)}&amount=${amount}&slippageBps=100`, { method: 'GET' });
-    const swap = await jupiterFetch('/swap', { method: 'POST', body: { quoteResponse: q, userPublicKey, wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true } });
-    if (!swap.swapTransaction) throw new Error('Jupiter tidak mengembalikan swapTransaction');
-    return res.json({ swapTransaction: swap.swapTransaction, intentId });
+    src = NATIVE; dst = intent.tokenAddress; amount = wei;
+  } else {
+    const decimals = await resolveTokenDecimals(intent.tokenAddress, intentChain);
+    if (decimals === null) {
+      return res.status(400).json({ error: 'Gagal resolve desimal token — sell ditolak (mencegah salah unit)' });
+    }
+    const atomic = ethers.parseUnits(String(intent.estTokens), decimals);
+    if (atomic <= 0n) return res.status(400).json({ error: 'Jumlah sell tidak valid' });
+    src = intent.tokenAddress; dst = NATIVE; amount = atomic.toString();
   }
 
-  if (!quoteResponse || typeof quoteResponse !== 'object') return res.status(400).json({ error: 'quoteResponse required' });
-  // Client-supplied quote hardening: only accept a well-formed Jupiter quote
-  // whose slippage is capped and whose mints are valid Solana addresses. This
-  // does not replace the intent path (which rebuilds server-side) — it stops
-  // malformed/hostile payloads from reaching the signer.
-  const qInput = String(quoteResponse.inputMint ?? '');
-  const qOutput = String(quoteResponse.outputMint ?? '');
-  const qAmount = Number(quoteResponse.inAmount);
-  // slippageBps is a REQUEST param to /quote, not in the raw Jupiter response.
-  // Accept a reasonable range for the slippage that was used to get this quote.
-  // The frontend should pass the slippage it requested via a separate field.
-  const qSlippage = Number(quoteResponse.slippageBps);
-  // If the quote doesn't carry slippage, fall back to a safe default (1%).
-  // The actual swap will enforce whatever slippage Jupiter applied when the
-  // quote was generated; this check just rejects absurd values.
-  const effectiveSlippage = Number.isFinite(qSlippage) ? qSlippage : 100;
-  if (!BASE58_RE.test(qInput) || !BASE58_RE.test(qOutput)) {
-    return res.status(400).json({ error: 'quoteResponse.inputMint/outputMint tidak valid' });
-  }
-  if (qInput === qOutput) return res.status(400).json({ error: 'quoteResponse mints tidak boleh sama' });
-  if (!Number.isFinite(qAmount) || qAmount <= 0) return res.status(400).json({ error: 'quoteResponse.inAmount tidak valid' });
-  if (effectiveSlippage < 1 || effectiveSlippage > 500) {
-    return res.status(400).json({ error: 'quoteResponse.slippageBps harus 1-500 (maks 5%)' });
-  }
-  const swap = await jupiterFetch('/swap', { method: 'POST', body: { quoteResponse, userPublicKey, wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true } });
-  if (!swap.swapTransaction) throw new Error('Jupiter tidak mengembalikan swapTransaction');
-  res.json({ swapTransaction: swap.swapTransaction });
+  // Slippage is capped server-side at 1% — the intent path is never allowed to
+  // widen it, regardless of what the client asks for.
+  const built = await buildSwapTx({ src, dst, amount, chain: intentChain, from, slippage: 100 });
+  res.json({ ...built, intentId });
 }));
 
-// Wallet binding (L1): the server issues a single-use nonce challenge so a
-// captured signature cannot be replayed. The client signs the exact message
-// in Phantom; bindWallet consumes the nonce exactly once.
+// Manual trade request → a normal intent. Deliberately NOT a separate execution
+// path: routing the user's own clicks through the same intent state machine
+// means they inherit every guard (per-trade cap, affordability, claim tokens,
+// buy/sell dedup, chain allow-list) instead of a parallel path that would need
+// its own copies and could drift.
+app.post('/api/real/manual-intent', rateLimit('quote', 20), wrap(async (req, res) => {
+  const { tokenAddress, symbol, side, amountUsd, estTokens, intentPrice } = req.body ?? {};
+  const chain = resolveChain(res, req.body?.chain);
+  if (!chain) return;
+  if (!EVM_ADDRESS_RE.test(String(tokenAddress))) {
+    return res.status(400).json({ error: 'tokenAddress harus alamat 0x + 40 hex' });
+  }
+  if (side !== 'buy' && side !== 'sell') return res.status(400).json({ error: 'side harus "buy" atau "sell"' });
+
+  const address = getBoundEvmAddress(req.userId);
+  if (!address) return res.status(403).json({ error: 'Wallet belum di-bind — bind MetaMask dulu' });
+
+  const tokens = Number(estTokens);
+  if (!Number.isFinite(tokens) || tokens <= 0) return res.status(400).json({ error: 'estTokens harus > 0' });
+  const price = Number(intentPrice);
+  if (!Number.isFinite(price) || price <= 0) return res.status(400).json({ error: 'intentPrice harus > 0' });
+  const usd = Number(amountUsd);
+  if (!Number.isFinite(usd) || usd <= 0) return res.status(400).json({ error: 'amountUsd harus > 0' });
+
+  // Dedup: two open intents for the same token+side is how a double-click turns
+  // into two real on-chain trades once both are approved.
+  const dup = getRealIntents(req.userId).some(
+    (i) => (i.status === 'open' || i.status === 'active')
+      && i.side === side
+      && String(i.tokenAddress).toLowerCase() === String(tokenAddress).toLowerCase(),
+  );
+  if (dup) return res.status(409).json({ error: 'Sudah ada intent untuk token ini yang menunggu approve' });
+
+  const intent = { symbol: String(symbol ?? 'UNKNOWN').slice(0, 40), tokenAddress, chainId: chain, side, source: 'MANUAL', amountUsd: usd, estTokens: tokens, intentPrice: price };
+
+  if (side === 'buy') {
+    const { getNativeUsdPrice, checkTradeSize, checkEvmAffordability } = await import('./evmWallet.js');
+    const nativeUsd = await getNativeUsdPrice(chain);
+    if (!nativeUsd || nativeUsd <= 0) {
+      return res.status(400).json({ error: `Harga ${getChainConfig(chain).native} tidak tersedia — coba lagi` });
+    }
+    const capped = checkTradeSize(usd);
+    const effectiveUsd = capped.ok ? usd : capped.cap;
+    const afford = await checkEvmAffordability(address, effectiveUsd, { nativeUsd, chain });
+    if (!afford.ok) {
+      return res.status(400).json({
+        error: `Wallet tidak sanggup beli $${effectiveUsd} (${afford.reason}). Saldo ${afford.balanceNative.toFixed(4)}, cadangan gas ${afford.reserveNative} ${getChainConfig(chain).native}`,
+      });
+    }
+    intent.amountUsd = Math.round(afford.buyUsd * 100) / 100;
+    intent.amountWei = Math.round((intent.amountUsd / nativeUsd) * 1e18);
+  } else {
+    // Cost basis snapshot for the realized-PnL booking at confirmation time.
+    const { getPositions } = await import('./wallet.js');
+    const pos = getPositions(req.userId).find(
+      (p) => p.tokenAddress.toLowerCase() === String(tokenAddress).toLowerCase(),
+    );
+    intent.entryAvgPrice = Number(pos?.avgBuyPrice) || price;
+  }
+
+  const created = addRealIntent(req.userId, intent);
+  res.status(201).json(created);
+}));
+
+// Wallet binding: a single-use nonce challenge so a captured signature cannot
+// be replayed. The client signs the exact message with MetaMask (personal_sign);
+// bindWallet consumes the nonce exactly once and stores the RECOVERED address.
 app.get('/api/real/bind-message', rateLimit('bind', 10), (req, res) => {
-  const publicKey = String(req.query.publicKey ?? '');
-  if (!BASE58_RE.test(publicKey)) return res.status(400).json({ error: 'publicKey base58 tidak valid' });
-  res.json(createBindChallenge(req.userId, publicKey));
+  const address = String(req.query.address ?? req.query.publicKey ?? '');
+  if (!EVM_ADDRESS_RE.test(address)) return res.status(400).json({ error: 'address harus 0x + 40 hex' });
+  res.json(createBindChallenge(req.userId, address));
 });
 
 app.post('/api/real/bind', rateLimit('bind', 10), async (req, res) => {
-  const { publicKey, signature } = req.body ?? {};
-  if (!publicKey || !signature) return res.status(400).json({ error: 'publicKey & signature required' });
-  if (!BASE58_RE.test(String(publicKey))) return res.status(400).json({ error: 'publicKey base58 tidak valid' });
+  const address = String(req.body?.address ?? req.body?.publicKey ?? '');
+  const signature = req.body?.signature;
+  if (!address || !signature) return res.status(400).json({ error: 'address & signature required' });
+  if (!EVM_ADDRESS_RE.test(address)) return res.status(400).json({ error: 'address harus 0x + 40 hex' });
   try {
-    res.json(bindWallet(req.userId, String(publicKey), String(signature)));
+    res.json(bindWallet(req.userId, address, String(signature)));
   } catch (e) {
-    // Signature/key validation is a client input error, not a proxy failure.
+    // Signature/address validation is a client input error, not a proxy failure.
     res.status(400).json({ error: e.message ?? 'Signature wallet tidak valid' });
   }
 });
@@ -429,7 +442,7 @@ app.get('/api/export/positions.csv', (req, res) => {
   res.send(csv);
 });
 
-// --- Real-wallet pending intents (autopilot → user approves via Phantom) ---
+// --- Real-wallet pending intents (autopilot → user approves via MetaMask) ---
 app.get('/api/real/intents', (req, res) => {
   // claimToken is a server-side single-flight guard — never expose it to clients.
   res.json(getRealIntents(req.userId).map(({ claimToken, ...rest }) => rest));
@@ -458,379 +471,40 @@ app.post('/api/real/mode', async (req, res) => {
   res.json(setRealMode(req.userId, Boolean(realMode)));
 });
 
-// Auto-approve only removes the in-page click; Phantom still signs each tx.
+// Every real trade waits for an explicit signature in MetaMask.
 // Default false, persisted per user, forcibly disabled when real mode is off.
-app.get('/api/real/auto', async (req, res) => {
-  const { isRealAuto } = await import('./realIntent.js');
-  res.json({ realAuto: isRealAuto(req.userId) });
-});
+// Real-wallet on-chain reads for the BOUND MetaMask address. There is no
+// server-held wallet: these are read-only views of the user's own address.
+app.get('/api/real/balance', wrap(async (req, res) => {
+  const chain = resolveChain(res, req.query.chain);
+  if (!chain) return;
+  const address = getBoundEvmAddress(req.userId);
+  if (!address) return res.status(404).json({ error: 'Wallet belum di-bind' });
+  const native = await getEvmBalanceNative(address, chain);
+  res.json({ address, chain, native, nativeUsd: await getNativeUsdPrice(chain) });
+}));
 
-app.post('/api/real/auto', async (req, res) => {
-  const { setRealAuto } = await import('./realIntent.js');
-  const { realAuto } = req.body ?? {};
-  res.json(setRealAuto(req.userId, Boolean(realAuto)));
-});
-
-// --- Hot Wallet Management & Auto-Execute (new) ---
-// All protected by auth + IP rate limit already applied to /api/real/* above.
-
-// Check status only (public metadata: no secrets)
-app.get('/api/real/hot-wallet/status', async (req, res) => {
-  try {
-    const { getHotWalletPublicInfo } = await import('./hotWallet.js');
-    const info = getHotWalletPublicInfo(req.userId);
-    res.json(info);
-  } catch (e) {
-    res.status(500).json({ error: sanitizeError(e.message) });
-  }
-});
-
-// Read-only SOL balance of the hot wallet, so the UI can show funding state.
-app.get('/api/real/hot-wallet/balance', async (req, res) => {
-  try {
-    const { getHotWalletBalance } = await import('./hotWallet.js');
-    res.json(await getHotWalletBalance(req.userId));
-  } catch (e) {
-    res.status(500).json({ error: sanitizeError(e.message) });
-  }
-});
-
-// Full on-chain portfolio snapshot of the hot wallet (SOL + each SPL holding
-// with live price). Backs the Portfolio page when hot-wallet mode is active.
-app.get('/api/real/hot-wallet/portfolio', async (req, res) => {
-  try {
-    const { getHotWalletPortfolio, getHotWalletTotalValue } = await import('./hotWallet.js');
-    const snap = await getHotWalletPortfolio(req.userId);
-    if (!snap) return res.status(404).json({ error: 'Hot wallet belum dibuat' });
-    // Value the wallet server-side (SOL + SPL) instead of making the client
-    // re-derive the SOL leg from /api/overview's `markets` list — that list is
-    // watchlist + a few hardcoded tokens, so SOL is often absent and the page's
-    // "Total Nilai Hot Wallet" tile rendered as "—" with no explanation.
-    const totalUsd = await getHotWalletTotalValue(req.userId).catch(() => null);
-    res.json({ ...snap, totalUsd });
-  } catch (e) {
-    res.status(500).json({ error: sanitizeError(e.message) });
-  }
-});
-
-// Withdraw SOL from the hot wallet back to the user's BOUND Phantom wallet.
-/** Withdraw all SOL except a small fee buffer. Server-side computation avoids
- * client truncation issues (front-end sends 4-decimal balance, backend floors
- * and subtracts fee → insufficient error when user sees "enough" in UI). */
-app.post('/api/real/hot-wallet/withdraw-all', async (req, res) => {
-  try {
-    const { withdrawFromHotWallet, getHotWalletBalance, getSolanaConnection } = await import('./hotWallet.js');
-    const masterKey = getMasterKey();
-    const info = await getHotWalletBalance(req.userId);
-    if (!info.exists) {
-      return res.status(400).json({ error: 'Hot wallet belum dibuat' });
-    }
-    const conn = getSolanaConnection();
-    const balanceLamports = Math.floor(info.balanceSol * 1_000_000_000);
-
-    // Solana requires the SENDER account to stay rent-exempt (~890,880 lamports)
-    // in addition to paying the tx fee. Sending more than
-    // (balance − rentExempt − txFee) fails simulation with InsufficientFundsForRent.
-    const minRentLamports = await conn.getMinimumBalanceForRentExemption(0);
-    const TX_FEE_BUFFER = 5_000;
-    const sendable = balanceLamports - minRentLamports - TX_FEE_BUFFER;
-    if (sendable <= 0) {
-      return res.status(400).json({
-        error: `Saldo tidak cukup untuk menarik — butuh minimal ${((minRentLamports + TX_FEE_BUFFER) / 1e9).toFixed(6)} SOL (rent + fee)`,
-      });
-    }
-
-    const result = await withdrawFromHotWallet(req.userId, sendable, { masterKey });
-    res.json(result);
-  } catch (e) {
-    res.status(400).json({ error: sanitizeError(e.message) });
-  }
-});
-
-// Manual exit: user-initiated sell of an open position via the hot wallet.
-// If a sell intent for this token already exists in 'open' state (e.g. a
-// throttled autopilot exit that hasn't cleared), re-attempt THAT intent instead
-// of 409-ing — the user's explicit sell click is exactly the retry that should
-// push it through. Only 'active' (claimed by another session mid-execution) is
-// a real conflict.
-app.post('/api/real/hot-wallet/sell-position', async (req, res) => {
-  try {
-    const { tokenAddress } = req.body ?? {};
-    if (!tokenAddress || typeof tokenAddress !== 'string') {
-      return res.status(400).json({ error: 'tokenAddress required' });
-    }
-    const { getPositions } = await import('./wallet.js');
-    const pos = getPositions(req.userId).find(
-      (p) => p.tokenAddress.toLowerCase() === tokenAddress.toLowerCase(),
-    );
-    const { getRealIntents, getRealIntent, addRealIntent } = await import('./realIntent.js');
-    const pendingSell = getRealIntents(req.userId).find(
-      (i) => i.side === 'sell'
-        && i.tokenAddress === pos?.tokenAddress
-        && (i.status === 'open' || i.status === 'active'),
-    );
-    if (pendingSell?.status === 'active') {
-      return res.status(409).json({ error: 'Sell intent sedang dieksekusi sesi lain — tunggu selesai' });
-    }
-
-    const { getHotWalletPublicInfo, executeIntentWithHotWallet, resolveTokenDecimals } = await import('./hotWallet.js');
-    if (!getHotWalletPublicInfo(req.userId).exists) {
-      return res.status(400).json({ error: 'Hot wallet belum dibuat' });
-    }
-
-    // Reuse a pending 'open' sell intent (retry), else create a fresh MANUAL one.
-    let intent = pendingSell && pendingSell.status === 'open' ? pendingSell : null;
-    if (!intent) {
-      if (!pos) return res.status(404).json({ error: 'Posisi tidak ditemukan di portfolio' });
-      if (!(Number(pos.amount) > 0)) return res.status(400).json({ error: 'Jumlah posisi tidak valid' });
-      intent = addRealIntent(req.userId, {
-        symbol: pos.symbol,
-        tokenAddress: pos.tokenAddress,
-        chainId: pos.chainId,
-        side: 'sell',
-        source: 'MANUAL',
-        amountUsd: Math.round(Number(pos.amount) * (Number(pos.currentPrice) || Number(pos.avgBuyPrice)) * 100) / 100,
-        estTokens: Number(pos.amount),
-        intentPrice: Number(pos.currentPrice) || Number(pos.avgBuyPrice),
-      });
-    }
-
-    const { resolveIntentAsDone } = await import('./realIntent.js');
-    // Capture the cost basis BEFORE the sell: resolveIntentAsDone reduces (or
-    // deletes) the mirrored position, after which the entry is unrecoverable.
-    const costUsd = (Number(pos?.amount) || 0) * (Number(pos?.avgBuyPrice) || 0);
-    const result = await executeIntentWithHotWallet(req.userId, intent, {
-      getTokenDecimalsFn: resolveTokenDecimals,
-    });
-    try { resolveIntentAsDone(req.userId, intent.id, { force: true }); } catch {}
-    // A manual sell is a real round trip, so it must reach the same stats the
-    // guardian's SL/TP exits write. recordRealized is keyed on the intent id, so
-    // a guardian tick that later records the SAME exit is a no-op — that dedup
-    // is what makes it safe for both paths to call.
-    try {
-      const { getSolUsdPrice } = await import('./dexscreener.js');
-      const { recordRealized } = await import('./aiAgent.js');
-      const solUsd = await getSolUsdPrice();
-      const proceedsUsd = (Number(result.filledOutputAmount) || 0) * (Number(solUsd) || 0);
-      recordRealized(req.userId, { pnlUsd: proceedsUsd - costUsd, intentId: intent.id, key: intent.id });
-    } catch (e) {
-      console.warn(`[sell-position] stats recording failed: ${e.message}`);
-    }
-    res.json({ ok: true, intentId: intent.id, ...result });
-  } catch (e) {
-    res.status(400).json({ error: sanitizeError(e.message) });
-  }
-});
-
-// Destination is never client-supplied — it is read from the bind state, so a
-// compromised session cannot redirect funds to an attacker address.
-app.post('/api/real/hot-wallet/withdraw', async (req, res) => {
-  try {
-    const { withdrawFromHotWallet } = await import('./hotWallet.js');
-    const { amountSol } = req.body ?? {};
-    const sol = Number(amountSol);
-    if (!Number.isFinite(sol) || sol <= 0) {
-      return res.status(400).json({ error: 'amountSol harus angka > 0' });
-    }
-    const lamports = Math.floor(sol * 1_000_000_000);
-    const masterKey = getMasterKey();
-    const result = await withdrawFromHotWallet(req.userId, lamports, { masterKey });
-    res.json(result);
-  } catch (e) {
-    res.status(400).json({ error: sanitizeError(e.message) });
-  }
-});
-
-// Generate new hot wallet for userId (private key encrypted at server, never exposed)
-app.post('/api/real/hot-wallet/generate', async (req, res) => {
-  try {
-    const { getHotWalletPublicInfo, generateHotWallet } = await import('./hotWallet.js');
-    const info = getHotWalletPublicInfo(req.userId);
-    if (info.exists) {
-      return res.status(400).json({ error: `Hot wallet sudah ada (${info.publicKey}). Hapus dulu kalau mau buat baru.` });
-    }
-    const masterKey = getMasterKey();
-    const result = generateHotWallet(req.userId, masterKey);
-    res.json({ ok: true, ...result });
-  } catch (e) {
-    if (String(e.message).includes('MASTER_ENCRYPTION_KEY')) {
-      return res.status(500).json({ error: 'MASTER_ENCRYPTION_KEY belum diset di .env' });
-    }
-    res.status(500).json({ error: sanitizeError(e.message) });
-  }
-});
-
-// Import existing secret key (must be 64-byte Uint8Array Ed25519 format)
-app.post('/api/real/hot-wallet/import', async (req, res) => {
-  try {
-    const { importHotWallet, getHotWalletPublicInfo } = await import('./hotWallet.js');
-    const info = getHotWalletPublicInfo(req.userId);
-    if (info.exists) {
-      return res.status(400).json({ error: `Hot wallet sudah ada (${info.publicKey}). Hapus dulu kalau mau import yang baru.` });
-    }
-    const { secretKey } = req.body ?? {};
-    if (!secretKey || !Array.isArray(secretKey)) {
-      return res.status(400).json({ error: 'secretKey harus array of numbers (64 byte Ed25519)' });
-    }
-    if (secretKey.length !== 64) {
-      return res.status(400).json({ error: 'secretKey harus 64 byte (Uint8Array Ed25519 keypair)' });
-    }
-    const masterKey = getMasterKey();
-    const result = importHotWallet(req.userId, Uint8Array.from(secretKey), masterKey);
-    res.json({ ok: true, ...result });
-  } catch (e) {
-    res.status(500).json({ error: sanitizeError(e.message) });
-  }
-});
-
-// Execute a pending intent directly on-chain using hot wallet (bypasses Phantom sign)
-app.post('/api/real/hot-wallet/execute-intent', async (req, res) => {
-  try {
-    const { executeIntentWithHotWallet } = await import('./hotWallet.js');
-    const { intentId } = req.body ?? {};
-    if (!intentId) return res.status(400).json({ error: 'intentId required' });
-    const { getRealIntent } = await import('./realIntent.js');
-    const intent = getRealIntent(req.userId, intentId);
-    if (!intent) return res.status(404).json({ error: 'Intent tidak ditemukan untuk user ini' });
-    if (intent.status !== 'open') {
-      return res.status(400).json({ error: `Intent must be 'open'; current=${intent.status}` });
-    }
-    const masterKey = getMasterKey();
-    const result = await executeIntentWithHotWallet(req.userId, intent, {
-      masterKey,
-      getTokenDecimalsFn: resolveTokenDecimals, // shared decimals resolver for SELL
-    });
-    // The swap is already broadcast — closing the intent MUST NOT fail. A direct
-    // open→done would throw on the guarded state machine and leave it open for a
-    // second execution (double spend). force:true closes unconditionally, which
-    // is honest here because on-chain execution is already confirmed.
-    try {
-      const { resolveIntentAsDone } = await import('./realIntent.js');
-      resolveIntentAsDone(req.userId, intentId, { force: true });
-    } catch (closeErr) {
-      console.error(`[hot-wallet] intent ${intentId} executed but could not be closed:`, sanitizeError(closeErr.message));
-    }
-    res.json({ ok: true, ...result });
-  } catch (e) {
-    res.status(500).json({ error: sanitizeError(e.message) });
-  }
-});
-
-// Auto-execute toggle: when enabled, autopilot intents are signed + broadcast
-// server-side by the hot wallet instead of waiting for a Phantom approval.
-// Persisted per-user (realIntent state), NOT in process.env — a process-wide
-// flag would let one user's toggle enable auto-trading for every user.
-app.get('/api/real/hot-wallet/auto', async (req, res) => {
-  const { isHotWalletAuto } = await import('./realIntent.js');
-  res.json({ autoEnabled: isHotWalletAuto(req.userId) });
-});
-app.post('/api/real/hot-wallet/auto', async (req, res) => {
-  const { autoEnabled } = req.body ?? {};
-  const { setHotWalletAuto, isRealMode } = await import('./realIntent.js');
-  if (autoEnabled && !isRealMode(req.userId)) {
-    return res.status(400).json({ error: 'Nyalakan Real Wallet Mode dulu sebelum auto-execute hot wallet' });
-  }
-  res.json(setHotWalletAuto(req.userId, Boolean(autoEnabled)));
-});
-
-// Emergency pause switch: globally disable all hot-wallet auto-execution
-app.get('/api/real/hot-wallet/emergency-pause', async (req, res) => {
-  const { isEmergencyPaused } = await import('./hotWallet.js');
-  res.json({ paused: isEmergencyPaused() });
-});
-// ADMIN ONLY: emergencyPaused is process-global (hotWallet.js) — it stops or
-// re-arms autopilot for EVERY user, so a non-admin must not be able to flip it.
-app.post('/api/real/hot-wallet/emergency-pause', requireAdmin, async (req, res) => {
-  const { paused } = req.body ?? {};
-  const { setEmergencyPaused } = await import('./hotWallet.js');
-  setEmergencyPaused(Boolean(paused));
-  res.json({ ok: true, paused: Boolean(paused) });
-});
-
-// --- EVM (Base) hot wallet — Multi-chain trading, MANUAL execution only ---
-// Shared master key + per-user AES-GCM keystore, separate from the SOL hot wallet.
-const VALID_CHAINS = new Set(['base', 'ethereum', 'arbitrum', 'bsc', 'optimism', 'polygon', 'avalanche']);
-
-// List supported EVM chains (drives the chain selector in the UI).
-app.get('/api/real/evm/chains', async (_req, res) => {
-  const { listEvmChains } = await import('./evmWallet.js');
-  res.json({ chains: listEvmChains() });
-});
-
-app.get('/api/real/evm/status', async (req, res) => {
-  const { getEvmWalletStatus } = await import('./evmWallet.js');
-  res.json(getEvmWalletStatus(req.userId));
-});
-
-app.post('/api/real/evm/generate', async (req, res) => {
-  try {
-    const { generateEvmWallet, getEvmWalletStatus, getMasterKey } = await import('./evmWallet.js');
-    if (getEvmWalletStatus(req.userId).exists) {
-      return res.status(400).json({ error: 'EVM wallet sudah ada — hapus dulu untuk buat baru' });
-    }
-    res.json({ ok: true, ...generateEvmWallet(req.userId, getMasterKey()) });
-  } catch (e) {
-    res.status(500).json({ error: sanitizeError(e.message) });
-  }
-});
-
-app.post('/api/real/evm/import', async (req, res) => {
-  try {
-    const { importEvmWallet, getEvmWalletStatus, getMasterKey } = await import('./evmWallet.js');
-    if (getEvmWalletStatus(req.userId).exists) {
-      return res.status(400).json({ error: 'EVM wallet sudah ada — hapus dulu untuk import' });
-    }
-    const { privateKey } = req.body ?? {};
-    if (!privateKey || typeof privateKey !== 'string') {
-      return res.status(400).json({ error: 'privateKey (hex) required' });
-    }
-    res.json({ ok: true, ...importEvmWallet(req.userId, privateKey, getMasterKey()) });
-  } catch (e) {
-    res.status(500).json({ error: sanitizeError(e.message) });
-  }
-});
-
-app.get('/api/real/evm/balance', async (req, res) => {
-  try {
-    const { getEvmBalance } = await import('./evmWallet.js');
-    const chain = VALID_CHAINS.has(String(req.query.chain)) ? req.query.chain : 'base';
-    res.json(await getEvmBalance(req.userId, chain));
-  } catch (e) {
-    res.status(500).json({ error: sanitizeError(e.message) });
-  }
-});
-
-app.post('/api/real/evm/quote', async (req, res) => {
-  try {
-    const { evmQuote } = await import('./evmWallet.js');
-    const { src, dst, amount } = req.body ?? {};
-    if (!src || !dst || !Number.isFinite(Number(amount)) || Number(amount) <= 0) {
-      return res.status(400).json({ error: 'src, dst, amount (number > 0) required' });
-    }
-    const chain = VALID_CHAINS.has(String(req.body.chain)) ? req.body.chain : 'base';
-    const result = await evmQuote(req.userId, { src, dst, amount, chain });
-    res.json(result);
-  } catch (e) {
-    res.status(500).json({ error: sanitizeError(e.message) });
-  }
-});
-
-// MANUAL swap: server signs + broadcasts; frontend shows a confirm dialog first.
-// Never uses Phantom. Emergency pause (admin) blocks it.
-app.post('/api/real/evm/swap', async (req, res) => {
-  try {
-    const { executeEvmSwap } = await import('./evmWallet.js');
-    const { src, dst, amount, slippage = 100, chain } = req.body ?? {};
-    if (!src || !dst || !Number.isFinite(Number(amount)) || Number(amount) <= 0) {
-      return res.status(400).json({ error: 'src, dst, amount (number > 0) required' });
-    }
-    const resolvedChain = VALID_CHAINS.has(String(chain)) ? chain : 'base';
-    const result = await executeEvmSwap(req.userId, { src, dst, amount, slippage, chain: resolvedChain });
-    res.json(result);
-  } catch (e) {
-    res.status(500).json({ error: sanitizeError(e.message) });
-  }
-});
+app.get('/api/real/portfolio', wrap(async (req, res) => {
+  const chain = resolveChain(res, req.query.chain);
+  if (!chain) return;
+  const address = getBoundEvmAddress(req.userId);
+  if (!address) return res.status(404).json({ error: 'Wallet belum di-bind' });
+  // The tracked token set is the user's own positions — the only holdings the
+  // app knows how to price (DexScreener) or value.
+  const { getPositions } = await import('./wallet.js');
+  const tokens = [...new Set(getPositions(req.userId)
+    .filter((p) => p.chainId === chain)
+    .map((p) => p.tokenAddress))];
+  const { valueUsd, holdings } = await getEvmTokenValue(address, chain, tokens);
+  const nativeUsd = await getNativeUsdPrice(chain);
+  const native = await getEvmBalanceNative(address, chain);
+  res.json({
+    address, chain, native, nativeUsd,
+    tokenValueUsd: valueUsd,
+    totalUsd: nativeUsd ? Math.round((native * nativeUsd + valueUsd) * 100) / 100 : null,
+    holdings,
+  });
+}));
 
 // --- Per-user rate limits for heavy AI endpoints ---
 const aiLimits = new Map(); // userId -> { analyze: {count, resetAt}, signals: {count, resetAt} }
@@ -935,16 +609,22 @@ app.get('/api/overview', wrap(async (req, res) => {
   const wallet = getWallet(req.userId);
   const positions = getPositions(req.userId);
 
-  // Hot wallet total (SOL + SPL), valued server-side. The Portfolio page used
-  // to derive the SOL leg itself by scanning `markets` for the SOL mint — but
-  // `markets` is watchlist + a few hardcoded hot tokens, and SOL is not
-  // guaranteed to be in it, so the total rendered as "—". getHotWalletTotalValue
-  // already prices the wallet correctly, so reuse it.
-  let hotWalletTotalUsd = null;
-  try {
-    const { getHotWalletTotalValue } = await import('./hotWallet.js');
-    hotWalletTotalUsd = await getHotWalletTotalValue(req.userId, { markets: wlMarkets });
-  } catch {}
+  // Real-wallet on-chain total, valued server-side from the bound MetaMask
+  // address. The Portfolio page used to derive the native leg itself by
+  // scanning `markets` for the native mint — but `markets` is watchlist + a few
+  // hardcoded hot tokens and the mint is not guaranteed to be there, so the
+  // total rendered as "—". Server-side pricing is the fix.
+  let realWalletTotalUsd = null;
+  if (isRealMode(req.userId)) {
+    try {
+      const address = getBoundEvmAddress(req.userId);
+      const { getPositions: livePositions } = await import('./wallet.js');
+      const tokens = [...new Set(livePositions(req.userId).map((p) => p.tokenAddress))];
+      realWalletTotalUsd = address
+        ? await getEvmTotalValue(address, 'base', { tokens })
+        : null;
+    } catch {}
+  }
 
   res.json({
     watchedTokens: entries.length,
@@ -959,7 +639,7 @@ app.get('/api/overview', wrap(async (req, res) => {
       balance: wallet.balance,
       totalValue: wallet.totalValue,
       openPositionsCount: positions.length,
-      hotWalletTotalUsd,
+      realWalletTotalUsd,
     },
   });
 }));
@@ -1157,48 +837,6 @@ setInterval(() => {
 }, 5 * 60 * 1000).unref?.();
 
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
-
-// --- Solana JSON-RPC proxy (same-origin) ---
-// The browser cannot call public RPCs reliably: api.mainnet-beta.solana.com
-// returns 403 to browser origins, and shipping a paid RPC key to the client
-// would leak it to anyone who opens devtools. The backend already holds the
-// configured RPC (BACKEND_SOLANA_RPC / NETWORK), so the wallet UI reads chain
-// state through this same-origin passthrough instead. Read methods only — this
-// is for balances/account reads, not for broadcasting (signing stays client-side
-// with Phantom, and the hot wallet never exposes its key).
-const RPC_READ_METHODS = new Set([
-  'getBalance', 'getAccountInfo', 'getMultipleAccounts', 'getTokenAccountBalance',
-  'getParsedTokenAccountsByOwner', 'getTokenAccountsByOwner', 'getLatestBlockhash',
-  'getRecentBlockhash', 'getFeeForMessage', 'getMinimumBalanceForRentExemption',
-  'getSignatureStatuses', 'getTransaction', 'getEpochInfo', 'getVersion',
-  'getSlot', 'getBlockHeight', 'getHealth', 'simulateTransaction',
-]);
-app.post('/api/rpc', userRateLimit({ max: 600, windowMs: 60_000 }), wrap(async (req, res) => {
-  const body = req.body;
-  if (!body || typeof body !== 'object') return res.status(400).json({ error: 'JSON-RPC body required' });
-  // Batch requests arrive as arrays — reject to keep the method allow-list simple
-  // and unambiguous (the wallet adapter only sends single calls).
-  if (Array.isArray(body)) return res.status(400).json({ error: 'Batch request tidak didukung' });
-  const method = String(body.method ?? '');
-  if (!RPC_READ_METHODS.has(method)) {
-    return res.status(403).json({ error: `Method RPC "${method}" tidak diizinkan lewat proxy` });
-  }
-  const rpcUrl = getSolanaRpcUrl();
-  const upstream = await fetch(rpcUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(process.env.HELIUS_API_KEY ? { 'x-api-key': process.env.HELIUS_API_KEY } : {}),
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(20_000),
-  });
-  const text = await upstream.text();
-  if (!upstream.ok) {
-    return res.status(upstream.status).json({ error: `RPC upstream ${upstream.status}: ${sanitizeError(text)}` });
-  }
-  res.type('application/json').send(text);
-}));
 
 // Serve built frontend if present
 app.use(express.static(join(__dirname, '../../frontend/dist')));

@@ -11,7 +11,7 @@
 // and several components mount at once, so a per-mount fetch would fire N
 // identical requests on every navigation. The in-flight promise is cached too,
 // so concurrent mounts share one request rather than racing.
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { api, EvmChain } from '../api/client';
 
 let cache: EvmChain[] | null = null;
@@ -41,6 +41,10 @@ export function loadEvmChains(): Promise<EvmChain[]> {
  * membership (e.g. "is this search result tradeable?") should treat empty as
  * "unknown" rather than "nothing is tradeable", or they will reject every
  * token during the first render.
+ *
+ * `keys` is memoised on `chains`. RealTradePanel/RealTradeForm keep `keys` in
+ * a useCallback dependency list, and a fresh array on every render would
+ * invalidate that callback on every render of the parent.
  */
 export function useEvmChains(): { chains: EvmChain[]; keys: string[] } {
   const [chains, setChains] = useState<EvmChain[]>(() => cache ?? []);
@@ -52,5 +56,6 @@ export function useEvmChains(): { chains: EvmChain[]; keys: string[] } {
     return () => { cancelled = true; };
   }, []);
 
-  return { chains, keys: chains.map((c) => c.key) };
+  const keys = useMemo(() => chains.map((c) => c.key), [chains]);
+  return { chains, keys };
 }

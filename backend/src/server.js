@@ -4,10 +4,12 @@
 
 import express from 'express';
 import { ethers } from 'ethers';
+import { randomBytes } from 'crypto';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { existsSync, readdirSync } from 'fs';
 import { dexscreener } from './dexscreener.js';
+import { recoverSigner, buildLoginMessage } from './evmBind.js';
 import {
   addWatchlist, removeWatchlist, getWatchlist,
   pushHistory, getHistory,
@@ -25,10 +27,11 @@ import { getLLMConfig, setLLMConfig, listModels, testConnection } from './llmCli
 import {
   isRealMode, setRealMode,
   getRealIntents, getRealIntent, setRealIntentStatus, addRealIntent,
-  getBoundWallet, bindWallet, assertBoundWallet, createBindChallenge,
+  getBoundWallet, bindWallet, assertBoundWallet, createBindChallenge, setBoundWallet,
 } from './realIntent.js';
 import { verifyUser, createSession, getUser, destroySession, seedAdminFromEnv,
-  changePassword, destroyOtherSessions, listUsers as listAuthUsers, getUserById } from './auth.js';
+  changePassword, destroyOtherSessions, listUsers as listAuthUsers, getUserById,
+  findUserByAddress, createUserWithAddress } from './auth.js';
 import { flushAll, cleanupTempFiles, DATA_DIR } from './persistence.js';
 import { securityHeaders, redact, sanitizeError, ipRateLimit, userRateLimit, isSafeBaseUrl } from './security.js';
 import {
@@ -63,7 +66,14 @@ app.use((req, res, next) => {
 // --- Auth middleware: resolves req.userId from Bearer token ---
 // Guards ONLY /api/* data routes. Static frontend (/, /assets/*) stays public —
 // the SPA gate handles auth client-side; blocking assets would blank the app.
-const PUBLIC_PATHS = new Set(['/api/login', '/api/health']);
+// The two wallet-login paths are pre-auth by necessity: a wallet login has no
+// session yet, and the challenge is what mints one.
+const PUBLIC_PATHS = new Set([
+  '/api/login',
+  '/api/login/wallet',
+  '/api/login/wallet/challenge',
+  '/api/health',
+]);
 app.use((req, res, next) => {
   // Express path matching is case-insensitive, so /API/portfolio reaches the
   // same route as /api/portfolio. Compare lowercased, or the guard is bypassed.
@@ -141,6 +151,84 @@ app.post('/api/login', loginLimiter, (req, res) => {
   res.json({ token, userId: user.id, username: user.username });
 });
 
+// --- Login with a wallet (MetaMask) ---
+// Declared before the routes that use it: `const` is not hoisted, so a route
+// registered above this line would throw a ReferenceError on first request.
+const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+
+// The user signs one message; the address recovered from that signature is the
+// identity. Password login above is unaffected — both paths stay open.
+//
+// A challenge is required even though a signature already proves ownership:
+// signing a FIXED string would let a signature captured from any prior session
+// be replayed forever. The nonce makes each challenge single-use and
+// short-lived, so a captured signature buys nothing.
+const WALLOGIN_NONCE_TTL_MS = 5 * 60 * 1000;
+const walletNonces = new Map(); // lowercase address -> { nonce, exp }
+setInterval(() => {
+  const now = Date.now();
+  for (const [addr, rec] of walletNonces) {
+    if (now > rec.exp) walletNonces.delete(addr);
+  }
+}, 60_000).unref?.();
+
+app.get('/api/login/wallet/challenge', loginLimiter, (req, res) => {
+  const address = String(req.query.address ?? '');
+  if (!EVM_ADDRESS_RE.test(address)) {
+    return res.status(400).json({ error: 'address harus 0x + 40 hex' });
+  }
+  const key = address.toLowerCase();
+  const nonce = randomBytes(16).toString('hex');
+  walletNonces.set(key, { nonce, exp: Date.now() + WALLOGIN_NONCE_TTL_MS });
+  res.json({ message: buildLoginMessage(address, nonce) });
+});
+
+app.post('/api/login/wallet', loginLimiter, (req, res) => {
+  const { address, signature } = req.body ?? {};
+  if (!address || !signature) return res.status(400).json({ error: 'address & signature required' });
+  if (!EVM_ADDRESS_RE.test(String(address))) return res.status(400).json({ error: 'address harus 0x + 40 hex' });
+
+  const key = String(address).toLowerCase();
+  const pending = walletNonces.get(key);
+  if (!pending || typeof pending.nonce !== 'string') {
+    return res.status(400).json({ error: 'Login challenge tidak ditemukan — minta ulang' });
+  }
+  if (Date.now() > pending.exp) {
+    walletNonces.delete(key);
+    return res.status(400).json({ error: 'Login challenge kedaluwarsa — minta ulang' });
+  }
+
+  // Identity comes from the recovered signer, never from the request body.
+  const recovered = recoverSigner(buildLoginMessage(address, pending.nonce), String(signature));
+  if (!recovered || recovered.toLowerCase() !== key) {
+    return res.status(401).json({ error: 'Signature wallet tidak valid' });
+  }
+  // Consume the nonce only once the signature is proven, so a mistyped address
+  // does not burn the challenge the user is still working on.
+  walletNonces.delete(key);
+
+  // First sign from this wallet provisions the account. Registration by wallet
+  // is open by design — the same "registration is disabled" stance as env-seeded
+  // accounts does not survive an address being the only credential there is.
+  const existing = findUserByAddress(recovered);
+  const user = existing ?? createUserWithAddress(recovered);
+  const token = createSession(user.id);
+
+  // The signature already proved control of this address, so the bound wallet
+  // is set directly: a wallet-login user can trade real without a second
+  // round trip through Settings. Bound via the public setter, not by poking
+  // realIntent's internals, so persistence stays in one place.
+  setBoundWallet(user.id, recovered);
+
+  res.json({
+    token,
+    userId: user.id,
+    username: user.username ?? null,
+    address: recovered,
+    isNewUser: !existing,
+  });
+});
+
 app.post('/api/logout', (req, res) => {
   const auth = req.headers.authorization ?? '';
   if (auth.startsWith('Bearer ')) destroySession(auth.slice(7));
@@ -149,7 +237,12 @@ app.post('/api/logout', (req, res) => {
 
 app.get('/api/me', (req, res) => {
   const user = getUserById(req.userId);
-  res.json({ userId: req.userId, username: user?.username ?? '', wallet: getWallet(req.userId) });
+  res.json({
+    userId: req.userId,
+    username: user?.username ?? '',
+    address: user?.address ?? getBoundWallet(req.userId),
+    wallet: getWallet(req.userId),
+  });
 });
 
 app.post('/api/change-password', (req, res) => {
@@ -183,7 +276,6 @@ app.get('/api/leaderboard', (req, res) => {
 // --- Real trading: EVM (1inch proxy — the server never signs) ---
 // The backend builds the UNSIGNED tx; MetaMask signs it in the browser via
 // eth_sendTransaction. No private key touches this process.
-const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 
 /** Reject an unknown chain before it reaches 1inch or the RPC layer. */
 function resolveChain(res, value) {

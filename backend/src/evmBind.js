@@ -19,6 +19,18 @@ export function buildBindMessage(userId, address, nonce) {
 }
 
 /**
+ * Canonical LOGIN message — must match the client byte-for-byte.
+ *
+ * Separate from the bind message on purpose: a bind challenge is scoped to an
+ * already-authenticated userId, while a login challenge has no user yet and is
+ * scoped to the address alone. Keeping the two strings distinct means a
+ * signature captured for one flow can never be replayed into the other.
+ */
+export function buildLoginMessage(address, nonce) {
+  return `dex-trade-login:${address}:${nonce}`;
+}
+
+/**
  * Recover the signer of an EIP-191 personal_sign signature.
  *
  * Returns the checksummed address, or null when the signature is malformed or

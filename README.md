@@ -36,7 +36,7 @@ If you want unattended trading, this is deliberately the wrong tool.
 | Signing | MetaMask (EIP-1193) | The key never leaves the browser |
 | Frontend | React 18 + Vite + TypeScript | ~300 kB bundle, no wallet library |
 | Storage | JSON, one file per user | Readable, diffable, trivial to back up |
-| Auth | scrypt + Bearer session | No external dependency |
+| Auth | Wallet signature **or** scrypt + Bearer session | No external dependency |
 
 No database, no ORM, no queue, no Docker required. State is one JSON file per
 user under `backend/data/`.
@@ -56,8 +56,9 @@ cp backend/.env.example backend/.env
 Edit `backend/.env`:
 
 ```bash
-# Required — creates the first account on boot. Registration is disabled;
-# add more accounts by changing this and restarting.
+# Optional — creates a username/password account on boot. Add more accounts by
+# changing this and restarting. (You can also just sign in with MetaMask; a
+# wallet that has never been seen before gets its own account automatically.)
 USER_USERNAME=yourname
 USER_PASSWORD=a-long-password
 
@@ -84,14 +85,27 @@ agents, and trade the virtual ledger before spending anything.
 
 ## First run with a real wallet
 
+**Signing in with MetaMask.** The login page has a *Login dengan MetaMask*
+button next to the password form. You sign one message; the address recovered
+from that signature is the identity, and the account is created on the spot if
+that wallet has never been seen. Because the signature already proves the
+address is yours, the wallet is bound in the same step — there is no separate
+bind to do, and you can trade real immediately.
+
+**Signing in with a password.** If you use the username/password form, nothing
+about your wallet is proven yet, so one more step is needed:
+
 1. **Settings → Connect MetaMask.** Requires the extension; the app talks to
    `window.ethereum` directly.
 2. **Bind the wallet.** The server issues a single-use, 5-minute nonce and you
    sign a one-line message. Binding proves the address is yours — it moves no
    funds. Replaying a captured signature fails, because the nonce is consumed.
+   One wallet can only ever belong to one account.
 3. **Enable Real Wallet mode.** The Portfolio page now reads your actual
    on-chain balances instead of the paper ledger.
 4. **Trade → create an intent → approve in MetaMask.**
+
+Either way, every real swap still ends in a MetaMask signature.
 
 **Start with a small amount.** Swap routing, slippage, and ERC-20 allowances
 are the parts that have not been exercised against live funds.
@@ -157,9 +171,9 @@ every user's account. Back them up separately and never commit them.
 npm --prefix backend test
 ```
 
-26 tests. The ones that matter most cover the money path: intent state
-transitions, claim-token races, idempotent close, bind replay rejection, and
-the router allow-list.
+117 tests. The ones that matter most cover the money path: intent state
+transitions, claim-token races, idempotent close, bind replay rejection, the
+router allow-list, wallet-login challenge replay, and the SSRF guard.
 
 ```bash
 npm --prefix frontend run build   # tsc -b && vite build

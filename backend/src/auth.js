@@ -53,8 +53,6 @@ function atomicWrite(file, data) {
 }
 
 function loadUsers() {
-  // No implicit admin promotion: registration is disabled and roles must not
-  // change merely because an admin record is absent.
   return loadJson(USERS_FILE, []);
 }
 
@@ -63,7 +61,7 @@ function saveUsers(users) {
 }
 
 /** Create a user (idempotent: existing username → false). */
-export function createUser(username, password, role = 'user') {
+export function createUser(username, password) {
   const users = loadUsers();
   if (users.some((u) => u.username === username)) return false;
   const salt = randomBytes(16).toString('hex');
@@ -72,7 +70,6 @@ export function createUser(username, password, role = 'user') {
     username,
     salt,
     hash: hashPasswordScrypt(password, salt),
-    role,
     createdAt: Date.now(),
   };
   users.push(user);
@@ -121,34 +118,9 @@ export function changePassword(userId, currentPassword, newPassword) {
   return true;
 }
 
-/** Admin sets a new password for any user (no current-password check). */
-export function adminSetPassword(userId, newPassword) {
-  const users = loadUsers();
-  const user = users.find((u) => u.id === userId);
-  if (!user) throw new Error('User tidak ditemukan');
-  const salt = randomBytes(16).toString('hex');
-  user.salt = salt;
-  user.hash = hashPasswordScrypt(newPassword, salt);
-  saveUsers(users);
-  destroyUserSessions(userId);
-  return true;
-}
-
-/** Public user list for admin/leaderboard (no salt/hash). */
+/** Public user list for the leaderboard (no salt/hash). */
 export function listUsers() {
-  return loadUsers().map(({ id, username, role, createdAt }) => ({ id, username, role, createdAt }));
-}
-
-/** Delete a user: record + sessions + their state file. */
-export function deleteUser(userId) {
-  const users = loadUsers();
-  const idx = users.findIndex((u) => u.id === userId);
-  if (idx === -1) throw new Error('User tidak ditemukan');
-  users.splice(idx, 1);
-  saveUsers(users);
-  destroyUserSessions(userId);
-  try { unlinkSync(join(DATA_DIR, `${userId}.json`)); } catch {}
-  return true;
+  return loadUsers().map(({ id, username, createdAt }) => ({ id, username, createdAt }));
 }
 
 // --- Sessions (persisted to data/sessions.json) ---
@@ -199,14 +171,6 @@ export function destroyOtherSessions(userId, keepToken) {
   if (changed) saveSessions();
 }
 
-function destroyUserSessions(userId) {
-  let changed = false;
-  for (const [token, s] of sessions) {
-    if (s.userId === userId) { sessions.delete(token); changed = true; }
-  }
-  if (changed) saveSessions();
-}
-
 /** Add one regular user from env when their username is not present.
  *  Registration is disabled, so this is the manual account-creation path. */
 export function seedAdminFromEnv() {
@@ -216,6 +180,6 @@ export function seedAdminFromEnv() {
     if (loadUsers().length === 0) console.log('\n[!] Belum ada user. Set USER_USERNAME dan USER_PASSWORD lalu restart.\n');
     return;
   }
-  const user = createUser(username, password, 'user');
+  const user = createUser(username, password);
   if (user) console.log(`\n[i] Akun manual dibuat dari env: ${user.username}\n`);
 }

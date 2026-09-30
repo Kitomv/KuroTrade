@@ -1,10 +1,12 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { api, AgentReport, AutopilotConfig, LLMConfig, LLMProviderEntry } from '../api/client';
+import { api, AgentReport, AutopilotConfig, LLMConfig } from '../api/client';
 import { usePolling } from '../hooks/usePolling';
 import { EquityChart } from '../components/EquityChart';
 import { IconBot, IconBolt, IconChartBar, IconChartLine, IconGear, IconKey, IconLock, IconPower, IconRocket, IconShield, IconSparkles, IconTrendingDown, IconTrendingUp } from '../components/Icons';
 import { fmt } from '../lib/format';
 import { Modal } from '../components/Modal';
+import { LlmConfigModal } from '../components/LlmConfigModal';
+import { MemoryInspector } from '../components/MemoryInspector';
 import { useToast } from '../components/ToastProvider';
 import { useConfirm } from '../components/ConfirmDialog';
 import { StaleBadge } from '../components/StaleBadge';
@@ -29,6 +31,8 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
   const [executingTrade, setExecutingTrade] = useState(false);
   const [showConfig, setShowConfig] = useState(false);
   const [showLLMModal, setShowLLMModal] = useState(false);
+  // Bumped after the LLM modal saves, so the status badge re-reads the config.
+  const [llmVersion, setLlmVersion] = useState(0);
   const [tagFilter, setTagFilter] = useState<LogTag>('ALL');
   const [logSearch, setLogSearch] = useState('');
   // Auto-follow the tail only while the reader is already at the bottom.
@@ -44,7 +48,7 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
   const autopilotP = usePolling(() => api.getAutopilot(), 4_000, []);
   const watchlistP = usePolling(() => api.watchlist(), 10_000, []);
   const scannedP = usePolling(() => api.agentSignals(6), 5_000, []);
-  const llmP = usePolling(() => api.getLLMConfig(), 10_000, []);
+  const llmP = usePolling(() => api.getLLMConfig(), 10_000, [llmVersion]);
   const autopilot = autopilotP.data;
   const watchlist = watchlistP.data;
   const scannedSignals = scannedP.data;
@@ -70,17 +74,6 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
   const [realMode, setRealMode] = useState(false);
   // Real-wallet auto-approve was removed (autopilot + hot wallet execute now).
   // No local realAuto state needed — realMode only.
-
-  // LLM Modal State
-  // LLM Modal State — multi-provider stack (fallback chain / role routing)
-  const [llmEntries, setLlmEntries] = useState([
-    { provider: '9router', apiKey: '', model: 'claude-3-5-sonnet-20241022', baseUrl: 'https://api.9router.com/v1', role: null as string | null },
-  ]);
-  const [savingLLM, setSavingLLM] = useState(false);
-  // Per-entry: fetched model list (combo) + last connection-test result.
-  const [llmModels, setLlmModels] = useState<Record<number, string[]>>({});
-  const [llmBusy, setLlmBusy] = useState<Record<number, 'models' | 'test' | undefined>>({});
-  const [llmTestResult, setLlmTestResult] = useState<Record<number, { ok: boolean; text: string } | undefined>>({});
 
   const logsEndRef = useRef<HTMLDivElement>(null);
   const logScrollRef = useRef<HTMLDivElement>(null);
@@ -178,29 +171,6 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
     }
   }, [rawLogCount, followLogs]);
 
-  useEffect(() => {
-    if (llmInfo) {
-      // Prefer entries[] if backend sent it; otherwise fall back to single-entry shape.
-      if (llmInfo.entries?.length) {
-        setLlmEntries(llmInfo.entries.map((e) => ({
-          provider: e.provider,
-          apiKey: '',
-          model: e.model,
-          baseUrl: e.baseUrl ?? '',
-          role: e.role,
-        })));
-      } else {
-        setLlmEntries([{
-          provider: (llmInfo.provider ?? '9router') as any,
-          apiKey: '',
-          model: llmInfo.model ?? 'claude-3-5-sonnet-20241022',
-          baseUrl: llmInfo.baseUrl ?? 'https://api.9router.com/v1',
-          role: null,
-        }]);
-      }
-    }
-  }, [llmInfo?.entries?.length, llmInfo?.provider, llmInfo?.baseUrl]);
-
   const handleAnalyze = async (addr: string) => {
     if (!addr.trim()) return;
     setAnalyzing(true);
@@ -253,75 +223,6 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
     }
   };
 
-  const handleSaveLLM = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setSavingLLM(true);
-    try {
-      // Send the full stack; entries without a typed key keep the stored key
-      // (backend treats a missing apiKey as "leave existing").
-      const payload: LLMProviderEntry[] = llmEntries.map((entry) => ({
-        provider: entry.provider as LLMProviderEntry['provider'],
-        ...(entry.apiKey.trim() ? { apiKey: entry.apiKey } : {}),
-        model: entry.model,
-        baseUrl: entry.provider === '9router' || entry.provider === 'custom' ? entry.baseUrl : undefined,
-        role: (entry.role as LLMProviderEntry['role']) ?? null,
-      }));
-      await api.setLLMConfig(payload);
-      setLlmEntries((prev) => prev.map((p) => ({ ...p, apiKey: '' })));
-      setLlmTestResult({});
-      setShowLLMModal(false);
-      toast.showToast('Konfigurasi LLM tersimpan', 'success');
-    } catch (e: unknown) {
-      const message = e instanceof Error ? e.message : 'Gagal menyimpan konfigurasi LLM';
-      setErr(message.slice(0, 200));
-      toast.showToast(message.slice(0, 120), 'error');
-    } finally {
-      setSavingLLM(false);
-    }
-  };
-
-  // Fetch /v1/models for one entry (9router-style combo) — preview params supported.
-  const handleLoadModels = async (idx: number) => {
-    const entry = llmEntries[idx];
-    if (!entry) return;
-    setLlmBusy((b) => ({ ...b, [idx]: 'models' }));
-    setLlmTestResult((r) => ({ ...r, [idx]: undefined }));
-    try {
-      const { models } = await api.llmModels(entry.apiKey.trim() ? { provider: entry.provider, baseUrl: entry.baseUrl, apiKey: entry.apiKey } : undefined);
-      setLlmModels((m) => ({ ...m, [idx]: models }));
-    } catch (e: unknown) {
-      const message = e instanceof Error ? e.message : 'Gagal memuat model';
-      setLlmModels((m) => ({ ...m, [idx]: [] }));
-      setLlmTestResult((r) => ({ ...r, [idx]: { ok: false, text: `❌ Muat model: ${message.slice(0, 180)}` } }));
-    } finally {
-      setLlmBusy((b) => ({ ...b, [idx]: undefined }));
-    }
-  };
-
-  // Probe koneksi (models dulu, fallback chat ping) — tampilkan pesan verbatim.
-  const handleTestLLM = async (idx: number) => {
-    const entry = llmEntries[idx];
-    if (!entry) return;
-    setLlmBusy((b) => ({ ...b, [idx]: 'test' }));
-    try {
-      const r = await api.llmTest(entry.apiKey.trim() ? { provider: entry.provider, model: entry.model, baseUrl: entry.baseUrl, apiKey: entry.apiKey } : {});
-      if (r.ok) {
-        const detail = r.via === 'models'
-          ? `${r.modelCount} model · ${r.latencyMs}ms`
-          : r.sample ? `sample: ${r.sample} · ${r.latencyMs}ms` : `${r.latencyMs}ms`;
-        setLlmTestResult((prev) => ({ ...prev, [idx]: { ok: true, text: `✅ OK · ${detail}` } }));
-        const models = r.models;
-        if (models?.length) setLlmModels((m) => ({ ...m, [idx]: models }));
-      } else {
-        setLlmTestResult((prev) => ({ ...prev, [idx]: { ok: false, text: `❌ ${r.error || r.modelsError || 'Gagal koneksi'} · ${r.latencyMs}ms` } }));
-      }
-    } catch (e: unknown) {
-      const message = e instanceof Error ? e.message : 'Gagal tes koneksi';
-      setLlmTestResult((prev) => ({ ...prev, [idx]: { ok: false, text: `❌ ${message.slice(0, 180)}` } }));
-    } finally {
-      setLlmBusy((b) => ({ ...b, [idx]: undefined }));
-    }
-  };
 
   const handleClearLogs = async () => {
     try {
@@ -421,6 +322,12 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
 
   return (
     <>
+      {showLLMModal && (
+        <LlmConfigModal
+          onClose={() => { setShowLLMModal(false); setLlmVersion((v) => v + 1); }}
+        />
+      )}
+
       {/* Top Header */}
       <div className="page-head" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 14 }}>
         <div>
@@ -477,167 +384,6 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
         </div>
       </div>
 
-      {/* LLM Model Setup Modal */}
-      {showLLMModal && (
-        <Modal title={<><IconBot size={16} /> Konfigurasi Model AI (Cloud LLM)</>} onClose={() => setShowLLMModal(false)} maxWidth={480}>
-          <p style={{ fontSize: 13, color: 'var(--muted)', marginBottom: 18, lineHeight: 1.5 }}>
-            Multi-LLM: susun beberapa provider sebagai fallback chain (primary → fallback) dan/atau role routing
-            (Bull / Bear / Lead bisa pakai model berbeda). Kosongkan api key pada baris fallback yang tidak dipakai.
-          </p>
-
-          <form onSubmit={handleSaveLLM}>
-              {llmEntries.map((entry, idx) => (
-                <div key={idx} style={{ border: '1px solid var(--border)', borderRadius: 10, padding: 12, marginBottom: 12 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                    <strong style={{ fontSize: 12, color: 'var(--muted)' }}>
-                      {idx === 0 ? 'PRIMARY' : `FALLBACK ${idx}`}
-                    </strong>
-                    {idx > 0 && (
-                      <button type="button" className="btn icon" style={{ minHeight: 26, minWidth: 26, padding: 2, fontSize: 11 }}
-                        onClick={() => setLlmEntries((prev) => prev.filter((_, i) => i !== idx))}>
-                        ✕
-                      </button>
-                    )}
-                  </div>
-
-                  <div className="grid-2" style={{ marginBottom: 8 }}>
-                    <select
-                      className="input"
-                      style={{ width: '100%' }}
-                      value={entry.provider}
-                      onChange={(e) => {
-                        const p = e.target.value as any;
-                        const defaults: Record<string, { model: string; baseUrl?: string }> = {
-                          '9router': { model: 'claude-3-5-sonnet-20241022', baseUrl: 'https://api.9router.com/v1' },
-                          anthropic: { model: 'claude-3-5-sonnet-20241022' },
-                          openai: { model: 'gpt-4o-mini' },
-                          deepseek: { model: 'deepseek-chat' },
-                          openrouter: { model: 'anthropic/claude-3.5-sonnet' },
-                          custom: { model: 'claude-3-5-sonnet-20241022', baseUrl: 'https://api.openai.com/v1' },
-                        };
-                        setLlmEntries((prev) => prev.map((x, i) => i === idx ? { ...x, provider: p, ...defaults[p] } : x));
-                      }}
-                    >
-                      <option value="9router">9router (Gateway)</option>
-                      <option value="anthropic">Anthropic (Claude)</option>
-                      <option value="openai">OpenAI (GPT)</option>
-                      <option value="deepseek">DeepSeek</option>
-                      <option value="openrouter">OpenRouter</option>
-                      <option value="custom">Custom Endpoint</option>
-                    </select>
-                    <select
-                      className="input"
-                      style={{ width: '100%' }}
-                      value={entry.role ?? ''}
-                      onChange={(e) => {
-                        const r = e.target.value || null;
-                        setLlmEntries((prev) => prev.map((x, i) => i === idx ? { ...x, role: r } : x));
-                      }}
-                    >
-                      <option value="">Role: Semua (fallback)</option>
-                      <option value="bull">Role: Bull only</option>
-                      <option value="bear">Role: Bear only</option>
-                      <option value="lead">Role: Lead only</option>
-                    </select>
-                  </div>
-
-                  {(entry.provider === '9router' || entry.provider === 'custom') && (
-                    <input
-                      type="text"
-                      className="input"
-                      style={{ width: '100%', marginBottom: 8 }}
-                      value={entry.baseUrl}
-                      onChange={(e) => setLlmEntries((prev) => prev.map((x, i) => i === idx ? { ...x, baseUrl: e.target.value } : x))}
-                      placeholder="http://localhost:20128/v1 (9router lokal) atau https://api.9router.com/v1"
-                    />
-                  )}
-
-                  {/* Model combo — datalist dari /v1/models (9router-style) + input bebas */}
-                  <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
-                    <input
-                      type="text"
-                      className="input"
-                      style={{ flex: 1, minWidth: 0 }}
-                      value={entry.model}
-                      onChange={(e) => setLlmEntries((prev) => prev.map((x, i) => i === idx ? { ...x, model: e.target.value } : x))}
-                      placeholder="nama model (kc/nvidia/…:free / gpt-4o / deepseek-chat)"
-                      list={`llm-models-${idx}`}
-                      required
-                    />
-                    <datalist id={`llm-models-${idx}`}>
-                      {(llmModels[idx] ?? []).map((m) => <option key={m} value={m} />)}
-                    </datalist>
-                    <button
-                      type="button"
-                      className="btn"
-                      style={{ minHeight: 44, fontSize: 12, whiteSpace: 'nowrap' }}
-                      disabled={llmBusy[idx] === 'models'}
-                      onClick={() => handleLoadModels(idx)}
-                      title="Ambil daftar model dari endpoint /v1/models"
-                    >
-                      {llmBusy[idx] === 'models' ? '…' : `Muat Model${llmModels[idx]?.length ? ` (${llmModels[idx].length})` : ''}`}
-                    </button>
-                  </div>
-
-                  <input
-                    type="password"
-                    className="input"
-                    style={{ width: '100%' }}
-                    value={entry.apiKey}
-                    onChange={(e) => setLlmEntries((prev) => prev.map((x, i) => i === idx ? { ...x, apiKey: e.target.value } : x))}
-                    placeholder={llmInfo?.entries?.[idx]?.hasKey ? `Tersimpan: ${llmInfo.entries[idx].maskedKey} — isi untuk ganti` : 'API key (kosongkan jika tidak dipakai)'}
-                  />
-
-                  {/* Tes koneksi — verifikasi key/baseUrl/model tanpa jalankan autopilot */}
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
-                    <button
-                      type="button"
-                      className="btn"
-                      style={{ minHeight: 32, padding: '4px 12px', fontSize: 12 }}
-                      disabled={llmBusy[idx] === 'test'}
-                      onClick={() => handleTestLLM(idx)}
-                    >
-                      {llmBusy[idx] === 'test' ? 'Menguji…' : 'Tes Koneksi'}
-                    </button>
-                    {llmTestResult[idx] && (
-                      <span style={{ fontSize: 12, color: llmTestResult[idx]!.ok ? 'var(--up)' : 'var(--down)', wordBreak: 'break-word', flex: 1, minWidth: 0 }}>
-                        {llmTestResult[idx]!.text}
-                      </span>
-                    )}
-                  </div>
-                </div>
-              ))}
-
-              <button
-                type="button"
-                className="btn"
-                style={{ width: '100%', marginBottom: 14, fontSize: 12, minHeight: 36 }}
-                onClick={() => setLlmEntries((prev) => [...prev, { provider: 'openai', apiKey: '', model: 'gpt-4o-mini', baseUrl: '', role: null }])}
-              >
-                + Tambah Provider (Fallback / Role)
-              </button>
-
-              <div style={{ display: 'flex', gap: 10 }}>
-                <button
-                  type="button"
-                  className="btn"
-                  style={{ flex: 1 }}
-                  onClick={() => setShowLLMModal(false)}
-                >
-                  Batal
-                </button>
-                <button
-                  type="submit"
-                  className="btn primary"
-                  style={{ flex: 1 }}
-                  disabled={savingLLM}
-                >
-                  {savingLLM ? 'Menyimpan…' : 'Simpan & Terapkan'}
-                </button>
-              </div>
-            </form>
-        </Modal>
-      )}
 
       {/* Real-Time Telemetry Bar */}
       <div className={`card${isRunning ? ' card-neon' : ''}`} style={{ padding: '16px 22px', marginBottom: 20, border: isRunning ? '1px solid var(--accent)' : '1px solid var(--border)', boxShadow: isRunning ? '0 0 20px var(--accent-glow)' : undefined }}>
@@ -1166,106 +912,7 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
       </div>
 
       {/* Memory Inspector — agents' decision log & near-misses */}
-      <div className="card" style={{ marginBottom: 24 }}>
-        <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
-          <strong style={{ fontSize: 14 }}>🧠 Memory Inspector</strong>
-          <span style={{ fontSize: 12, color: 'var(--muted)' }}>
-            Keputusan: {ap.memory?.length ?? 0} · Near-misses: {ap.nearMisses?.length ?? 0}
-          </span>
-        </div>
-
-        {/* Calibration strip from signalAccuracy */}
-        {ap.signalAccuracy && (ap.signalAccuracy.acc1h !== null || ap.signalAccuracy.acc24h !== null) && (
-          <div style={{ padding: '10px 20px', borderBottom: '1px solid var(--border)', fontSize: 12, color: 'var(--muted)', lineHeight: 1.6 }}>
-            <strong>Kalibrasi sinyal (1h):</strong> {ap.signalAccuracy.acc1h !== null ? `${ap.signalAccuracy.acc1h}% (${ap.signalAccuracy.win1h}/${ap.signalAccuracy.n1h})` : '—'}
-            {' | '}
-            <strong>24h:</strong> {ap.signalAccuracy.acc24h !== null ? `${ap.signalAccuracy.acc24h}% (${ap.signalAccuracy.win24h}/${ap.signalAccuracy.n24h})` : '—'}
-            {ap.signalAccuracy.bySignal && Object.keys(ap.signalAccuracy.bySignal).length > 0 && (
-              <span style={{ marginLeft: 10 }}>
-                Per sinyal: {Object.entries(ap.signalAccuracy.bySignal).map(([k, v]) => `${k.replace('_', ' ')} ${Math.round((v.win1h / v.n1h) * 100)}% (n=${v.n1h})`).join('; ')}
-              </span>
-            )}
-          </div>
-        )}
-
-        {/* Decisions table */}
-        {ap.memory && ap.memory.length > 0 && (
-          <>
-            <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--border)', fontWeight: 600, fontSize: 13, color: 'var(--muted)' }}>
-              Keputusan tertutup (terbaru dulu)
-            </div>
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Waktu</th>
-                    <th>Token</th>
-                    <th>Sinyal</th>
-                    <th className="num">Entry</th>
-                    <th className="num">Outcome</th>
-                    <th>Regime</th>
-                    <th>Exit</th>
-                    <th className="num">Hold</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {ap.memory.slice(0, 20).map((m, i) => (
-                    <tr key={`${m.ts}:${i}`}>
-                      <td>{new Date(m.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</td>
-                      <td><strong>{m.symbol}</strong></td>
-                      <td><span className={`badge ${m.signal.includes('BUY') ? 'up' : m.signal === 'SELL' ? 'down' : 'flat'}`}>{m.signal.replace('_', ' ')}</span></td>
-                      <td className="num">${m.entryPrice.toFixed(6)}</td>
-                      <td className="num"><span className={`badge ${m.outcomePct >= 0 ? 'up' : 'down'}`}>{m.outcomePct >= 0 ? '+' : ''}{m.outcomePct.toFixed(1)}%</span></td>
-                      <td><span className="chip" style={{ fontSize: 10 }}>{m.regime ?? '—'}</span></td>
-                      <td><span className="chip" style={{ fontSize: 10 }}>{m.exitReason ?? '—'}</span></td>
-                      <td className="num">{m.holdMs ? `${Math.round(m.holdMs / 3_600_000)}h` : '—'}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </>
-        )}
-
-        {/* Near-misses table */}
-        {ap.nearMisses && ap.nearMisses.length > 0 && (
-          <>
-            <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--border)', fontWeight: 600, fontSize: 13, color: 'var(--muted)' }}>
-              Near-misses (sinyal kuat tapi tak dieksekusi)
-            </div>
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Waktu</th>
-                    <th>Token</th>
-                    <th>Sinyal</th>
-                    <th className="num">Conf</th>
-                    <th className="num">Entry</th>
-                    <th>Alasan Skip</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {ap.nearMisses.slice(0, 20).map((m, i) => (
-                    <tr key={`${m.ts}:${i}`}>
-                      <td>{new Date(m.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</td>
-                      <td><strong>{m.symbol}</strong></td>
-                      <td><span className={`badge ${m.signal.includes('BUY') ? 'up' : m.signal === 'SELL' ? 'down' : 'flat'}`}>{m.signal.replace('_', ' ')}</span></td>
-                      <td className="num">{m.confidence}%</td>
-                      <td className="num">${m.entryPrice.toFixed(6)}</td>
-                      <td><span className="chip" style={{ fontSize: 10 }}>{m.reason}</span></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </>
-        )}
-
-        {!ap.memory?.length && !ap.nearMisses?.length && (
-          <div className="empty" style={{ padding: 24 }}>Belum ada memori — nyalakan Auto-Pilot dan biarkan melindungi / mencari posisi.</div>
-        )}
-      </div>
+      <MemoryInspector ap={ap} />
 
       {/* Interactive Token Audit Bar */}
       <div className="card" style={{ padding: 20, marginBottom: 24 }}>

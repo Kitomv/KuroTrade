@@ -7,10 +7,18 @@ import { fileURLToPath } from 'url';
 import { randomBytes } from 'crypto';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-// Resolved from env so tests can point persistence at a temp dir. Without this,
-// a test run writes real user state files into backend/data. Same escape hatch
-// hotWallet.js used via HOT_WALLET_KEYS_FILE. Production leaves it unset.
-const DATA_DIR = process.env.PERSIST_DATA_DIR || join(__dirname, '../data');
+/**
+ * The one place the per-user data directory is resolved.
+ *
+ * Overridable via PERSIST_DATA_DIR so tests can redirect it to a temp dir.
+ * auth.js and server.js used to compute this path independently and ignored
+ * the override, so a test run that touched auth still wrote real credentials
+ * and sessions into backend/data — the escape hatch worked for everything
+ * except the two modules that mattered most for it. They import this instead.
+ *
+ * Production leaves the env var unset.
+ */
+export const DATA_DIR = process.env.PERSIST_DATA_DIR || join(__dirname, '../data');
 mkdirSync(DATA_DIR, { recursive: true });
 
 const SAVE_DEBOUNCE_MS = 500;

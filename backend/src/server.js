@@ -29,7 +29,7 @@ import {
 } from './realIntent.js';
 import { verifyUser, createSession, getUser, destroySession, seedAdminFromEnv,
   changePassword, destroyOtherSessions, listUsers as listAuthUsers, getUserById, adminSetPassword, deleteUser } from './auth.js';
-import { flushAll, cleanupTempFiles } from './persistence.js';
+import { flushAll, cleanupTempFiles, DATA_DIR } from './persistence.js';
 import { securityHeaders, redact, sanitizeError, ipRateLimit, userRateLimit, isSafeBaseUrl } from './security.js';
 import {
   listEvmChains, isSupportedChain, getChainConfig, getEvmBalanceNative,
@@ -851,9 +851,8 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 try {
   // Clean up orphaned temp files from previous crashed processes.
   cleanupTempFiles();
-  const usersDir = join(__dirname, '../data');
-  if (existsSync(usersDir)) {
-    for (const f of readdirSync(usersDir)) {
+  if (existsSync(DATA_DIR)) {
+    for (const f of readdirSync(DATA_DIR)) {
       if (!f.endsWith('.json') || f.endsWith('.tmp')) continue;
       const userId = f.slice(0, -5);
       if (!UUID_RE.test(userId)) continue;

@@ -416,7 +416,7 @@ export const AUTH = {
       body: JSON.stringify({ username, password }),
     }),
   logout: () => req<{ ok: boolean }>('/api/logout', { method: 'POST' }),
-  me: () => req<{ userId: string; username: string; role: 'admin' | 'user'; wallet: Wallet }>('/api/me'),
+  me: () => req<{ userId: string; username: string; wallet: Wallet }>('/api/me'),
   changePassword: (currentPassword: string, newPassword: string) =>
     req<{ ok: boolean }>('/api/change-password', {
       method: 'POST',
@@ -425,18 +425,9 @@ export const AUTH = {
     }),
 };
 
-export interface AdminUser {
-  id: string;
-  username: string;
-  role: 'admin' | 'user';
-  createdAt: number;
-  wallet: Wallet;
-}
-
 export interface LeaderboardRow {
   userId: string;
   username: string;
-  role: 'admin' | 'user';
   totalValue: number;
   pnlPct: number;
   positionsCount: number;
@@ -556,17 +547,8 @@ export const api = {
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(entry) },
     ),
 
-  // Leaderboard & admin
+  // Leaderboard
   leaderboard: () => req<LeaderboardRow[]>('/api/leaderboard'),
-  adminUsers: () => req<AdminUser[]>('/api/admin/users'),
-  adminResetPassword: (id: string, newPassword: string) =>
-    req<{ ok: boolean }>(`/api/admin/users/${encodeURIComponent(id)}/reset-password`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ newPassword }),
-    }),
-  adminDeleteUser: (id: string) =>
-    req<{ ok: boolean }>(`/api/admin/users/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
   // Real trading — EVM via 1inch. The server builds the UNSIGNED tx; MetaMask
   // signs it in the browser. No private key ever reaches the backend.

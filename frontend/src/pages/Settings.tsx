@@ -16,12 +16,11 @@ import { IconAlert, IconGear, IconShield, IconWallet } from '../components/Icons
 
 interface Props {
   username?: string;
-  role?: 'admin' | 'user';
   onChangePassword?: (current: string, next: string) => Promise<void>;
   onLogout?: () => void;
 }
 
-export function Settings({ username, role, onChangePassword, onLogout }: Props) {
+export function Settings({ username, onChangePassword, onLogout }: Props) {
   const { connected, isBound, realMode } = useEvmWallet();
   const confirmAction = useConfirm();
   const toast = useToast();
@@ -72,7 +71,7 @@ export function Settings({ username, role, onChangePassword, onLogout }: Props) 
           </span>
           {username && (
             <span className="chip" style={{ background: 'var(--panel-2)', color: 'var(--muted)', fontSize: 11 }}>
-              {username}{role === 'admin' ? ' · admin' : ''}
+              {username}
             </span>
           )}
         </div>

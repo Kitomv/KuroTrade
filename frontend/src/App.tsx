@@ -23,7 +23,6 @@ import { EvmWalletProvider } from './components/EvmWalletContext';
 export function App() {
   const [authed, setAuthed] = useState<boolean>(() => Boolean(localStorage.getItem('trading_token')));
   const [username, setUsername] = useState(() => localStorage.getItem('trading_username') ?? '');
-  const [role, setRole] = useState<'admin' | 'user'>('user');
   const [page, setPage] = useState<Page>('overview');
   const [watchKey, setWatchKey] = useState(0);
   const [tradePrefill, setTradePrefill] = useState<{ market: Market; nonce: number } | null>(null);
@@ -37,14 +36,13 @@ export function App() {
     return () => removeEventListener('trading-unauthorized', on401);
   }, []);
 
-  // Refresh profile (username + role) when authenticated — also validates the
-  // stored token on boot.
+  // Refresh profile (username) when authenticated — also validates the stored
+  // token on boot.
   useEffect(() => {
     if (!authed) return;
     AUTH.me()
       .then((me) => {
         setUsername(me.username);
-        setRole(me.role);
         localStorage.setItem('trading_username', me.username);
       })
       .catch(() => {});
@@ -111,8 +109,8 @@ export function App() {
                     {page === 'trade' && <Trade prefill={tradePrefill} />}
                     {page === 'portfolio' && <Portfolio />}
                     {page === 'agents' && <Agents onNavigate={navTo} />}
-                    {page === 'leaderboard' && <Leaderboard role={role} />}
-                    {page === 'settings' && <Settings username={username} role={role} onChangePassword={async (cur, next) => { await AUTH.changePassword(cur, next); }} onLogout={handleLogout} />}
+                    {page === 'leaderboard' && <Leaderboard />}
+                    {page === 'settings' && <Settings username={username} onChangePassword={async (cur, next) => { await AUTH.changePassword(cur, next); }} onLogout={handleLogout} />}
                   </main>
                 </div>
             </EvmWalletProvider>

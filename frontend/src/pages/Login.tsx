@@ -76,7 +76,8 @@ export function Login({ onLogin }: { onLogin: (username: string) => void }) {
         </form>
 
         <p style={{ color: 'var(--muted)', fontSize: 12, marginTop: 16, textAlign: 'center', lineHeight: 1.5 }}>
-          Registrasi dinonaktifkan — akun dibuat oleh admin lewat <code>ADMIN_USER</code>/<code>ADMIN_PASSWORD</code>.
+          Registrasi dinonaktifkan — tambah akun lewat <code>USER_USERNAME</code>/<code>USER_PASSWORD</code> di
+          <code> backend/.env</code>, lalu restart backend.
         </p>
       </CardNeon>
     </div>

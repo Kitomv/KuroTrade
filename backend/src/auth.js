@@ -3,11 +3,9 @@
 // Hashing: scrypt (new) with on-login migration from legacy sha256.
 import { createHash, randomBytes, randomUUID, timingSafeEqual, scryptSync } from 'crypto';
 import { readFileSync, writeFileSync, renameSync, existsSync, unlinkSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { join } from 'path';
+import { DATA_DIR } from './persistence.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = join(__dirname, '../data');
 const USERS_FILE = join(DATA_DIR, 'users.json');
 const SESSIONS_FILE = join(DATA_DIR, 'sessions.json');
 

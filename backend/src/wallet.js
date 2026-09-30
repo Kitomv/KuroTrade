@@ -27,6 +27,7 @@ function walletFor(userId) {
       positions: new Map(), // tokenAddress -> position
       orders: [],
       nextOrderId: 1,
+      realizedPnl: 0, // cumulative, lives here so closing a position cannot erase it
     });
   }
   return wallets.get(userId);
@@ -36,8 +37,19 @@ function uid(w) {
   return `ord_${Date.now()}_${w.nextOrderId++}`;
 }
 
-function updateRealizedPnl(p, amount) {
-  p.realizedPnl = (Number(p.realizedPnl) || 0) + Number(amount);
+/**
+ * Book a realized gain/loss against the WALLET, not the position.
+ *
+ * This used to accumulate on the position object, and getWallet summed
+ * position.realizedPnl across the open positions. A fully-closed position is
+ * deleted from the map, so its profit was deleted with it — the "Realized PnL"
+ * KPI read $0 after every complete round trip, and only a partially-sold
+ * position ever showed a non-zero total. Realized PnL must outlive the
+ * position that produced it.
+ */
+function updateRealizedPnl(w, amount) {
+  const next = (Number(w.realizedPnl) || 0) + Number(amount);
+  w.realizedPnl = Number.isFinite(next) ? next : (Number(w.realizedPnl) || 0);
 }
 
 /** Load a user's persisted wallet+orders into memory (call once at startup). */
@@ -48,6 +60,16 @@ export function initWallet(userId) {
   if (Number.isFinite(saved.balance)) w.balance = Math.min(MAX_VIRTUAL_USD, Math.max(0, Number(saved.balance)));
   if (Number.isFinite(saved.initialBalance) && saved.initialBalance > 0) w.initialBalance = Math.min(MAX_VIRTUAL_USD, Number(saved.initialBalance));
   w.nextOrderId = Number.isSafeInteger(saved.nextOrderId) && saved.nextOrderId > 0 ? saved.nextOrderId : 1;
+  // Fall back to the sum of the per-position figures for a state file written
+  // before realized PnL was tracked at the wallet level, so an upgrade does not
+  // silently zero a total the user has already earned.
+  const storedPnl = Number(saved.realizedPnl);
+  if (Number.isFinite(storedPnl)) w.realizedPnl = clampUsd(storedPnl);
+  else {
+    const legacy = (Array.isArray(saved.positions) ? saved.positions : [])
+      .reduce((s, p) => s + (Number(p?.realizedPnl) || 0), 0);
+    if (Number.isFinite(legacy) && legacy !== 0) w.realizedPnl = clampUsd(legacy);
+  }
   w.positions = new Map(
     (Array.isArray(saved.positions) ? saved.positions : [])
       .map((p) => sanitizePosition(p))
@@ -75,6 +97,7 @@ registerStateProvider((userId) => {
     balance: w.balance,
     initialBalance: w.initialBalance,
     nextOrderId: w.nextOrderId,
+    realizedPnl: Number(w.realizedPnl) || 0,
     positions: [...w.positions.entries()].map(([tokenAddress, p]) => ({ ...p, tokenAddress })),
     orders: w.orders,
   };
@@ -110,7 +133,6 @@ function sanitizePosition(p) {
     totalCost,
     currentPrice: Number.isFinite(currentPrice) && currentPrice > 0 && currentPrice <= MAX_TOKEN_PRICE ? currentPrice : avgBuyPrice,
     highestPrice: Number.isFinite(highestPrice) && highestPrice > 0 && highestPrice <= MAX_TOKEN_PRICE ? Math.max(highestPrice, avgBuyPrice) : avgBuyPrice,
-    realizedPnl: clampUsd(p.realizedPnl),
   };
 }
 
@@ -142,7 +164,7 @@ export function getWallet(userId) {
   const curBal = clampUsd(Math.round(clampUsd(w.balance) * 100) / 100);
   const totPos = clampUsd(Math.round(totalPositionValue * 100) / 100);
   const totVal = clampUsd(Math.round((curBal + totPos) * 100) / 100);
-  const totPnl = clampUsd(Math.round([...w.positions.values()].reduce((s, p) => s + (Number(p.realizedPnl) || 0), 0) * 100) / 100);
+  const totPnl = clampUsd(Math.round((Number(w.realizedPnl) || 0) * 100) / 100);
   const totUnreal = clampUsd(Math.round(unrealizedPnl * 100) / 100);
 
   return {
@@ -159,8 +181,13 @@ export function getWallet(userId) {
 
 export function updatePositionPrices(userId, priceMap) {
   const w = walletFor(userId);
-  for (const [, p] of w.positions) {
-    const fresh = priceMap.get(p.tokenAddress);
+  // The token address lives in the Map KEY, not on the position object — it is
+  // only attached at serialisation time (the provider below). Reading
+  // p.tokenAddress here always yielded undefined, so every lookup missed and
+  // this function silently did nothing: positions kept their entry price
+  // forever, and the guardian's SL/TP checks ran against a stale cost basis.
+  for (const [tokenAddress, p] of w.positions) {
+    const fresh = priceMap.get(tokenAddress);
     // Reject non-finite / absurd ticks (Infinity passes a naive `> 0` check).
     if (fresh == null) continue;
     const num = Number(fresh);
@@ -243,7 +270,6 @@ export function addMirroredPosition(userId, { tokenAddress, symbol, name, chainI
     currentPrice: px,
     highestPrice: Math.max(Number(existing?.highestPrice) || px, px),
     tp1Hit: false,
-    realizedPnl: existing?.realizedPnl ?? 0,
     openedAt: existing?.openedAt ?? Date.now(),
   });
   saveUserState(userId);
@@ -261,6 +287,7 @@ export function resetWallet(userId, newInitialBalance) {
     positions: new Map(),
     orders: [],
     nextOrderId: 1,
+    realizedPnl: 0, // a reset account has earned nothing yet
   });
   saveUserState(userId);
   return getWallet(userId);
@@ -397,7 +424,6 @@ export function executeMarketOrder(userId, { side, tokenAddress, chainId, symbol
         currentPrice: numPrice,
         highestPrice: numPrice,
         tp1Hit: false,
-        realizedPnl: 0,
         openedAt: now, // used by autopilot stagnant-rotation
       });
     }
@@ -432,7 +458,7 @@ export function executeMarketOrder(userId, { side, tokenAddress, chainId, symbol
     w.balance = Math.min(MAX_VIRTUAL_USD, w.balance + revenue);
     const avgBuy = Number(existing.avgBuyPrice) || numPrice;
     const realized = revenue - (sellQty * avgBuy);
-    updateRealizedPnl(existing, realized);
+    updateRealizedPnl(w, realized);
 
     const remaining = curAmount - sellQty;
     if (remaining < 1e-8) {

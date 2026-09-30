@@ -716,7 +716,7 @@ app.post('/api/orders/market', async (req, res) => {
     const order = executeMarketOrder(req.userId, {
       side,
       tokenAddress,
-      chainId: chainId ?? current?.chainId ?? 'solana',
+      chainId: chainId ?? current?.chainId ?? 'base',
       symbol: symbol ? String(symbol).slice(0, 40) : (current?.symbol ?? 'UNKNOWN'),
       name: name ? String(name).slice(0, 40) : (current?.name ?? ''),
       usdAmount: usd || 0,
@@ -744,7 +744,7 @@ app.post('/api/orders/limit', async (req, res) => {
     const order = createLimitOrder(req.userId, {
       side,
       tokenAddress,
-      chainId: chainId ?? 'solana',
+      chainId: chainId ?? 'base',
       symbol: symbol ? String(symbol).slice(0, 40) : 'UNKNOWN',
       name: name ? String(name).slice(0, 40) : '',
       targetPrice: target,

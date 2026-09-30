@@ -1,10 +1,9 @@
 // EIP-191 personal_sign verification using ethers (already a dependency).
 // Importers/callers: realIntent.js (bindWallet / createBindChallenge).
-// Replaces ed25519.js, which verified base58 Ed25519 signatures (Solana wallets).
 //
-// Bind message format is unchanged (`dex-trade-bind:<userId>:<address>:<nonce>`)
-// so persisted state stays readable across the wallet migration; only the
-// verification primitive changed, from Ed25519/base58 to secp256k1/recover.
+// Bind message format (`dex-trade-bind:<userId>:<address>:<nonce>`) is stable
+// so persisted state stays readable; only the verification primitive is
+// secp256k1/recover.
 //
 // Why recover rather than verify-against-a-known-key: EIP-191 signing recovers
 // the signer from the signature, so one call both proves the signature is valid

@@ -236,7 +236,7 @@ export function addMirroredPosition(userId, { tokenAddress, symbol, name, chainI
     ...(existing ?? {}),
     symbol: symbol ?? existing?.symbol ?? 'UNKNOWN',
     name: name ?? existing?.name ?? '',
-    chainId: chainId ?? existing?.chainId ?? 'solana',
+    chainId: chainId ?? existing?.chainId ?? 'base',
     amount: qty,
     avgBuyPrice: px,
     totalCost: qty * px,
@@ -276,14 +276,6 @@ export function getPositions(userId) {
   return out;
 }
 
-/** Clear ALL positions for a user — used when switching to real mode so the
- *  virtual ledger doesn't mix with on-chain mirrors. */
-export function clearPositions(userId) {
-  const w = walletFor(userId);
-  w.positions.clear();
-  saveUserState(userId);
-}
-
 export function getOrders(userId) {
   // Sanitized for the same reason as getOrdersPage — legacy SELL rows lack
   // `amount`/`usdAmount`, and CSV/consumers must never see undefined fields.
@@ -299,7 +291,7 @@ function sanitizeOrder(o) {
   const usdAmount = Number(o.usdAmount);
   const tokenAddress = typeof o.tokenAddress === 'string' ? o.tokenAddress : '';
   const symbol = typeof o.symbol === 'string' ? o.symbol : 'UNKNOWN';
-  const chainId = typeof o.chainId === 'string' ? o.chainId : 'solana';
+  const chainId = typeof o.chainId === 'string' ? o.chainId : 'base';
   const type = (o.type === 'market' || o.type === 'limit') ? o.type : 'market';
   const status = (o.status === 'filled' || o.status === 'open' || o.status === 'cancelled') ? o.status : 'filled';
   const createdAt = Number.isFinite(o.createdAt) ? o.createdAt : Date.now();
@@ -390,7 +382,7 @@ export function executeMarketOrder(userId, { side, tokenAddress, chainId, symbol
       w.positions.set(tokenAddress, {
         symbol: symbol ?? 'UNKNOWN',
         name: name ?? '',
-        chainId: chainId ?? 'solana',
+        chainId: chainId ?? 'base',
         amount: numTokens,
         avgBuyPrice: numPrice,
         totalCost: cost,
@@ -452,7 +444,7 @@ export function executeMarketOrder(userId, { side, tokenAddress, chainId, symbol
     type: 'market',
     side,
     tokenAddress,
-    chainId: chainId ?? 'solana',
+    chainId: chainId ?? 'base',
     symbol: symbol ?? 'UNKNOWN',
     name: name ?? '',
     amount: numTokens,
@@ -500,7 +492,7 @@ export function createLimitOrder(userId, { side, tokenAddress, chainId, symbol, 
     type: 'limit',
     side,
     tokenAddress,
-    chainId: chainId ?? 'solana',
+    chainId: chainId ?? 'base',
     symbol: symbol ?? 'UNKNOWN',
     name: name ?? '',
     amount: numTokens,

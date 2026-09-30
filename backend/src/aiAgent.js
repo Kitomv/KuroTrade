@@ -119,7 +119,13 @@ function remindPendingApproval(userId, intent) {
 }
 
 function stateFor(userId) {
-  if (!autopilotStates.has(userId)) autopilotStates.set(userId, DEFAULT_AUTOPILOT());
+  if (!autopilotStates.has(userId)) {
+    // Hydrate from the user's persisted config before falling back to defaults,
+    // so a write arriving before the page ever loads this module still lands on
+    // the user's own settings rather than a blank slate.
+    initAutopilot(userId);
+    if (!autopilotStates.has(userId)) autopilotStates.set(userId, DEFAULT_AUTOPILOT());
+  }
   return autopilotStates.get(userId);
 }
 
@@ -137,7 +143,12 @@ function stateFor(userId) {
  * exit cannot double-count the same PnL.
  */
 export function recordRealized(userId, { pnlUsd, intentId = null, key = null } = {}) {
-  const st = autopilotStates.get(userId);
+  // stateFor, not autopilotStates.get. This is called from realIntent.js when
+  // the user approves a sell in MetaMask, which can happen before they have
+  // ever opened the Agents page — so before any getAutopilot() call created
+  // the state. With a plain .get() the write was dropped on the floor: a real
+  // exit that moved funds showed 0 trades and 0 profit forever.
+  const st = stateFor(userId);
   if (!st) return;
   if (!st.stats) st.stats = { ...DEFAULT_AUTOPILOT().stats };
   // Validate BEFORE claiming the dedup slot. Burning the key on a NaN PnL would

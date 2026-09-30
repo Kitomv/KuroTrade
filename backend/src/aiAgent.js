@@ -15,6 +15,13 @@ import {
   registerAutopilotModule,
 } from './realIntent.js';
 import { getChainConfig, isSupportedChain } from './evmWallet.js';
+import {
+  runTechnicalAnalysis, runBullThesis, runBearThesis,
+  runRiskAssessment, passesPreFilter,
+} from './analysis.js';
+import {
+  marketRegime, buildMemoryBlock, buildAccuracyBlock, computeSignalAccuracy,
+} from './memory.js';
 
 const DEFAULT_AUTOPILOT = () => ({
   enabled: false,
@@ -253,155 +260,6 @@ function addLog(userId, tag, msg, details = null) {
   if (st.logs.length > 80) st.logs.pop();
 }
 
-/* ---------------- Deterministic agent logic (unchanged math) ---------------- */
-
-function runTechnicalAnalysis(market) {
-  const priceUsd = Number(market.priceUsd) || 0;
-  const change5m = Number(market.change5m) || 0;
-  const change1h = Number(market.change1h) || 0;
-  const change24h = Number(market.change24h) || 0;
-  const volume24h = Number(market.volume24h) || 0;
-  const liquidityUsd = Number(market.liquidityUsd) || 0;
-  const fdv = Number(market.fdv) || 0;
-
-  const txns = market.txns24h ?? {};
-  const buys = Number(txns.buys) || 0;
-  const sells = Number(txns.sells) || 0;
-  const totalTxns = buys + sells;
-  const buyRatio = totalTxns > 0 ? (buys / totalTxns) * 100 : 50;
-
-  const momentumScore = (change5m * 0.4) + (change1h * 0.4) + (change24h * 0.2);
-  const volToLiqRatio = liquidityUsd > 0 ? volume24h / liquidityUsd : 0;
-
-  const isBreakout = change5m >= 2.0 && buyRatio >= 58;
-  const isVolumeSurge = volToLiqRatio >= 1.0 && volume24h > 20000;
-
-  let trend = 'NEUTRAL';
-  if (isBreakout && change1h > 2) trend = 'MOMENTUM_BREAKOUT';
-  else if (change5m > 1 && change1h > 3) trend = 'STRONG_BULLISH';
-  else if (change1h > 0 && change24h > 0) trend = 'BULLISH';
-  else if (change5m < -1 && change1h < -3) trend = 'STRONG_BEARISH';
-  else if (change1h < 0 && change24h < 0) trend = 'BEARISH';
-
-  const findings = [
-    `Trend ${trend.replace('_', ' ')}: 5m (${change5m > 0 ? '+' : ''}${change5m.toFixed(2)}%), 1h (${change1h > 0 ? '+' : ''}${change1h.toFixed(2)}%), 24h (${change24h > 0 ? '+' : ''}${change24h.toFixed(2)}%)`,
-    `Order Flow: ${buyRatio.toFixed(0)}% Buy pressure (${buys} buys vs ${sells} sells dalam 24h)`,
-    `Vol/Liq turnover: ${volToLiqRatio.toFixed(2)}x ($${(volume24h / 1000).toFixed(1)}k vol vs $${(liquidityUsd / 1000).toFixed(1)}k liq)`,
-  ];
-
-  if (isBreakout) findings.unshift(`⚡ [BREAKOUT SURGE] Lonjakan candle 5m (+${change5m.toFixed(2)}%) didukung tekanan beli ${buyRatio}%!`);
-
-  return {
-    trend,
-    momentumScore: Math.round(momentumScore * 100) / 100,
-    buyRatio: Math.round(buyRatio),
-    buys,
-    sells,
-    volToLiqRatio: Math.round(volToLiqRatio * 100) / 100,
-    liquidityUsd,
-    volume24h,
-    priceUsd,
-    fdv,
-    isBreakout,
-    isVolumeSurge,
-    findings,
-  };
-}
-
-function runBullThesis(market, tech) {
-  const points = [];
-  let bullScore = 50;
-
-  if (tech.isBreakout) { points.push(`Katalis Breakout Volume terdeteksi pada 5m dengan rasio beli ${tech.buyRatio}%`); bullScore += 20; }
-  if (tech.buyRatio > 55) { points.push(`Dominasi buyer kuat di angka ${tech.buyRatio}%`); bullScore += 15; }
-  if ((Number(market.change5m) || 0) > 0 && (Number(market.change1h) || 0) > 0) { points.push('Momentum timeframe pendek selaras positif (5m & 1h hijau)'); bullScore += 15; }
-  if (tech.volToLiqRatio > 0.5 && tech.volToLiqRatio < 5) { points.push(`Aktivitas trading sehat dengan rasio turnover ${tech.volToLiqRatio}x`); bullScore += 10; }
-  if (tech.liquidityUsd > 50000) { points.push(`Likuiditas pool tebal ($${(tech.liquidityUsd / 1000).toFixed(1)}k), slippage rendah`); bullScore += 10; }
-
-  if (points.length === 0) { points.push('Kondisi pasar saat ini belum menunjukkan katalis bullish yang jelas.'); bullScore = 30; }
-
-  return {
-    score: Math.min(95, bullScore),
-    thesis: points,
-    quote: `Katalis volume & buy flow mendukung potensi ekspansi harga ke atas.`,
-  };
-}
-
-function runBearThesis(market, tech) {
-  const warnings = [];
-  let bearScore = 30;
-
-  if (tech.liquidityUsd < 10000) { warnings.push(`⚠️ Likuiditas sangat tipis ($${(tech.liquidityUsd / 1000).toFixed(1)}k) — Risiko slippage ekstrem & dump besar`); bearScore += 35; }
-  if (tech.buyRatio < 45) { warnings.push(`Tekanan jual tinggi: ${100 - tech.buyRatio}% transaksi adalah SELL`); bearScore += 20; }
-  if ((Number(market.change24h) || 0) > 100) { warnings.push(`Harga sudah naik ${Number(market.change24h).toFixed(0)}% dalam 24h — Waspada take-profit massal / koreksi tajam`); bearScore += 20; }
-  if ((Number(market.change5m) || 0) < -3) { warnings.push('Terdeteksi dump cepat pada candle 5 menit terakhir'); bearScore += 15; }
-  if (tech.fdv > 0 && tech.liquidityUsd > 0 && (tech.fdv / tech.liquidityUsd) > 100) { warnings.push(`Rasio FDV/Liq sangat tinggi (${(tech.fdv / tech.liquidityUsd).toFixed(0)}x) — Potensi unlock atau supply dump`); bearScore += 15; }
-
-  if (warnings.length === 0) { warnings.push('Tidak ditemukan red flag on-chain yang signifikan pada metrik saat ini.'); bearScore = 20; }
-
-  return {
-    score: Math.min(95, bearScore),
-    risks: warnings,
-    quote: `Waspadai titik likuiditas dan potensi reversal jika buyer kehabisan tenaga.`,
-  };
-}
-
-function runRiskAssessment(market, tech, bull, bear, walletBalance, riskLevel = 'medium') {
-  let approved = true;
-  let rejectionReason = null;
-  // Per-user Guardian risk level drives per-trade sizing. This is the knob the
-  // user sets in the Agents UI (Low/Medium/High); it must actually size trades
-  // or the setting is cosmetic. Hot-wallet trades are additionally clamped by
-  // HOT_WALLET_MAX_USD_PER_TRADE (a hard safety ceiling in checkTradeSize), so
-  // the two settings compose: riskLevel sets the target, env sets the ceiling.
-  const ALLOCATION_BY_RISK = { low: 0.10, medium: 0.20, high: 0.35 };
-  let maxAllocationPct = ALLOCATION_BY_RISK[riskLevel] ?? ALLOCATION_BY_RISK.medium;
-
-  if (tech.liquidityUsd < 5000) { approved = false; rejectionReason = 'Likuiditas pool di bawah batas aman minimum $5,000 USD.'; }
-  else if (bear.score > 75) { approved = false; rejectionReason = 'Skor risiko Bearish melampaui batas toleransi (>75%).'; }
-
-  // Extra caution for thinner pools: cap the allocation even on High risk.
-  if (tech.liquidityUsd < 20000) maxAllocationPct = Math.min(maxAllocationPct, 0.10);
-
-  const currentPrice = tech.priceUsd > 0 ? tech.priceUsd : 0.000001;
-  const safeBalance = Number.isFinite(Number(walletBalance)) && Number(walletBalance) > 0 ? Number(walletBalance) : 100;
-  const maxUsdPosition = Math.max(1, Math.round((safeBalance * maxAllocationPct) * 100) / 100);
-
-  const stopLossPct = 7;
-  const targetProfitPct = 15;
-  const stopLossPrice = currentPrice * (1 - stopLossPct / 100);
-  const takeProfitPrice = currentPrice * (1 + targetProfitPct / 100);
-
-  return {
-    approved,
-    rejectionReason,
-    maxAllocationPct: Math.round(maxAllocationPct * 100),
-    maxUsdPosition,
-    stopLossPct,
-    targetProfitPct,
-    stopLossPrice,
-    takeProfitPrice,
-  };
-}
-
-// Deterministic pre-filter for the scan — rejects tokens that would waste
-// LLM calls. Uses the same hard gates as `runRiskAssessment` but without
-// per-user sizing (those are independent of the token's intrinsic quality).
-// EVM only: the execution layer is 1inch + MetaMask.
-function passesPreFilter(market) {
-  if (!market || !market.priceUsd) return false;
-  // An intent for a chain the execution layer cannot fill stays 'open' forever
-  // and blocks buy-dedup. DexScreener indexes many chains; accept only those
-  // the wallet can actually trade.
-  if (!isSupportedChain(market.chainId)) return false;
-  const liq = Number(market.liquidityUsd) || 0;
-  if (liq < 10000) return false;              // hard gate in runRiskAssessment
-  const vol = Number(market.volume24h) || 0;
-  if (liq > 0 && vol / liq < 0.05) return false; // nearly dead market
-  return true;
-}
-
-/** Tolerant JSON parse for LLM replies (some routers wrap output in fences). */
 const LLM_JSON_PARSE = (raw) => {
   try { return JSON.parse(raw.replace(/```json|```/g, '').trim()); } catch { return {}; }
 };
@@ -1063,6 +921,21 @@ export async function runAutopilotTick(userId) {
     }
   }
 
+  // Phase 2: scout for new buys — extracted to keep this tick readable.
+  return runScoutPhase(userId, st, { markets, positions, wallet });
+}
+
+/**
+ * Phase 2 of a tick: look for a new buy and emit an intent for it.
+ *
+ * Split out of runAutopilotTick, which had grown to ~470 lines spanning the
+ * guardian loop, the stale-intent sweep and this scout. The phase owns its
+ * own return value and shares only the tick's state and price snapshot, so
+ * it needs no injection beyond those.
+ *
+ * Returns { executed, ... } — the same shape the tick used to return inline.
+ */
+async function runScoutPhase(userId, st, { markets, positions, wallet }) {
   // Phase 2: scout for new buys (signal quality + exposure/correlation guards)
   st.status = 'SCANNING';
   const currentOpenPositions = getPositions(userId).length;
@@ -1299,83 +1172,6 @@ async function updateSignalOutcomes(userId) {
   if (changed) saveUserState(userId);
 }
 
-/** Map technical trend + volatility into a coarse market regime bucket. */
-function marketRegime(tech) {
-  const t = String(tech.trend ?? 'NEUTRAL');
-  if (t.includes('BULLISH') || t === 'MOMENTUM_BREAKOUT') {
-    return tech.volToLiqRatio >= 2 ? 'volatile' : 'trending_up';
-  }
-  if (t.includes('BEARISH')) {
-    return tech.volToLiqRatio >= 2 ? 'volatile' : 'trending_down';
-  }
-  return tech.volToLiqRatio >= 2 ? 'volatile' : 'ranging';
-}
-
-/**
- * Build the memory block injected into Bull/Bear prompts. Two-tier selection:
- * entries matching this token's chain + regime first, then recent fill-up.
- * Adds an aggregate pattern line when enough same-regime samples exist.
- */
-function buildMemoryBlock(st, market, tech) {
-  const all = st.memory ?? [];
-  if (all.length === 0) return '';
-
-  const regime = marketRegime(tech);
-  const chainId = market.chainId;
-  const relevant = all.filter((m) => m.regime === regime && m.chainId === chainId).slice(0, 5);
-  const chosen = [...relevant];
-  for (const m of all) {
-    if (chosen.length >= 8) break;
-    if (!chosen.includes(m)) chosen.push(m);
-  }
-
-  const line = (m) =>
-    `- ${m.symbol}: called ${m.signal} @ $${m.entryPrice} → ${m.outcomePct >= 0 ? '+' : ''}${Number(m.outcomePct).toFixed(1)}% (${m.outcomePct >= 0 ? 'worked' : 'failed'})${m.exitReason ? ` [${m.exitReason}${m.holdMs ? `, ${Math.round(m.holdMs / 3_600_000)}h` : ''}]` : ''}`;
-
-  let block = `\n\nPast decisions with REALIZED outcomes (learn from these):\n${chosen.map(line).join('\n')}`;
-
-  // Aggregate pattern line — only when we have a real sample of same-regime trades.
-  const sameRegime = all.filter((m) => m.regime === regime);
-  if (sameRegime.length >= 5) {
-    const wins = sameRegime.filter((m) => m.outcomePct > 0).length;
-    const avg = sameRegime.reduce((s, m) => s + Number(m.outcomePct || 0), 0) / sameRegime.length;
-    block += `\n\nPattern: in ${regime} ${chainId} markets, ${sameRegime.length} trades → ${Math.round((wins / sameRegime.length) * 100)}% win, avg ${avg >= 0 ? '+' : ''}${avg.toFixed(1)}%.`;
-  }
-  return block;
-}
-
-/** Compact calibration line from signal accuracy — injected next to the memory block. */
-function buildAccuracyBlock(st) {
-  const acc = computeSignalAccuracy(st);
-  if (acc.n1h === 0) return '';
-  const parts = Object.entries(acc.bySignal ?? {})
-    .filter(([, v]) => v.n1h > 0)
-    .map(([sig, v]) => `${sig.replace('_', ' ')} ${Math.round((v.win1h / v.n1h) * 100)}% @1h (n=${v.n1h})`);
-  if (parts.length === 0) return '';
-  return `\n\nRecent signal calibration: ${parts.join('; ')}. Adjust confidence accordingly — do not repeat setups that recently failed.`;
-}
-
-/** Aggregate accuracy stats from signal history. */
-function computeSignalAccuracy(st) {
-  const hist = (st.signalHistory ?? []).filter((h) => h.entryPrice > 0);
-  const isWin = (h, price) => {
-    if (!price) return null;
-    return h.signal.includes('BUY') ? price > h.entryPrice : h.signal === 'SELL' ? price < h.entryPrice : null;
-  };
-  const acc = { total: hist.length, win1h: 0, n1h: 0, win24h: 0, n24h: 0, bySignal: {} };
-  for (const h of hist) {
-    const key = h.signal;
-    acc.bySignal[key] = acc.bySignal[key] ?? { n: 0, win1h: 0, n1h: 0 };
-    acc.bySignal[key].n++;
-    const w1 = isWin(h, h.price1h);
-    const w24 = isWin(h, h.price24h);
-    if (w1 !== null) { acc.n1h++; if (w1) acc.win1h++; acc.bySignal[key].n1h++; if (w1) acc.bySignal[key].win1h++; }
-    if (w24 !== null) { acc.n24h++; if (w24) acc.win24h++; }
-  }
-  acc.acc1h = acc.n1h > 0 ? Math.round((acc.win1h / acc.n1h) * 100) : null;
-  acc.acc24h = acc.n24h > 0 ? Math.round((acc.win24h / acc.n24h) * 100) : null;
-  return acc;
-}
 
 /** Kick off a background refresh for `key`, deduped per key. Never awaited by
  *  the tick — failures are logged and the stale entry stays usable. */

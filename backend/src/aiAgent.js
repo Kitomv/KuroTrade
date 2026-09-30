@@ -82,6 +82,18 @@ async function mapLimit(items, limit, fn) {
 const intentReminderThrottles = new Map();
 const INTENT_REMINDER_INTERVAL_MS = 5 * 60_000;
 
+// Sweep entries whose window has already elapsed. They carry no information —
+// shouldRemind() re-adds one the moment it reminds again — and without this an
+// entry for every intent that ever waited for approval is retained forever.
+// What remains is only intents reminded within the last window, so the map
+// tracks pending approvals rather than total history.
+setInterval(() => {
+  const now = Date.now();
+  for (const [intentId, nextAllowed] of intentReminderThrottles) {
+    if (now >= nextAllowed) intentReminderThrottles.delete(intentId);
+  }
+}, INTENT_REMINDER_INTERVAL_MS).unref?.();
+
 function shouldRemind(intentId) {
   const next = intentReminderThrottles.get(intentId) ?? 0;
   if (Date.now() < next) return false;
@@ -551,7 +563,7 @@ Risk: Max $${risk.maxUsdPosition} USDC, TP: $${risk.takeProfitPrice.toFixed(6)} 
     timestamp: Date.now(),
     llmPowered: llmCfg.hasKey,
     llmProvider: llmCfg.hasKey ? `${llmCfg.provider} / ${llmCfg.model}` : 'Quantitative Engine',
-    token: { address: market.tokenAddress, symbol: market.symbol ?? 'UNKNOWN', name: market.name ?? '', chainId: market.chainId ?? 'solana', dexId: market.dexId ?? '', priceUsd: Number(market.priceUsd) || 0, icon: market.icon ?? undefined },
+    token: { address: market.tokenAddress, symbol: market.symbol ?? 'UNKNOWN', name: market.name ?? '', chainId: market.chainId ?? 'base', dexId: market.dexId ?? '', priceUsd: Number(market.priceUsd) || 0, icon: market.icon ?? undefined },
     agents: { technical: tech, bull, bear, risk },
     verdict: {
       signal,

@@ -1,6 +1,6 @@
 // Shared modal overlay — Esc + click-outside close, focus trap, focus restore.
-// Importers/callers: Agents (LLM stack), Sidebar (change password), Leaderboard
-// (admin panel). API: `<Modal title onClose actions maxWidth>children</Modal>`.
+// Importers/callers: Agents (LLM stack), Settings/Sidebar (change password),
+// RealWallet (modal + portfolio). API: `<Modal title onClose actions maxWidth>children</Modal>`.
 // No data schema — presentational. User instruction: "improve user experience:ALL".
 import { useEffect, useRef, ReactNode } from 'react';
 import { IconClose } from './Icons';

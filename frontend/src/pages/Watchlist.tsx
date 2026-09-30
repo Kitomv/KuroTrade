@@ -6,14 +6,16 @@ import { WatchEntry } from '../api/client';
 import { fmt } from '../lib/format';
 import { useToast } from '../components/ToastProvider';
 import { StaleBadge } from '../components/StaleBadge';
+import { useEvmChains } from '../hooks/useEvmChains';
 
 export function Watchlist({ onUpdated }: { onUpdated: () => void }) {
   const [addr, setAddr] = useState('');
-  const [chain, setChain] = useState('solana');
+  const [chain, setChain] = useState('base');
   const [adding, setAdding] = useState(false);
   const [err, setErr] = useState('');
   const [copied, setCopied] = useState<string | null>(null);
   const toast = useToast();
+  const { chains } = useEvmChains();
 
   const p = usePolling(
     () => api.watchlist(),
@@ -72,10 +74,9 @@ export function Watchlist({ onUpdated }: { onUpdated: () => void }) {
             style={{ width: 150 }}
             aria-label="Pilih Blockchain"
           >
-            <option value="base">Base</option>
-            <option value="ethereum">Ethereum</option>
-            <option value="arbitrum">Arbitrum</option>
-            <option value="bsc">BSC</option>
+            {chains.length === 0
+              ? <option value="base">Base</option>
+              : chains.map((c) => <option key={c.key} value={c.key}>{c.key === 'base' ? 'Base' : c.key}</option>)}
           </select>
           <button className="btn primary" onClick={handleAdd} disabled={adding || !addr.trim()}>
             {adding ? 'Menambahkan…' : 'Tambah'}

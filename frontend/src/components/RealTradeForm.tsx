@@ -7,10 +7,11 @@ import { IconAlert, IconCheck, IconArrowDown, IconArrowUp, IconZap } from './Ico
 import { useConfirm } from './ConfirmDialog';
 import { useEvmWallet } from './EvmWalletContext';
 import { shortAddr, isInsecureOrigin } from '../lib/evm';
-import { EVM_CHAINS } from './RealTradePanel';
+import { useEvmChains } from '../hooks/useEvmChains';
 
 export function RealTradeForm() {
   const { connected, isBound, address, approveIntent, cancelIntent, openIntents, approvingId, approveError } = useEvmWallet();
+  const { keys: evmChains } = useEvmChains();
   const confirmAction = useConfirm();
 
   const [side, setSide] = useState<'buy' | 'sell'>('buy');
@@ -29,7 +30,9 @@ export function RealTradeForm() {
     setErr('');
     try {
       const res = await api.search(query.trim());
-      const evm = res.find((m) => EVM_CHAINS.includes(m.chainId)) ?? null;
+      // Empty list = still loading (see useEvmChains); fall through to the top
+      // result and let the server reject an unsupported chain itself.
+      const evm = (evmChains.length === 0 ? res[0] : res.find((m) => evmChains.includes(m.chainId))) ?? null;
       if (!evm) { setErr('Token EVM tidak ditemukan'); setToken(null); return; }
       setToken(evm);
     } catch {
@@ -38,7 +41,7 @@ export function RealTradeForm() {
     } finally {
       setSearching(false);
     }
-  }, [query]);
+  }, [query, evmChains]);
 
   const createIntent = async () => {
     if (!token) { setErr('Pilih token dulu'); return; }

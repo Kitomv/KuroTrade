@@ -28,7 +28,7 @@ import {
   getBoundWallet, bindWallet, assertBoundWallet, createBindChallenge,
 } from './realIntent.js';
 import { verifyUser, createSession, getUser, destroySession, seedAdminFromEnv,
-  changePassword, destroyOtherSessions, listUsers as listAuthUsers, getUserById, adminSetPassword, deleteUser } from './auth.js';
+  changePassword, destroyOtherSessions, listUsers as listAuthUsers, getUserById } from './auth.js';
 import { flushAll, cleanupTempFiles, DATA_DIR } from './persistence.js';
 import { securityHeaders, redact, sanitizeError, ipRateLimit, userRateLimit, isSafeBaseUrl } from './security.js';
 import {
@@ -65,8 +65,8 @@ app.use((req, res, next) => {
 // the SPA gate handles auth client-side; blocking assets would blank the app.
 const PUBLIC_PATHS = new Set(['/api/login', '/api/health']);
 app.use((req, res, next) => {
-  // Express path matching is case-insensitive, so /API/admin/users reaches the
-  // same route as /api/admin/users. Compare lowercased, or the guard is bypassed.
+  // Express path matching is case-insensitive, so /API/portfolio reaches the
+  // same route as /api/portfolio. Compare lowercased, or the guard is bypassed.
   const p = req.path.toLowerCase();
   if (req.method === 'OPTIONS' || !p.startsWith('/api/') || PUBLIC_PATHS.has(p)) return next();
   const auth = req.headers.authorization ?? '';
@@ -75,14 +75,8 @@ app.use((req, res, next) => {
   if (!userId) return res.status(401).json({ error: 'Unauthorized' });
   req.userId = userId;
   req.token = token;
-  req.role = getUserById(userId)?.role ?? 'user';
   next();
 });
-
-const requireAdmin = (req, res, next) => {
-  if (req.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  next();
-};
 
 const wrap = (fn) => (req, res) => {
   Promise.resolve(fn(req, res)).catch((err) => {
@@ -155,7 +149,7 @@ app.post('/api/logout', (req, res) => {
 
 app.get('/api/me', (req, res) => {
   const user = getUserById(req.userId);
-  res.json({ userId: req.userId, username: user?.username ?? '', role: user?.role ?? 'user', wallet: getWallet(req.userId) });
+  res.json({ userId: req.userId, username: user?.username ?? '', wallet: getWallet(req.userId) });
 });
 
 app.post('/api/change-password', (req, res) => {
@@ -171,40 +165,6 @@ app.post('/api/change-password', (req, res) => {
   }
 });
 
-// --- Admin: user management ---
-app.get('/api/admin/users', requireAdmin, (req, res) => {
-  const users = listAuthUsers().map((u) => ({ ...u, wallet: getWallet(u.id) }));
-  res.json(users);
-});
-
-app.post('/api/admin/users/:id/reset-password', requireAdmin, (req, res) => {
-  const { newPassword } = req.body ?? {};
-  if (!newPassword || String(newPassword).length < 8) return res.status(400).json({ error: 'Password baru minimal 8 karakter' });
-  if (!getUserById(req.params.id)) return res.status(404).json({ error: 'User tidak ditemukan' });
-  try {
-    adminSetPassword(req.params.id, String(newPassword));
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(400).json({ error: e.message });
-  }
-});
-
-app.delete('/api/admin/users/:id', requireAdmin, (req, res) => {
-  if (req.params.id === req.userId) return res.status(400).json({ error: 'Tidak bisa menghapus akun sendiri' });
-  const users = listAuthUsers();
-  const target = users.find((u) => u.id === req.params.id);
-  if (!target) return res.status(404).json({ error: 'User tidak ditemukan' });
-  if (target.role === 'admin' && users.filter((u) => u.role === 'admin').length <= 1) {
-    return res.status(400).json({ error: 'Tidak bisa menghapus admin terakhir' });
-  }
-  try {
-    deleteUser(req.params.id);
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(400).json({ error: e.message });
-  }
-});
-
 // --- Leaderboard (all users ranked by portfolio value) ---
 app.get('/api/leaderboard', (req, res) => {
   const rows = listAuthUsers().map((u) => {
@@ -212,7 +172,6 @@ app.get('/api/leaderboard', (req, res) => {
     return {
       userId: u.id,
       username: u.username,
-      role: u.role,
       totalValue: w.totalValue,
       pnlPct: Math.round(((w.totalValue - w.initialBalance) / w.initialBalance) * 10000) / 100,
       positionsCount: getPositions(u.id).length,
@@ -716,7 +675,7 @@ app.post('/api/orders/market', async (req, res) => {
     const order = executeMarketOrder(req.userId, {
       side,
       tokenAddress,
-      chainId: chainId ?? current?.chainId ?? 'solana',
+      chainId: chainId ?? current?.chainId ?? 'base',
       symbol: symbol ? String(symbol).slice(0, 40) : (current?.symbol ?? 'UNKNOWN'),
       name: name ? String(name).slice(0, 40) : (current?.name ?? ''),
       usdAmount: usd || 0,
@@ -744,7 +703,7 @@ app.post('/api/orders/limit', async (req, res) => {
     const order = createLimitOrder(req.userId, {
       side,
       tokenAddress,
-      chainId: chainId ?? 'solana',
+      chainId: chainId ?? 'base',
       symbol: symbol ? String(symbol).slice(0, 40) : 'UNKNOWN',
       name: name ? String(name).slice(0, 40) : '',
       targetPrice: target,

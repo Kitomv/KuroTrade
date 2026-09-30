@@ -416,7 +416,7 @@ export const AUTH = {
       body: JSON.stringify({ username, password }),
     }),
   logout: () => req<{ ok: boolean }>('/api/logout', { method: 'POST' }),
-  me: () => req<{ userId: string; username: string; role: 'admin' | 'user'; wallet: Wallet }>('/api/me'),
+  me: () => req<{ userId: string; username: string; wallet: Wallet }>('/api/me'),
   changePassword: (currentPassword: string, newPassword: string) =>
     req<{ ok: boolean }>('/api/change-password', {
       method: 'POST',
@@ -425,21 +425,20 @@ export const AUTH = {
     }),
 };
 
-export interface AdminUser {
-  id: string;
-  username: string;
-  role: 'admin' | 'user';
-  createdAt: number;
-  wallet: Wallet;
-}
-
 export interface LeaderboardRow {
   userId: string;
   username: string;
-  role: 'admin' | 'user';
   totalValue: number;
   pnlPct: number;
   positionsCount: number;
+}
+
+/** One chain the backend can execute on (GET /api/real/evm/chains). */
+export interface EvmChain {
+  key: string;
+  chainId: number;
+  native: string;
+  explorer: string;
 }
 
 /** Download a CSV export (carries the auth header, unlike a plain <a href>). */
@@ -556,20 +555,14 @@ export const api = {
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(entry) },
     ),
 
-  // Leaderboard & admin
+  // Leaderboard
   leaderboard: () => req<LeaderboardRow[]>('/api/leaderboard'),
-  adminUsers: () => req<AdminUser[]>('/api/admin/users'),
-  adminResetPassword: (id: string, newPassword: string) =>
-    req<{ ok: boolean }>(`/api/admin/users/${encodeURIComponent(id)}/reset-password`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ newPassword }),
-    }),
-  adminDeleteUser: (id: string) =>
-    req<{ ok: boolean }>(`/api/admin/users/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
   // Real trading — EVM via 1inch. The server builds the UNSIGNED tx; MetaMask
   // signs it in the browser. No private key ever reaches the backend.
+  /** Chains the backend can execute on — the single source of truth for every
+   *  chain selector in the UI. Do not hardcode a chain list client-side. */
+  evmChains: () => req<{ chains: EvmChain[] }>('/api/real/evm/chains'),
   realQuote: (data: { src: string; dst: string; amount: string; chain?: string }) =>
     req<{ inAmount?: string; outAmount?: string; priceImpactPct?: string; [k: string]: unknown }>(
       '/api/real/quote',

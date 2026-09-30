@@ -4,6 +4,7 @@ import { usePolling } from '../hooks/usePolling';
 import { IconChartLine, IconPause, IconPlay } from '../components/Icons';
 import { WatchEntry } from '../api/client';
 import { fmt } from '../lib/format';
+import { useEvmChains } from '../hooks/useEvmChains';
 
 export function Chart() {
   const [tokenAddr, setTokenAddr] = useState('');
@@ -12,6 +13,7 @@ export function Chart() {
   const [isPaused, setIsPaused] = useState(false);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const [loadingHistory, setLoadingHistory] = useState(false);
+  const { chains } = useEvmChains();
 
   const entriesP = usePolling(
     () => api.watchlist(),
@@ -146,10 +148,9 @@ export function Chart() {
             style={{ width: 140 }}
             aria-label="Pilih Chain"
           >
-            <option value="base">Base</option>
-            <option value="ethereum">Ethereum</option>
-            <option value="arbitrum">Arbitrum</option>
-            <option value="bsc">BSC</option>
+            {chains.length === 0
+              ? <option value="base">Base</option>
+              : chains.map((c) => <option key={c.key} value={c.key}>{c.key === 'base' ? 'Base' : c.key}</option>)}
           </select>
           <input
             className="input"

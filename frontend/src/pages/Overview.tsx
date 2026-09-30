@@ -7,6 +7,7 @@ import { fmt } from '../lib/format';
 import { useToast } from '../components/ToastProvider';
 import { StaleBadge } from '../components/StaleBadge';
 import { useEvmWallet } from '../components/EvmWalletContext';
+import { useEvmChains } from '../hooks/useEvmChains';
 
 interface Props {
   refreshWatchlist: () => void;
@@ -24,6 +25,10 @@ export function Overview({ refreshWatchlist, onNavigateTab }: Props) {
   const aiSignals = aiSignalsP.data;
 
   const { realMode, connected, isBound } = useEvmWallet();
+  const { keys: chainKeys } = useEvmChains();
+  // "all" is a UI-only pseudo-chain, not a backend one. Guard against a chain
+  // ever being named "all" so the pill list cannot produce a duplicate key.
+  const chainPills = ['all', ...chainKeys.filter((c) => c !== 'all')];
 
   const handlePin = async (m: Market) => {
     try {
@@ -100,7 +105,7 @@ export function Overview({ refreshWatchlist, onNavigateTab }: Props) {
 
         {/* Chain selector pills */}
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
-          {['all', 'base', 'ethereum', 'bsc', 'arbitrum'].map((c) => (
+          {chainPills.map((c) => (
             <button
               key={c}
               className={`chip${selectedChain === c ? ' active' : ''}`}

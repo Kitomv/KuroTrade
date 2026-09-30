@@ -156,30 +156,6 @@ export const dexscreener = {
   },
 };
 
-/**
- * SOL/USD spot price for USD→lamports conversion (audit fix C1: BUY intents
- * must spend a SOL amount, not misread a USDC budget as SOL). Cached 15s;
- * falls back to a 'SOL' search if the wrapped-SOL mint lookup fails.
- * Returns null when unavailable — callers MUST refuse to emit a buy intent.
- */
-let solUsdCache = { at: 0, price: null };
-export async function getSolUsdPrice() {
-  const now = Date.now();
-  if (solUsdCache.price && now - solUsdCache.at < 15_000) return solUsdCache.price;
-  let price = null;
-  try {
-    const token = await dexscreener.token('So11111111111111111111111111111111111111112');
-    if (token && Number(token.priceUsd) > 0) price = Number(token.priceUsd);
-  } catch {}
-  if (price === null) {
-    try {
-      const results = await dexscreener.search('SOL', 60_000);
-      const best = results
-        .filter((r) => r.chainId === 'solana' && Number(r.priceUsd) > 0 && Number(r.liquidityUsd) > 1_000_000)
-        .sort((a, b) => Number(b.liquidityUsd) - Number(a.liquidityUsd))[0];
-      if (best) price = Number(best.priceUsd);
-    } catch {}
-  }
-  if (price !== null) solUsdCache = { at: Date.now(), price };
-  return price;
-}
+// Native-coin pricing lives in evmWallet.js (getNativeUsdPrice), which resolves
+// the wrapped-native token per chain by ADDRESS. This module stays a pure
+// DexScreener client — no chain-specific pricing belongs here.

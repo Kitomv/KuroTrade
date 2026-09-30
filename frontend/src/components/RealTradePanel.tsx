@@ -7,15 +7,14 @@ import { IconAlert, IconArrowDown, IconArrowUp, IconCheck, IconZap } from './Ico
 import { useConfirm } from './ConfirmDialog';
 import { useEvmWallet } from './EvmWalletContext';
 import { shortAddr, isInsecureOrigin } from '../lib/evm';
-
-/** Chains the backend can execute on. Keep in sync with backend CHAINS. */
-export const EVM_CHAINS = ['base', 'ethereum', 'arbitrum', 'bsc', 'optimism', 'polygon', 'avalanche'];
+import { useEvmChains } from '../hooks/useEvmChains';
 
 export function RealTradePanel() {
   const {
     connected, isBound, address, openIntents, approvingId, approveError,
     approveIntent, cancelIntent, refreshIntents, chainId,
   } = useEvmWallet();
+  const { keys: evmChains } = useEvmChains();
   const confirmAction = useConfirm();
 
   const [side, setSide] = useState<'buy' | 'sell'>('buy');
@@ -35,8 +34,12 @@ export function RealTradePanel() {
     setCreated(null);
     try {
       const res = await api.search(query.trim());
-      // EVM-only execution: a Solana pair cannot be filled by 1inch.
-      const evm = res.find((m) => EVM_CHAINS.includes(m.chainId)) ?? null;
+      // Execution is EVM-only: a non-EVM pair cannot be filled by 1inch. The
+      // chain list comes from the backend, so this can never drift from what
+      // the swap layer actually accepts. While it is still loading, an empty
+      // list means "unknown", not "nothing is tradeable" — take the top result
+      // and let the server reject an unsupported chain with its own error.
+      const evm = (evmChains.length === 0 ? res[0] : res.find((m) => evmChains.includes(m.chainId))) ?? null;
       if (!evm) { setErr('Token EVM tidak ditemukan di DexScreener'); setToken(null); return; }
       setToken(evm);
     } catch {
@@ -45,7 +48,7 @@ export function RealTradePanel() {
     } finally {
       setSearching(false);
     }
-  }, [query]);
+  }, [query, evmChains]);
 
   const createIntent = async () => {
     if (!token) { setErr('Pilih token dulu'); return; }

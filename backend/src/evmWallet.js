@@ -222,7 +222,21 @@ const ERC20_ABI = [
   'function decimals() view returns (uint8)',
 ];
 
+const DECIMALS_TTL_MS = 3_600_000; // 1h — a token's decimals are immutable
+// Token addresses come from user input and DexScreener search results, so an
+// unbounded Map would retain every token ever priced for the life of the
+// process. Capped with the same oldest-first eviction dexscreener.js uses.
+const DECIMALS_CACHE_MAX = 500;
 const decimalsCache = new Map(); // `${chain}:${token}` -> { at, decimals }
+
+// Drop expired entries so a long-running backend does not hold onto tokens it
+// will never price again. unref'd so it never blocks process exit.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of decimalsCache) {
+    if (now - entry.at > DECIMALS_TTL_MS) decimalsCache.delete(key);
+  }
+}, 60_000).unref?.();
 
 /**
  * ERC-20 decimals, resolved ON-CHAIN from the token contract itself.
@@ -230,17 +244,22 @@ const decimalsCache = new Map(); // `${chain}:${token}` -> { at, decimals }
  * The contract is authoritative. An aggregator index routinely misses new
  * tokens, and guessing 9 for a 6-decimal token mis-sells by 1000x. Cached 1h.
  * Returns null when unresolvable; callers MUST refuse the sell rather than
- * guess (the rule the Solana executor enforced at hotWallet.js:210).
+ * guess — a wrong decimals value over-sells by 1000x or more.
  */
 export async function resolveTokenDecimals(token, chain = 'base') {
   const addr = assertAddress(token, 'token');
   const key = `${chain}:${addr.toLowerCase()}`;
   const hit = decimalsCache.get(key);
-  if (hit && Date.now() - hit.at < 3_600_000) return hit.decimals;
+  if (hit && Date.now() - hit.at < DECIMALS_TTL_MS) return hit.decimals;
   try {
     const contract = new ethers.Contract(addr, ERC20_ABI, getProvider(chain));
     const decimals = Number(await contract.decimals());
     if (Number.isInteger(decimals) && decimals >= 0 && decimals <= 36) {
+      // Evict the oldest entry first so the cap is never exceeded.
+      if (decimalsCache.size >= DECIMALS_CACHE_MAX) {
+        const oldest = decimalsCache.keys().next().value;
+        if (oldest !== undefined) decimalsCache.delete(oldest);
+      }
       decimalsCache.set(key, { at: Date.now(), decimals });
       return decimals;
     }
@@ -276,7 +295,6 @@ export async function getEvmTokenBalance(address, token, chain = 'base') {
  * Exposure is the risky part of a book: the ETH in the wallet is undeployed
  * cash and gas, not a position at risk. Counting it reports ~100% exposure on
  * a wallet holding nothing but ETH, which permanently blocks every new buy.
- * (Same split getHotWalletTokenValue made for Solana.)
  *
  * `tokens` is the set to value — the caller's tracked/held tokens.
  */
@@ -362,18 +380,12 @@ export async function getNativeUsdPrice(chain = 'base') {
   return null;
 }
 
-/** Whether this chain can size a buy at all (needs a resolvable native price). */
-export function canPriceNative(chain) {
-  return Object.hasOwn(WRAPPED_NATIVE, chain);
-}
-
 // --- Risk guards ------------------------------------------------------------
 
 /**
  * Native coin that must stay UNSPENT so the exit swap can still pay its own
  * gas. A wallet that spends its last wei on the entry swap can never sell —
- * the position becomes a stuck bag. Mirrors the Solana executor's
- * HOT_WALLET_FEE_RESERVE_LAMPORTS (0.005 SOL).
+ * the position becomes a stuck bag.
  */
 export const EVM_FEE_RESERVE_NATIVE = 0.005;
 

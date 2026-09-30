@@ -50,6 +50,30 @@ export function sanitizeError(value) {
     .slice(0, 200);
 }
 
+/**
+ * Is this an IPv6 literal that carries an embedded IPv4 address?
+ *
+ * WHAT the URL parser hands us: it normalises the address, so the dotted form
+ * `::ffff:169.254.169.254` comes back as `::ffff:a9fe:a9fe`. Matching the
+ * dotted spelling therefore never fires. Parse the trailing hextet pair
+ * instead and re-derive the octets.
+ *
+ * WHY it matters: connecting to ::ffff:169.254.169.254 reaches 169.254.169.254
+ * verbatim, so without this a cloud metadata endpoint was reachable simply by
+ * writing the address in a form the prefix checks do not match.
+ *
+ * Returns the dotted IPv4 string, or null when this is not a mapped form.
+ */
+function extractMappedIPv4(host) {
+  // Only ::ffff:a.b.c.d and ::a.b.c.d embed an IPv4 address — that is the
+  // 5th/6th hextet pair, which is what the two captures below hold.
+  const m = host.match(/^::(ffff:)?([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (!m) return null;
+  const hi = parseInt(m[2], 16);
+  const lo = parseInt(m[3], 16);
+  return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+}
+
 function hostnameIsBlocked(hostname) {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
   if (PRIVATE_OR_METADATA_HOSTS.has(host) || host.endsWith('.internal')) return true;
@@ -60,6 +84,8 @@ function hostnameIsBlocked(hostname) {
       || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
   }
   if (ipVersion === 6) {
+    const mapped = extractMappedIPv4(host);
+    if (mapped) return hostnameIsBlocked(mapped);
     return host === '::1' || host === '::' || host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd');
   }
   return false;

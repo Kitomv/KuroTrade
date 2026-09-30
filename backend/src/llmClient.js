@@ -118,8 +118,12 @@ export function setLLMConfig(userId, value) {
 }
 
 /** Resolve a provider endpoint, validating any user-supplied baseUrl first so
- *  the server can never be pointed at cloud metadata / private IPs (SSRF). */
-function endpointFor(provider, baseUrl) {
+ *  the server can never be pointed at cloud metadata / private IPs (SSRF).
+ *
+ *  Exported so the SSRF guard can be tested directly. This is a security
+ *  boundary: asserting it through a mocked fetch would only prove the mock
+ *  behaves, not that the guard rejects a metadata endpoint. */
+export function endpointFor(provider, baseUrl) {
   if (provider === 'anthropic') return 'https://api.anthropic.com/v1/messages';
   // Providers with a fixed host: ignore user baseUrl entirely (prevents a
   // stored baseUrl from redirecting a preset provider to an arbitrary host).

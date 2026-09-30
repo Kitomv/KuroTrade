@@ -433,6 +433,14 @@ export interface LeaderboardRow {
   positionsCount: number;
 }
 
+/** One chain the backend can execute on (GET /api/real/evm/chains). */
+export interface EvmChain {
+  key: string;
+  chainId: number;
+  native: string;
+  explorer: string;
+}
+
 /** Download a CSV export (carries the auth header, unlike a plain <a href>). */
 export async function exportCsv(kind: 'orders' | 'positions'): Promise<void> {
   const token = localStorage.getItem('trading_token');
@@ -552,6 +560,9 @@ export const api = {
 
   // Real trading — EVM via 1inch. The server builds the UNSIGNED tx; MetaMask
   // signs it in the browser. No private key ever reaches the backend.
+  /** Chains the backend can execute on — the single source of truth for every
+   *  chain selector in the UI. Do not hardcode a chain list client-side. */
+  evmChains: () => req<{ chains: EvmChain[] }>('/api/real/evm/chains'),
   realQuote: (data: { src: string; dst: string; amount: string; chain?: string }) =>
     req<{ inAmount?: string; outAmount?: string; priceImpactPct?: string; [k: string]: unknown }>(
       '/api/real/quote',

@@ -38,12 +38,20 @@ export function App() {
 
   // Refresh profile (username) when authenticated — also validates the stored
   // token on boot.
+  //
+  // A wallet-only account has no username (the address IS the identity), so
+  // /api/me returns ''. Falling through with '' would drop `username` to
+  // falsy and the Sidebar renders its account block — including the Real
+  // Wallet control — only when a username is present. The address is the
+  // natural label, and without it the wallet panel becomes unreachable after
+  // a refresh.
   useEffect(() => {
     if (!authed) return;
     AUTH.me()
       .then((me) => {
-        setUsername(me.username);
-        localStorage.setItem('trading_username', me.username);
+        const label = me.username || (me.address ? `${me.address.slice(0, 6)}…${me.address.slice(-4)}` : '');
+        setUsername(label);
+        localStorage.setItem('trading_username', label);
       })
       .catch(() => {});
   }, [authed]);

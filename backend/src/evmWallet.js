@@ -68,6 +68,61 @@ export const CHAINS = {
 };
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+
+/**
+ * Canonical USDT contract per chain.
+ *
+ * Always tracked in the real portfolio: the position-derived token list only
+ * contains what the autopilot traded, so a wallet funded with USDT (the usual
+ * way to fund a trading wallet) showed an empty table and a total that ignored
+ * the balance the user actually cares about.
+ *
+ * USDT is NOT the same address across chains — each is a separate deployment.
+ */
+export const USDT_BY_CHAIN = {
+  base: '0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2',
+  ethereum: '0xdAC17F958D2ee523a2206206994597C13D831ec7',
+  arbitrum: '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9',
+  bsc: '0x55d398326f99059fF775485246999027B3197955',
+  optimism: '0x94b008aA00579c1307B0EF2c499aD98a8ce58e58',
+  polygon: '0xc2132D05D31c914a87C6611C10748AEb04B58e8F',
+  avalanche: '0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7',
+};
+
+// Fail fast at boot on a malformed entry. This module loads with the server,
+// and a typo here does not crash anything visible — it silently tracks the
+// wrong contract, or (worse) mislabels and misprices a stranger's token as a
+// stablecoin. ethers.getAddress throws on bad length, non-hex characters, or a
+// broken EIP-55 checksum; the round-trip check additionally requires the stored
+// literal to be the canonical checksummed form.
+for (const [chain, addr] of Object.entries(USDT_BY_CHAIN)) {
+  let normalized;
+  try {
+    normalized = ethers.getAddress(addr);
+  } catch {
+    throw new Error(`USDT_BY_CHAIN.${chain} bukan alamat valid: ${addr}`);
+  }
+  if (normalized !== addr) {
+    throw new Error(`USDT_BY_CHAIN.${chain} checksum salah: ${addr} (harusnya ${normalized})`);
+  }
+}
+
+/**
+ * Symbol for a known contract ON A SPECIFIC CHAIN, so the table is not raw hex.
+ *
+ * Keyed by `chain:address`, never by address alone: contract addresses are
+ * chain-local, so the Ethereum USDT address on Base is an unrelated contract
+ * someone could deploy. Keyed by address alone it would be mislabelled USDT —
+ * and, with the $1 fallback in getEvmTokenValue, valued as if it were real.
+ */
+const KNOWN_SYMBOLS = new Map(
+  Object.entries(USDT_BY_CHAIN).map(([chain, addr]) => [`${chain}:${addr.toLowerCase()}`, 'USDT']),
+);
+
+/** Known symbol for `token` on `chain`, or null. Case-insensitive on the address. */
+export function knownSymbol(chain, token) {
+  return KNOWN_SYMBOLS.get(`${chain}:${String(token).toLowerCase()}`) ?? null;
+}
 const ZERO_ADDRESS = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'; // 1inch native sentinel
 const HEX_RE = /^0x[0-9a-fA-F]*$/;
 
@@ -292,33 +347,59 @@ export async function getEvmTokenBalance(address, token, chain = 'base') {
 /**
  * USD value of the wallet's ERC-20 holdings ONLY, excluding the native coin.
  *
- * Exposure is the risky part of a book: the ETH in the wallet is undeployed
- * cash and gas, not a position at risk. Counting it reports ~100% exposure on
- * a wallet holding nothing but ETH, which permanently blocks every new buy.
+ * Returns two numbers because callers need different things:
+ *  - `valueUsd`    — every holding, INCLUDING USDT. What the portfolio shows.
+ *  - `exposureUsd` — positions at risk only, EXCLUDING USDT. What the
+ *    autopilot's exposure gate reads.
+ *
+ * USDT is cash, not a position: it is the funding currency and the undeployed
+ * part of the book. Counting it as exposure reports ~100% on a wallet funded
+ * with USDT, which permanently blocks every new buy — the same failure the
+ * native-coin exclusion exists to prevent. The native coin stays out of both.
  *
  * `tokens` is the set to value — the caller's tracked/held tokens.
  */
 export async function getEvmTokenValue(address, chain = 'base', tokens = []) {
   const owner = assertAddress(address, 'address');
-  if (tokens.length === 0) return { valueUsd: 0, holdings: [] };
-  const markets = await dexscreener.tokens(tokens).catch(() => new Map());
+  // USDT always rides along: the tracked-position list only holds what the
+  // autopilot traded, so a wallet funded with USDT showed an empty table.
+  const always = USDT_BY_CHAIN[chain] ? [USDT_BY_CHAIN[chain]] : [];
+  const all = [...new Set([...always, ...tokens])];
+  if (all.length === 0) return { valueUsd: 0, exposureUsd: 0, holdings: [] };
+  const markets = await dexscreener.tokens(all).catch(() => new Map());
   let total = 0;
+  let exposure = 0;
   const holdings = [];
-  for (const token of tokens) {
+  for (const token of all) {
     const balance = await getEvmTokenBalance(owner, token, chain);
     if (balance === null || balance === 0n) continue;
     const decimals = await resolveTokenDecimals(token, chain);
     if (decimals === null) continue;
     const amount = Number(ethers.formatUnits(balance, decimals));
     const norm = markets.get(String(token).toLowerCase());
+    const symbol = knownSymbol(chain, token);
+    // A stablecoin is a dollar even when DexScreener has no pair for it — but
+    // only when the contract is THIS chain's known USDT (symbol is chain-scoped).
     const priceUsd = norm && norm.chainId === chain && Number(norm.priceUsd) > 0
       ? Number(norm.priceUsd)
-      : null;
+      : (symbol === 'USDT' ? 1 : null);
     const valueUsd = priceUsd !== null ? Math.round(amount * priceUsd * 100) / 100 : null;
     if (valueUsd !== null) total += valueUsd;
-    holdings.push({ token, amount, decimals, priceUsd, valueUsd });
+    holdings.push({
+      token,
+      symbol,
+      amount,
+      decimals,
+      priceUsd,
+      valueUsd,
+    });
+    if (symbol !== 'USDT' && valueUsd !== null) exposure += valueUsd;
   }
-  return { valueUsd: Math.round(total * 100) / 100, holdings };
+  return {
+    valueUsd: Math.round(total * 100) / 100,
+    exposureUsd: Math.round(exposure * 100) / 100,
+    holdings,
+  };
 }
 
 /** Total on-chain USD value: native coin + priced ERC-20 holdings. */

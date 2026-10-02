@@ -10,10 +10,12 @@ import { Modal } from './Modal';
 import { RealTradeForm } from './RealTradeForm';
 import { useEvmWallet } from './EvmWalletContext';
 import { IconAlert, IconLock } from './Icons';
-import { shortAddr } from '../lib/evm';
+import { shortAddr, chainKeyFromId, chainNameFromId, NATIVE_SYMBOL_BY_CHAIN } from '../lib/evm';
 
 interface Holding {
   token: string;
+  /** Known symbol (e.g. USDT), or null when the backend does not recognise it. */
+  symbol: string | null;
   amount: number;
   decimals: number;
   priceUsd: number | null;
@@ -23,35 +25,54 @@ interface Holding {
 /** Native coin below this cannot pay for an exit swap — the wallet is stuck. */
 const GAS_FLOOR = 0.005;
 
+/**
+ * The portfolio table shows USDT ONLY.
+ *
+ * USDT is the funding currency of this app: it is what the user sends in and
+ * what every trade is sized in, so a table of autopilot leftovers answered a
+ * question nobody asked. The backend still returns every holding (it needs them
+ * for exposure), and this view narrows to the one token the user tracks.
+ */
+const DISPLAY_SYMBOL = 'USDT';
+
 export function RealWalletPortfolio() {
   const { connected, isBound, address, chainId } = useEvmWallet();
-  const chain = 'base';
+  // Read the chain the wallet is ACTUALLY on, not a hardcoded default. Null
+  // when the chain has no backend support — the panel then refuses to load
+  // rather than showing Base balances as if they were the wallet's.
+  const chain = chainKeyFromId(chainId);
+  const nativeSymbol = chain ? (NATIVE_SYMBOL_BY_CHAIN[chain] ?? 'ETH') : 'ETH';
+  const chainLabel = chainNameFromId(chainId) ?? chainId ?? 'tidak dikenal';
 
   const [native, setNative] = useState<number | null>(null);
-  const [totalUsd, setTotalUsd] = useState<number | null>(null);
   const [holdings, setHoldings] = useState<Holding[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState('');
   const [swapOpen, setSwapOpen] = useState(false);
 
   const load = useCallback(async () => {
-    if (!connected || !address || !isBound) {
-      setNative(null); setHoldings([]); setTotalUsd(null); setLoading(false);
+    if (!connected || !address || !isBound || !chain) {
+      setNative(null); setHoldings([]); setLoading(false);
       return;
     }
     setLoading(true);
     try {
       const snap = await api.realPortfolio(chain);
       setNative(snap.native);
-      setTotalUsd(snap.totalUsd);
-      setHoldings([...snap.holdings].sort((a, b) => (b.valueUsd ?? 0) - (a.valueUsd ?? 0)));
+      setHoldings(snap.holdings.filter((h) => h.symbol === DISPLAY_SYMBOL));
       setErr('');
     } catch (e: unknown) {
       setErr(String((e as { message?: string })?.message ?? 'Gagal memuat saldo on-chain'));
     } finally {
       setLoading(false);
     }
-  }, [connected, address, isBound]);
+  }, [connected, address, isBound, chain]);
+
+  const usdt = holdings[0] ?? null;
+  // The backend omits zero-balance tokens, so a missing USDT row means "0
+  // USDT", not "unknown" — show 0 instead of an ellipsis that never resolves.
+  const usdtAmount = usdt?.amount ?? 0;
+  const usdtValue = usdt ? (usdt.valueUsd ?? usdt.amount) : null;
 
   useEffect(() => { load(); }, [load]);
 
@@ -106,25 +127,34 @@ export function RealWalletPortfolio() {
 
         <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 10, wordBreak: 'break-all' }}>
           {address ? shortAddr(address, 6) : '—'}
-          {chainId && chainId !== '0x2105' && (
-            <span style={{ color: 'var(--accent)' }}> · wallet di chain {chainId}, data di bawah untuk Base</span>
+          {chainId && !chain && (
+            <span style={{ color: 'var(--down)' }}> · chain {chainLabel} belum didukung — saldo tidak dimuat</span>
           )}
         </div>
 
+        {chainId && !chain && isBound && (
+          <div className="error" style={{ marginBottom: 14 }}>
+            <IconAlert size={13} /> Wallet kamu di {chainLabel}. Chain ini belum didukung backend —
+            ganti ke Base di MetaMask untuk melihat saldo dan melakukan swap.
+          </div>
+        )}
+
         <div className="kpi-grid">
           <div className="card kpi">
-            <div className="kpi-label">ETH (gas + trade)</div>
+            <div className="kpi-label">{nativeSymbol} (gas + trade)</div>
             <div className="kpi-value">{native === null ? '…' : native.toFixed(4)}</div>
             <div className="kpi-sub">
               {native !== null && native < GAS_FLOOR ? '⚠ di bawah biaya gas' : 'siap untuk transaksi'}
             </div>
           </div>
           <div className="card kpi">
-            <div className="kpi-label">Total Nilai</div>
+            <div className="kpi-label">USDT</div>
             <div className="kpi-value">
-              {totalUsd === null ? '…' : `$${totalUsd.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}
+              {loading || !isBound ? '…' : usdtAmount.toLocaleString(undefined, { maximumFractionDigits: 2 })}
             </div>
-            <div className="kpi-sub">{holdings.length} token on-chain</div>
+            <div className="kpi-sub">
+              {usdtValue === null ? 'belum ada USDT di wallet' : `≈ $${usdtValue.toFixed(2)}`}
+            </div>
           </div>
         </div>
 
@@ -142,7 +172,7 @@ export function RealWalletPortfolio() {
               <tbody>
                 {holdings.map((t) => (
                   <tr key={t.token}>
-                    <td><strong>{shortAddr(t.token, 4)}</strong></td>
+                    <td><strong>{t.symbol ?? shortAddr(t.token, 4)}</strong></td>
                     <td style={{ fontSize: 11, color: 'var(--muted)' }}>{shortAddr(t.token, 4)}</td>
                     <td className="num">{t.amount.toLocaleString(undefined, { maximumFractionDigits: 6 })}</td>
                     <td className="num">
@@ -155,9 +185,9 @@ export function RealWalletPortfolio() {
           </div>
         )}
 
-        {!loading && holdings.length === 0 && (
+        {!loading && isBound && holdings.length === 0 && (
           <div className="empty" style={{ marginTop: 12 }}>
-            Belum ada token ERC-20 di wallet ini. Kirim ETH ke alamat di atas untuk mulai trading.
+            Belum ada USDT di wallet ini. Kirim USDT ke alamat di atas — sisakan sedikit {nativeSymbol} untuk biaya gas.
           </div>
         )}
       </div>

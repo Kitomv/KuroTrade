@@ -1,7 +1,13 @@
-// Login page — registration is disabled (accounts are seeded from env on the
-// backend). Importers/callers: App.tsx. API: AUTH.login only.
-import { useState } from 'react';
+// Login page — two independent ways in: sign with a wallet, or use the
+// username/password seeded from the backend env. Importers/callers: App.tsx.
+// API: AUTH.login, AUTH.loginWalletChallenge, AUTH.loginWallet.
+//
+// The wallet path talks to window.ethereum directly through lib/evm.ts, which
+// is context-free — so this page needs no EvmWalletProvider (that one is
+// mounted only after login and is not available here).
+import { useEffect, useState } from 'react';
 import { AUTH } from '../api/client';
+import { hasInjectedWallet, requestAccounts, personalSign, subscribeProviders } from '../lib/evm';
 import { IconKey } from '../components/Icons';
 import { CardNeon } from '../components/CardNeon';
 
@@ -9,23 +15,64 @@ export function Login({ onLogin }: { onLogin: (username: string) => void }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [showPw, setShowPw] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<'password' | 'wallet' | null>(null);
   const [err, setErr] = useState('');
+  // Re-check on announce: the extension can be installed or enabled after this
+  // page mounted, and a button stuck on "not detected" until a reload is a
+  // dead end for the user.
+  const [walletAvailable, setWalletAvailable] = useState(() => hasInjectedWallet());
+  useEffect(() => subscribeProviders(() => setWalletAvailable(hasInjectedWallet())), []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!username.trim()) { setErr('Username wajib diisi'); return; }
     if (!password) { setErr('Password wajib diisi'); return; }
-    setBusy(true);
+    setBusy('password');
     setErr('');
     try {
       const res = await AUTH.login(username.trim(), password);
       localStorage.setItem('trading_token', res.token);
-      onLogin(res.username);
+      // Password login always has a username; the null branch is wallet-only.
+      onLogin(res.username ?? username.trim());
     } catch (ex: any) {
       setErr(ex.message ?? 'Login gagal');
     } finally {
-      setBusy(false);
+      setBusy(null);
+    }
+  };
+
+  const handleWalletLogin = async () => {
+    setBusy('wallet');
+    setErr('');
+    try {
+      const accounts = await requestAccounts();
+      const address = accounts[0];
+      if (!address) { setErr('Tidak ada akun di MetaMask'); return; }
+
+      const { message } = await AUTH.loginWalletChallenge(address);
+      const signature = await personalSign(message, address);
+      const res = await AUTH.loginWallet(address, signature);
+
+      localStorage.setItem('trading_token', res.token);
+      // A wallet-only account has no username; show the short address instead
+      // so the sidebar still has something to render.
+      onLogin(res.username ?? `${res.address.slice(0, 6)}…${res.address.slice(-4)}`);
+    } catch (ex: any) {
+      // MetaMask rejections arrive as opaque provider errors ("User rejected
+      // the request"), so translate the common one rather than showing it raw.
+      const raw = String(ex?.message ?? '');
+      setErr(
+        /user rejected|user denied|rejected the request/i.test(raw)
+          ? 'Signature dibatalkan di MetaMask'
+          // MetaMask's generic failure. Its usual cause is several wallet
+          // extensions competing for window.ethereum, which sends it down an
+          // extension-selection path that dies without naming the reason.
+          : /unexpected error/i.test(raw)
+            ? 'MetaMask gagal connect. Nonaktifkan ekstensi wallet lain (Rabby/Coinbase/Trust), lalu reload halaman ini.'
+            : raw || 'Login wallet gagal',
+      );
+    } finally {
+      setBusy(null);
     }
   };
 
@@ -70,14 +117,36 @@ export function Login({ onLogin }: { onLogin: (username: string) => void }) {
 
           {err && <div className="error" style={{ margin: 0 }}><IconKey size={14} /> {err}</div>}
 
-          <button type="submit" className="btn primary" style={{ minHeight: 46, width: '100%', fontWeight: 700 }} disabled={busy}>
-            {busy ? 'Melogin…' : 'Login'}
+          <button type="submit" className="btn primary" style={{ minHeight: 46, width: '100%', fontWeight: 700 }} disabled={busy !== null}>
+            {busy === 'password' ? 'Melogin…' : 'Login'}
           </button>
         </form>
 
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '18px 0' }}>
+          <span style={{ flex: 1, height: 1, background: 'var(--border)' }} />
+          <span style={{ fontSize: 11, color: 'var(--muted)' }}>atau</span>
+          <span style={{ flex: 1, height: 1, background: 'var(--border)' }} />
+        </div>
+
+        <button
+          type="button"
+          className="btn"
+          style={{ minHeight: 46, width: '100%', fontWeight: 700 }}
+          disabled={busy !== null || !walletAvailable}
+          onClick={handleWalletLogin}
+          title={walletAvailable ? 'Tanda tangan satu pesan untuk masuk' : 'Ekstensi MetaMask tidak terdeteksi'}
+        >
+          {busy === 'wallet' ? 'Menunggu MetaMask…' : 'Login dengan MetaMask'}
+        </button>
+        {!walletAvailable && (
+          <p style={{ color: 'var(--down)', fontSize: 11, marginTop: 8, textAlign: 'center' }}>
+            MetaMask tidak terdeteksi — install ekstensinya untuk memakai cara ini.
+          </p>
+        )}
+
         <p style={{ color: 'var(--muted)', fontSize: 12, marginTop: 16, textAlign: 'center', lineHeight: 1.5 }}>
-          Registrasi dinonaktifkan — tambah akun lewat <code>USER_USERNAME</code>/<code>USER_PASSWORD</code> di
-          <code> backend/.env</code>, lalu restart backend.
+          Login wallet membuat akun otomatis bila wallet-nya belum pernah dipakai. Akun berbasis password
+          tetap ditambah lewat <code>USER_USERNAME</code>/<code>USER_PASSWORD</code> di <code>backend/.env</code>.
         </p>
       </CardNeon>
     </div>

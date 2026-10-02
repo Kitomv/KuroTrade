@@ -8,6 +8,7 @@
 import { randomBytes, randomUUID } from 'crypto';
 import { loadUserState, touch, registerStateProvider } from './persistence.js';
 import { buildBindMessage, verifyEvmSignature } from './evmBind.js';
+import { findUserByAddress } from './auth.js';
 import { reducePositionAmount, addMirroredPosition, updatePositionMetadata } from './wallet.js';
 
 const INTENT_TTL_MS = 30 * 60 * 1000;
@@ -125,16 +126,46 @@ export function bindWallet(userId, address, signature) {
   }
   const message = buildBindMessage(userId, address, challenge.value);
   if (!verifyEvmSignature(address, message, signature)) throw new Error('Signature wallet tidak valid');
+  // One address, one account. Without this, the same wallet can be bound to
+  // several accounts and — now that a wallet can also log in — would resolve
+  // to whichever account happened to be found first.
+  const owner = findUserByAddress(address);
+  if (owner && owner.id !== userId) {
+    throw new Error('Wallet ini sudah terhubung ke akun lain');
+  }
   state.bindNonce = null; // single-use: a captured signature cannot be replayed
   state.boundWallet = address;
   touch(userId);
   return { bound: true, address };
 }
 
+/**
+ * Record a bound wallet WITHOUT the challenge/response dance.
+ *
+ * Only for a caller that has already proven control of the address by other
+ * means — currently the wallet login, where the EIP-191 signature over the
+ * login challenge is itself the proof. The interactive bind path
+ * (createBindChallenge + bindWallet) remains the only route for an
+ * already-authenticated user who has not signed anything yet.
+ */
+export function setBoundWallet(userId, address) {
+  const state = stateFor(userId);
+  state.boundWallet = String(address);
+  state.bindNonce = null;
+  touch(userId);
+  return { bound: true, address: state.boundWallet };
+}
+
 export function assertBoundWallet(userId, publicKey) {
   const bound = stateFor(userId).boundWallet;
   if (!bound) throw new Error('Wallet belum di-bind; sign message terlebih dahulu');
-  if (bound !== publicKey) throw new Error('Wallet tidak cocok dengan wallet yang di-bind');
+  // Compare case-insensitively. The bound address comes from recoverSigner()
+  // (checksummed) or from a wallet login, while the caller may send the
+  // all-lowercase form; a case-sensitive compare would refuse a legitimate
+  // swap from the user's own wallet.
+  if (String(bound).toLowerCase() !== String(publicKey).toLowerCase()) {
+    throw new Error('Wallet tidak cocok dengan wallet yang di-bind');
+  }
   return true;
 }
 

@@ -75,6 +75,45 @@ export function createUser(username, password) {
   return user;
 }
 
+/**
+ * Create a wallet-only account, with no password.
+ *
+ * Used by the MetaMask login flow: the address has already been proven by an
+ * EIP-191 signature, so there is no password to hash — and deliberately no
+ * salt/hash fields either, so a wallet-only account can never be the target
+ * of a password login. The address is stored lowercased as the canonical form.
+ */
+export function createUserWithAddress(address) {
+  const users = loadUsers();
+  const canonical = String(address).toLowerCase();
+  // Wallet login is idempotent by address: signing with a wallet that already
+  // has an account must never mint a second one.
+  const existing = users.find((u) => typeof u.address === 'string' && u.address === canonical);
+  if (existing) return existing;
+  const user = {
+    id: randomUUID(),
+    address: canonical,
+    username: null,
+    createdAt: Date.now(),
+  };
+  users.push(user);
+  saveUsers(users);
+  return user;
+}
+
+/**
+ * Find the account that owns `address`, or null.
+ *
+ * Compared lowercased: one EVM address has many valid checksum casings, so a
+ * case-sensitive match would silently fail to resolve a user who is already
+ * registered under a different casing.
+ */
+export function findUserByAddress(address) {
+  const canonical = String(address ?? '').toLowerCase();
+  if (!canonical) return null;
+  return loadUsers().find((u) => typeof u.address === 'string' && u.address === canonical) ?? null;
+}
+
 export function verifyUser(username, password) {
   const user = loadUsers().find((u) => u.username === username);
   // Always hash (decoy) so response timing does not reveal whether a username
@@ -118,7 +157,9 @@ export function changePassword(userId, currentPassword, newPassword) {
 
 /** Public user list for the leaderboard (no salt/hash). */
 export function listUsers() {
-  return loadUsers().map(({ id, username, createdAt }) => ({ id, username, createdAt }));
+  // `address` is included so a wallet-only account (which has no username) can
+  // still be identified in the leaderboard. Still no credential material.
+  return loadUsers().map(({ id, username, address, createdAt }) => ({ id, username, address, createdAt }));
 }
 
 // --- Sessions (persisted to data/sessions.json) ---

@@ -405,7 +405,14 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 export interface LoginResult {
   token: string;
   userId: string;
-  username: string;
+  /** null for a wallet-only account, which has no username. */
+  username: string | null;
+}
+
+export interface WalletLoginResult extends LoginResult {
+  address: string;
+  /** True when this sign provisioned the account (first time this wallet is seen). */
+  isNewUser: boolean;
 }
 
 export const AUTH = {
@@ -415,8 +422,18 @@ export const AUTH = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
     }),
+  /** Single-use challenge to sign. Pre-auth, so it carries no bearer token. */
+  loginWalletChallenge: (address: string) =>
+    req<{ message: string }>(`/api/login/wallet/challenge?address=${encodeURIComponent(address)}`),
+  /** Exchange a signature over that challenge for a session token. */
+  loginWallet: (address: string, signature: string) =>
+    req<WalletLoginResult>('/api/login/wallet', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ address, signature }),
+    }),
   logout: () => req<{ ok: boolean }>('/api/logout', { method: 'POST' }),
-  me: () => req<{ userId: string; username: string; wallet: Wallet }>('/api/me'),
+  me: () => req<{ userId: string; username: string; address?: string; wallet: Wallet }>('/api/me'),
   changePassword: (currentPassword: string, newPassword: string) =>
     req<{ ok: boolean }>('/api/change-password', {
       method: 'POST',
@@ -609,6 +626,6 @@ export const api = {
     req<{
       address: string; chain: string; native: number; nativeUsd: number | null;
       tokenValueUsd: number; totalUsd: number | null;
-      holdings: { token: string; amount: number; decimals: number; priceUsd: number | null; valueUsd: number | null }[];
+      holdings: { token: string; symbol: string | null; amount: number; decimals: number; priceUsd: number | null; valueUsd: number | null }[];
     }>(`/api/real/portfolio?chain=${encodeURIComponent(chain)}`),
 };

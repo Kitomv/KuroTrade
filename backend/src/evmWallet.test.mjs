@@ -4,7 +4,11 @@
 // Run: node --test backend/src/evmWallet.test.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isAllowedRouter, isSupportedChain, checkTradeSize, listEvmChains } from './evmWallet.js';
+import { ethers } from 'ethers';
+import {
+  isAllowedRouter, isSupportedChain, checkTradeSize, listEvmChains,
+  USDT_BY_CHAIN, knownSymbol,
+} from './evmWallet.js';
 
 const ROUTER = '0x111111125421cA6dc452d289314280a0f8842A65';
 const ATTACKER = '0x00000000000000000000000000000000deadbeef';
@@ -59,4 +63,29 @@ test('trade size cap rejects zero, negative, NaN and oversized amounts', () => {
   const over = checkTradeSize(500);
   assert.equal(over.ok, false);
   assert.equal(over.cap, 50);
+});
+
+test('every USDT address is a canonical checksummed address for a supported chain', () => {
+  // A typo here is silent: it tracks the wrong contract or mislabels a
+  // stranger's token as a $1 stablecoin. The boot-time guard in evmWallet.js
+  // throws on the same condition, and this pins it so a regression fails CI.
+  for (const [chain, addr] of Object.entries(USDT_BY_CHAIN)) {
+    assert.equal(isSupportedChain(chain), true, `${chain} should be a supported chain`);
+    assert.equal(ethers.getAddress(addr), addr, `${chain} must round-trip through getAddress`);
+  }
+  // One address per chain — no accidental copy-paste between two entries.
+  const seen = new Set(Object.values(USDT_BY_CHAIN).map((a) => a.toLowerCase()));
+  assert.equal(seen.size, Object.keys(USDT_BY_CHAIN).length, 'addresses must be unique');
+});
+
+test('knownSymbol is chain-scoped: a USDT address on the wrong chain is not USDT', () => {
+  const baseUsdt = USDT_BY_CHAIN.base;
+  assert.equal(knownSymbol('base', baseUsdt), 'USDT');
+  // Case-insensitive on the address, but never chain-blind: the same literal
+  // on another chain is a different contract and must NOT resolve.
+  assert.equal(knownSymbol('base', baseUsdt.toUpperCase().replace('0X', '0x')), 'USDT');
+  assert.equal(knownSymbol('ethereum', baseUsdt), null);
+  assert.equal(knownSymbol('unknown-chain', baseUsdt), null);
+  assert.equal(knownSymbol('base', '0x00000000000000000000000000000000deadbeef'), null);
+  assert.equal(knownSymbol('base', null), null);
 });

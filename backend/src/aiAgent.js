@@ -63,6 +63,9 @@ const AUDIT_TTL = 30_000;
 // immediately AND refreshed in the background. The guardian tick NEVER awaits
 // the LLM; it gets a stale-but-usable report, while a background task refreshes.
 const AUDIT_STALE_TTL = 10 * 60_000;
+// How long the scout skips a token after an exit fires on it. Stops the
+// autopilot buying straight back into something it just stopped out on.
+const SL_COOLDOWN_MS = 60_000;
 
 /**
  * Run `fn` over `items` with at most `limit` in flight. Preserves input order
@@ -1227,11 +1230,11 @@ async function getCachedAudit(userId, tokenAddress, { allowBlocking = true } = {
   return report;
 }
 
-/** Mark a token as SL-cooldown: scout skips it for 30 minutes. */
+/** Mark a token as SL-cooldown: scout skips it for SL_COOLDOWN_MS. */
 function setSlCooldown(userId, tokenAddress) {
   const st = stateFor(userId);
   if (!st.slCooldowns) st.slCooldowns = {};
-  st.slCooldowns[tokenAddress] = Date.now() + 30 * 60_000;
+  st.slCooldowns[tokenAddress] = Date.now() + SL_COOLDOWN_MS;
   saveUserState(userId);
 }
 

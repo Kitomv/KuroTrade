@@ -163,8 +163,25 @@ export function getChainConfig(chain = 'base') {
   return cfg;
 }
 
+/**
+ * RPC provider for `chain`.
+ *
+ * The network is declared up front (`new Network(name, chainId)` +
+ * `staticNetwork: true`) rather than auto-detected. With auto-detection, an
+ * unreachable endpoint makes ethers retry "failed to detect network" once a
+ * second FOREVER — and every provider this module hands out is short-lived,
+ * so a single dead RPC (eth.llamarpc.com and polygon-rpc.com both answer 401
+ * from this machine) produced a permanent log flood that also burned CPU.
+ * Declaring the network skips detection entirely: the call fails once and
+ * that is the end of it.
+ *
+ * Callers MUST destroy() the provider when done — this returns a fresh
+ * instance, not a shared one, so a leaked reference keeps its sockets open.
+ */
 export function getProvider(chain = 'base') {
-  return new ethers.JsonRpcProvider(getChainConfig(chain).rpc());
+  const cfg = getChainConfig(chain);
+  const network = new ethers.Network(chain, cfg.chainId);
+  return new ethers.JsonRpcProvider(cfg.rpc(), network, { staticNetwork: true });
 }
 
 /** The wallet this user bound for real trading (MetaMask address, or null). */
@@ -306,8 +323,9 @@ export async function resolveTokenDecimals(token, chain = 'base') {
   const key = `${chain}:${addr.toLowerCase()}`;
   const hit = decimalsCache.get(key);
   if (hit && Date.now() - hit.at < DECIMALS_TTL_MS) return hit.decimals;
+  const provider = getProvider(chain);
   try {
-    const contract = new ethers.Contract(addr, ERC20_ABI, getProvider(chain));
+    const contract = new ethers.Contract(addr, ERC20_ABI, provider);
     const decimals = Number(await contract.decimals());
     if (Number.isInteger(decimals) && decimals >= 0 && decimals <= 36) {
       // Evict the oldest entry first so the cap is never exceeded.
@@ -320,13 +338,22 @@ export async function resolveTokenDecimals(token, chain = 'base') {
     }
   } catch {
     // non-contract address or RPC failure — both land here
+  } finally {
+    // Short-lived provider: without destroy() a failed endpoint keeps its
+    // sockets and timers alive after the call has already given up.
+    provider.destroy();
   }
   return null;
 }
 
 /** Native balance in wei. */
 export async function getEvmBalance(address, chain = 'base') {
-  return getProvider(chain).getBalance(assertAddress(address, 'address'));
+  const provider = getProvider(chain);
+  try {
+    return await provider.getBalance(assertAddress(address, 'address'));
+  } finally {
+    provider.destroy();
+  }
 }
 
 /** Native balance in human units (ETH, not wei). */
@@ -336,11 +363,14 @@ export async function getEvmBalanceNative(address, chain = 'base') {
 
 /** ERC-20 balance in atomic units, or null when the contract does not answer. */
 export async function getEvmTokenBalance(address, token, chain = 'base') {
+  const provider = getProvider(chain);
   try {
-    const contract = new ethers.Contract(assertAddress(token, 'token'), ERC20_ABI, getProvider(chain));
+    const contract = new ethers.Contract(assertAddress(token, 'token'), ERC20_ABI, provider);
     return BigInt(await contract.balanceOf(assertAddress(address, 'address')));
   } catch {
     return null;
+  } finally {
+    provider.destroy();
   }
 }
 

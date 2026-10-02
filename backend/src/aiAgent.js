@@ -48,7 +48,19 @@ const DEFAULT_AUTOPILOT = () => ({
   logs: [],
   guardedPositions: [],
   pnlHistory: [],
-  signalHistory: [],  // [{ ts, symbol, address, signal, confidence, entryPrice, bull, bear, llmPowered, price1h?, price24h? }]
+  // Rolling display buffer for the radar UI. NOT the accuracy source: it turns
+  // over in ~3 minutes (5 signals/scan × 5s tick ÷ 200 entries), so a signal
+  // is evicted long before its 1h/24h outcome can be measured. Accuracy reads
+  // pendingSignals + signalStats instead.
+  signalHistory: [],  // [{ ts, symbol, address, chainId, signal, confidence, entryPrice, bull, bear, llmPowered }]
+  // Signals still awaiting their 1h/24h price check. Pruned by AGE (25h), not
+  // by count, so an outcome is never lost to buffer rotation. Capped as a
+  // safety valve; the age prune is what keeps it small in practice.
+  pendingSignals: [], // [{ ts, symbol, address, chainId, signal, confidence, entryPrice, kind: 'signal'|'nearMiss', reason?, price1h?, price24h? }]
+  // Incremental accuracy aggregate, updated as outcomes complete. Survives
+  // restarts and does not grow unbounded — this is what the agents calibrate
+  // against and what the UI displays.
+  signalStats: { bySignal: {}, byChain: {}, totals: { n1h: 0, win1h: 0, n24h: 0, win24h: 0 } },
   slCooldowns: {},    // tokenAddress -> untilTs (skip scout after a stop-loss)
   memory: [],         // decision memory: [{ ts, symbol, signal, confidence, entryPrice, outcomePct, regime, chainId, exitReason, holdMs, ... }]
   nearMisses: [],     // strong signals skipped by constraints: [{ ts, symbol, address, chainId, signal, confidence, entryPrice, reason }]
@@ -66,6 +78,22 @@ const AUDIT_STALE_TTL = 10 * 60_000;
 // How long the scout skips a token after an exit fires on it. Stops the
 // autopilot buying straight back into something it just stopped out on.
 const SL_COOLDOWN_MS = 60_000;
+// Consecutive 5s ticks with no market data before a held position is flagged
+// stale (72 ticks ≈ 6 minutes). Long enough that a transient DexScreener gap
+// does not trip it, short enough that a dead bag stops blocking slots.
+const STALE_POSITION_TICKS = 72;
+
+/**
+ * Is this the all-zero EVM address?
+ *
+ * A zero-address "token" can never resolve on DexScreener and can never be
+ * swapped, but the pipeline has admitted one before: a live ETH position sits
+ * at 0x0000…0000, bought and then never marked to market because no market
+ * data will ever exist for it.
+ */
+function isZeroAddress(addr) {
+  return String(addr ?? '').toLowerCase() === '0x0000000000000000000000000000000000000000';
+}
 
 /**
  * Run `fn` over `items` with at most `limit` in flight. Preserves input order
@@ -214,6 +242,21 @@ export function initAutopilot(userId) {
     Object.assign(base, saved.autopilot);
     if (!saved.autopilot.stats) base.stats = DEFAULT_AUTOPILOT().stats;
     if (!Array.isArray(saved.autopilot.pnlHistory)) base.pnlHistory = [];
+    // Fields added after the first release: a save from before them must get
+    // the default, not `undefined`. A missing pendingSignals would crash the
+    // outcome tracker, and a missing signalStats would silently disable
+    // calibration for an account that predates the split.
+    if (!Array.isArray(base.pendingSignals)) base.pendingSignals = [];
+    if (!base.signalStats || typeof base.signalStats !== 'object') {
+      base.signalStats = DEFAULT_AUTOPILOT().signalStats;
+    } else {
+      // Partial-shape repair: the aggregate must always have the buckets the
+      // outcome writer touches.
+      const d = DEFAULT_AUTOPILOT().signalStats;
+      base.signalStats.bySignal ??= {};
+      base.signalStats.byChain ??= {};
+      base.signalStats.totals ??= { ...d.totals };
+    }
     autopilotStates.set(userId, base);
   }
 }
@@ -229,7 +272,8 @@ registerStateProvider((userId) => {
     enabled, riskLevel, minConfidence, takeProfitPct, stopLossPct, trailingStopPct,
     trailingTriggerPct, moonbagX, maxOpenPositions, rotateAfterHours, maxExposurePct, agentMode,
     llmTemperature, llmTimeoutMs, scanConcurrency, enableLeadSynthesis,
-    signalHistory, slCooldowns, memory, nearMisses, stats, pnlHistory, recordedExits,
+    signalHistory, pendingSignals, signalStats, slCooldowns, memory, nearMisses,
+    stats, pnlHistory, recordedExits,
   } = st;
   return {
     autopilot: {
@@ -237,6 +281,11 @@ registerStateProvider((userId) => {
       trailingTriggerPct, moonbagX, maxOpenPositions, rotateAfterHours, maxExposurePct, agentMode,
       llmTemperature, llmTimeoutMs, scanConcurrency, enableLeadSynthesis,
       signalHistory: (signalHistory ?? []).slice(0, 200),
+      // The accuracy pipeline is persisted in full: these are small, bounded,
+      // and losing them on restart would blind the agents' calibration until
+      // the next outcome completes (which can be 24h away).
+      pendingSignals: (pendingSignals ?? []).slice(0, 500),
+      signalStats: signalStats ?? DEFAULT_AUTOPILOT().signalStats,
       slCooldowns,
       memory: (memory ?? []).slice(0, 50),
       nearMisses: (nearMisses ?? []).slice(0, 30),
@@ -550,11 +599,16 @@ export async function scanMarketSignals(userId, limit = 10, opts = {}) {
     // Record signal history (max 200 per user)
     const st = stateFor(userId);
     if (!st.signalHistory) st.signalHistory = [];
+    if (!Array.isArray(st.pendingSignals)) st.pendingSignals = [];
+    const nowTs = Date.now();
     for (const r of sorted) {
+      // The display buffer: capped at 200, feeds the radar. It rotates in
+      // ~3 minutes, which is fine for display and useless for accuracy.
       st.signalHistory.unshift({
-        ts: Date.now(),
+        ts: nowTs,
         symbol: r.token.symbol,
         address: r.token.address,
+        chainId: r.token.chainId,
         signal: r.verdict.signal,
         confidence: r.verdict.confidence,
         entryPrice: r.verdict.entryPrice,
@@ -562,8 +616,26 @@ export async function scanMarketSignals(userId, limit = 10, opts = {}) {
         bear: { score: r.agents.bear.score, risks: r.agents.bear.risks },
         llmPowered: r.llmPowered ?? false,
       });
+      // The outcome queue: age-pruned, so the 1h/24h check still has the entry
+      // when it comes due. Without this the accuracy pipeline is dead — every
+      // signal was evicted from the 200-entry buffer before its outcome could
+      // be measured (0 of 200 had a price recorded).
+      st.pendingSignals.unshift({
+        ts: nowTs,
+        symbol: r.token.symbol,
+        address: r.token.address,
+        chainId: r.token.chainId,
+        signal: r.verdict.signal,
+        confidence: r.verdict.confidence,
+        entryPrice: r.verdict.entryPrice,
+        kind: 'signal',
+      });
     }
     if (st.signalHistory.length > 200) st.signalHistory.length = 200;
+    // Safety valve only — the age prune in updateSignalOutcomes is what keeps
+    // this small. 500 covers ~25h at the observed ~600 signals/hour, so a
+    // backlog from a stalled prune cannot grow without bound.
+    if (st.pendingSignals.length > 500) st.pendingSignals.length = 500;
     // Persist signalHistory + slCooldowns + autopilot config via saveUserState
     saveUserState(userId);
 
@@ -637,11 +709,18 @@ export function getAutopilot(userId) {
     const tpPrice = avg * (1 + (st.takeProfitPct ?? 15) / 100);
     const slPrice = avg * (1 - (st.stopLossPct ?? 7) / 100);
     const high = Number(p.highestPrice) || cur;
+    const low = Number(p.lowestPrice) || cur;
     const peakPct = avg > 0 ? ((high - avg) / avg) * 100 : 0;
     const isTrailing = peakPct >= (st.trailingTriggerPct ?? 6);
+    // Worst drawdown seen while held: the realized-risk counterpart to the
+    // peak. A position that traded at -30% is a risk breach even if it
+    // recovered — the stop did not hold and the sizing assumed it would.
+    const drawdownPct = avg > 0 ? ((low - avg) / avg) * 100 : 0;
+    const riskBreach = drawdownPct < -(st.stopLossPct ?? 7) * 1.5;
 
     let status = 'GUARDED';
-    if (p.tp1Hit) status = 'MOONBAG_RUNNER';
+    if (p.stale) status = 'STALE';
+    else if (p.tp1Hit) status = 'MOONBAG_RUNNER';
     else if (isTrailing) status = 'TRAILING_ACTIVE';
     else if (pnlPct >= (st.takeProfitPct ?? 15)) status = 'TP_TRIGGER';
     else if (pnlPct <= -(st.stopLossPct ?? 7)) status = 'SL_TRIGGER';
@@ -649,8 +728,10 @@ export function getAutopilot(userId) {
     return {
       symbol: p.symbol, address: p.tokenAddress, chainId: p.chainId,
       amount: Number(p.amount) || 0, avgBuyPrice: avg, currentPrice: cur,
-      highestPrice: high, tp1Hit: Boolean(p.tp1Hit),
+      highestPrice: high, lowestPrice: low, tp1Hit: Boolean(p.tp1Hit),
       pnlUsd: Math.round(pnlUsd * 100) / 100, pnlPct: Math.round(pnlPct * 100) / 100,
+      drawdownPct: Math.round(drawdownPct * 100) / 100,
+      riskBreach, stale: Boolean(p.stale), missingTicks: Number(p.missingTicks) || 0,
       tpPrice, slPrice, status,
     };
   });
@@ -757,7 +838,31 @@ export async function runAutopilotTick(userId) {
   for (const pos of positions) {
     try {
       const market = markets.get(pos.tokenAddress.toLowerCase());
-      if (!market || !market.priceUsd) continue;
+      if (!market || !market.priceUsd) {
+        // A held token with no DexScreener data: delisted, rugged, or simply
+        // missing from the index. The old `continue` skipped it forever — the
+        // position was never exited, never flagged, and its capital was
+        // silently locked. Two live positions (SI, BI) are in exactly this
+        // state. Count consecutive misses and flag the position once the
+        // window closes; do NOT auto-sell (the token may just be missing from
+        // the index), so the user decides.
+        const misses = (Number(pos.missingTicks) || 0) + 1;
+        updatePositionMetadata(userId, pos.tokenAddress, { missingTicks: misses });
+        if (misses === STALE_POSITION_TICKS) {
+          updatePositionMetadata(userId, pos.tokenAddress, { stale: true });
+          addLog(userId, 'WARN', `⚠️ ${pos.symbol}: tidak ada data pasar ${Math.round((STALE_POSITION_TICKS * 5) / 60)} menit berturut-turut — posisi ditandai STALE dan tidak lagi memblokir slot baru. Cek manual: token mungkin delisted/rugpull.`, {
+            tokenAddress: pos.tokenAddress,
+            chainId: pos.chainId,
+            amount: pos.amount,
+          });
+        }
+        continue;
+      }
+      // Market is back: clear the stale markers so a temporary index outage
+      // does not permanently sideline a healthy position.
+      if (pos.missingTicks || pos.stale) {
+        updatePositionMetadata(userId, pos.tokenAddress, { missingTicks: 0, stale: false });
+      }
 
       const curPrice = Number(market.priceUsd);
       // DexScreener data is external input; skip a corrupt tick before it can
@@ -774,6 +879,12 @@ export async function runAutopilotTick(userId) {
       const prevHigh = Number(pos.highestPrice) || avgPrice;
       const highPrice = Math.max(prevHigh, curPrice);
       if (highPrice > prevHigh) updatePositionMetadata(userId, pos.tokenAddress, { highestPrice: highPrice });
+      // Track the worst drawdown too: a position that traded at -30% is a
+      // risk breach even if it recovered, and without this the risk model has
+      // no way to see that its stop did not hold.
+      const prevLow = Number(pos.lowestPrice) || avgPrice;
+      const lowPrice = Math.min(prevLow, curPrice);
+      if (lowPrice < prevLow) updatePositionMetadata(userId, pos.tokenAddress, { lowestPrice: lowPrice });
 
       const trailingStopPct = st.trailingStopPct ?? 4;
       const trailingTriggerPct = st.trailingTriggerPct ?? 6;
@@ -909,7 +1020,19 @@ export async function runAutopilotTick(userId) {
 
       // 4. Hard stop loss
       if (pnlPct <= -(st.stopLossPct ?? 7)) {
-        const exit = await sellAll('SL', `🛑 [STOP LOSS ${pnlPct.toFixed(1)}%] Auto-cut ${pos.symbol} @ $${curPrice} (Loss -$${Math.abs(pnlUsd).toFixed(2)} USDC)`, curPrice);
+        // Gap detection: the stop is a threshold, not a guaranteed fill. A
+        // meme token can gap far past it between ticks, so the realized loss
+        // can be a multiple of the configured risk. Measured on the live
+        // account: stopLossPct 7, worst realized exit -32.5% — the risk model
+        // assumed a 7% cap it never delivered. Log the gap explicitly so the
+        // slippage between intent and outcome is visible instead of silent.
+        const configured = st.stopLossPct ?? 7;
+        const gapped = pnlPct < -(configured * 1.5);
+        const tag = gapped ? 'SL_GAP' : 'SL';
+        const msg = gapped
+          ? `🛑 [STOP LOSS GAP ${pnlPct.toFixed(1)}%] ${pos.symbol} @ $${curPrice} — jauh melewati SL ${configured}% (Loss -$${Math.abs(pnlUsd).toFixed(2)}). Risiko nyata lebih besar dari setelan; pertimbangkan turunkan ukuran posisi.`
+          : `🛑 [STOP LOSS ${pnlPct.toFixed(1)}%] Auto-cut ${pos.symbol} @ $${curPrice} (Loss -$${Math.abs(pnlUsd).toFixed(2)} USDC)`;
+        const exit = await sellAll(tag, msg, curPrice);
         if (exit?.executed) setSlCooldown(userId, pos.tokenAddress);
         continue;
       }
@@ -945,13 +1068,17 @@ export async function runAutopilotTick(userId) {
 async function runScoutPhase(userId, st, { markets, positions, wallet }) {
   // Phase 2: scout for new buys (signal quality + exposure/correlation guards)
   st.status = 'SCANNING';
-  const currentOpenPositions = getPositions(userId).length;
+  // A STALE position (no market data for ~6 min — delisted or rugged) does not
+  // count toward the slot cap. Otherwise a dead bag blocks every new trade
+  // forever, which is the state two live positions were found in.
+  const livePositions = getPositions(userId).filter((p) => !p.stale);
+  const currentOpenPositions = livePositions.length;
   const slotsFull = currentOpenPositions >= (st.maxOpenPositions ?? 3);
   if (slotsFull) {
     // Slot full → try rotation of a stagnant position to free capacity.
     // Reuses the tick's price snapshot — no extra DexScreener round-trip.
     await rotateStagnant(userId, markets);
-    if (getPositions(userId).length >= (st.maxOpenPositions ?? 3)) {
+    if (getPositions(userId).filter((p) => !p.stale).length >= (st.maxOpenPositions ?? 3)) {
       addLog(userId, 'SCAN', `Slot posisi penuh (${currentOpenPositions}/${st.maxOpenPositions}). Guardian tetap aktif memantau.`);
       st.status = 'IDLE';
       return { executed: false, reason: 'MAX_POSITIONS' };
@@ -1060,6 +1187,15 @@ async function runScoutPhase(userId, st, { markets, positions, wallet }) {
 
       // Real-wallet mode: emit intent for the user to approve in MetaMask.
       if (isRealMode(userId)) {
+        // The zero address can never resolve on DexScreener and can never be
+        // swapped. An intent for it sits unpriceable forever — a live position
+        // (ETH) is stuck in exactly this state, bought at the zero address and
+        // never marked to market since.
+        if (isZeroAddress(token.address)) {
+          addLog(userId, 'WARN', `⚠️ [${verdict.signal} REAL] ${token.symbol}: alamat token tidak valid (zero address) — intent tidak dibuat`, { tokenAddress: token.address });
+          st.status = 'IDLE';
+          return { executed: false, reason: 'INVALID_TOKEN_ADDRESS' };
+        }
         // EVM-only execution. A non-EVM token can never be filled — 1inch has
         // no Solana route — so emitting it would strand an 'open' intent and
         // block this token's dedup. Defense-in-depth behind passesPreFilter
@@ -1190,27 +1326,106 @@ async function runScoutPhase(userId, st, { markets, positions, wallet }) {
 }
 
 /**
- * Update signal outcomes: for history entries older than 1h/24h that lack a
- * price snapshot, batch-fetch prices and fill price1h/price24h.
+ * Update signal outcomes: for pending entries older than 1h/24h that lack a
+ * price snapshot, batch-fetch prices, fill price1h/price24h, then fold the
+ * completed entry into the accuracy aggregate and drop it.
+ *
+ * Reads `pendingSignals`, NOT `signalHistory`. The display buffer rotates in
+ * ~3 minutes (200 entries ÷ ~5 per scan ÷ a 5s tick), so reading it meant no
+ * signal ever survived to its 1h check — 0 of 200 entries had an outcome and
+ * the agents' calibration block was permanently empty.
+ *
+ * An entry is dropped once BOTH prices are recorded, or when it is older than
+ * 25h (the 24h check can never come due after that, and an unresolved token is
+ * usually delisted — retrying it forever would pin the queue).
  */
+export const SIGNAL_PRUNE_MS = 25 * 3_600_000;
+const SIGNAL_1H_MS = 3_600_000;
+const SIGNAL_24H_MS = 24 * 3_600_000;
+
 async function updateSignalOutcomes(userId) {
   const st = stateFor(userId);
-  const hist = st.signalHistory ?? [];
+  if (!Array.isArray(st.pendingSignals)) st.pendingSignals = [];
   const now = Date.now();
-  const pending = hist.filter((h) =>
-    (!h.price1h && now - h.ts >= 3_600_000) ||
-    (!h.price24h && now - h.ts >= 24 * 3_600_000),
+  const due = st.pendingSignals.filter((h) =>
+    (!h.price1h && now - h.ts >= SIGNAL_1H_MS) ||
+    (!h.price24h && now - h.ts >= SIGNAL_24H_MS),
   );
-  if (pending.length === 0) return;
-  const markets = await dexscreener.tokens([...new Set(pending.map((h) => h.address))]).catch(() => new Map());
-  let changed = false;
-  for (const h of pending) {
-    const m = markets.get(h.address.toLowerCase());
-    if (!m?.priceUsd) continue;
-    if (!h.price1h && now - h.ts >= 3_600_000) { h.price1h = m.priceUsd; changed = true; }
-    if (!h.price24h && now - h.ts >= 24 * 3_600_000) { h.price24h = m.priceUsd; changed = true; }
+  // Drop entries whose window has fully closed, whether or not a price was
+  // ever resolved. A token that vanished from DexScreener must not sit in the
+  // queue for the life of the account.
+  const expired = (h) => now - h.ts > SIGNAL_PRUNE_MS;
+  if (due.length === 0 && !st.pendingSignals.some(expired)) return;
+
+  const markets = due.length > 0
+    ? await dexscreener.tokens([...new Set(due.map((h) => h.address))]).catch(() => new Map())
+    : new Map();
+
+  for (const h of due) {
+    const m = markets.get(String(h.address).toLowerCase());
+    if (m?.priceUsd) {
+      if (!h.price1h && now - h.ts >= SIGNAL_1H_MS) h.price1h = m.priceUsd;
+      if (!h.price24h && now - h.ts >= SIGNAL_24H_MS) h.price24h = m.priceUsd;
+    }
+    // Fold into the aggregate as soon as an outcome exists; the entry is then
+    // done and is dropped by the filter below.
+    recordSignalOutcome(st, h);
   }
-  if (changed) saveUserState(userId);
+
+  const before = st.pendingSignals.length;
+  st.pendingSignals = st.pendingSignals.filter((h) => {
+    if (expired(h)) return false;
+    const done = h.price1h && (h.price24h || now - h.ts > SIGNAL_24H_MS);
+    return !done;
+  });
+  if (before !== st.pendingSignals.length || due.length > 0) saveUserState(userId);
+}
+
+/**
+ * Fold one completed outcome into the incremental aggregate.
+ *
+ * Idempotent by construction: a '1h' fold only happens once (the entry is
+ * dropped right after) and the caller only passes entries that just gained a
+ * price. `kind` separates real signals from near-misses so a skipped BUY can
+ * be audited — "you skipped N tokens that would have won".
+ *
+ * Exported for tests: the accuracy pipeline is the fix for a silent
+ * regression (0 of 200 signals ever got an outcome), so it must be pinnable.
+ */
+export function recordSignalOutcome(st, h) {
+  if (!st.signalStats) st.signalStats = DEFAULT_AUTOPILOT().signalStats;
+  const { signalStats } = st;
+  signalStats.bySignal ??= {};
+  signalStats.byChain ??= {};
+  signalStats.totals ??= { n1h: 0, win1h: 0, n24h: 0, win24h: 0 };
+
+  const entry = Number(h.entryPrice);
+  if (!Number.isFinite(entry) || entry <= 0) return;
+  const isWin = (price) => {
+    const p = Number(price);
+    if (!Number.isFinite(p) || p <= 0) return null;
+    // A BUY call is right when price rose; a SELL call is right when it fell.
+    return String(h.signal).includes('BUY') ? p > entry : String(h.signal) === 'SELL' ? p < entry : null;
+  };
+
+  const sigKey = h.kind === 'nearMiss' ? `NEAR_MISS:${h.signal}` : h.signal;
+  const chainKey = h.chainId ?? 'unknown';
+  const buckets = [
+    signalStats.totals,
+    (signalStats.bySignal[sigKey] ??= { n1h: 0, win1h: 0, n24h: 0, win24h: 0 }),
+    (signalStats.byChain[chainKey] ??= { n1h: 0, win1h: 0, n24h: 0, win24h: 0 }),
+  ];
+
+  const w1 = isWin(h.price1h);
+  const w24 = isWin(h.price24h);
+  if (w1 !== null && !h._folded1h) {
+    for (const b of buckets) { b.n1h++; if (w1) b.win1h++; }
+    h._folded1h = true;
+  }
+  if (w24 !== null && !h._folded24h) {
+    for (const b of buckets) { b.n24h++; if (w24) b.win24h++; }
+    h._folded24h = true;
+  }
 }
 
 
@@ -1309,10 +1524,12 @@ function hasPendingBuyIntent(userId, tokenAddress) {
 function recordNearMiss(userId, s, reason) {
   const st = stateFor(userId);
   if (!st.nearMisses) st.nearMisses = [];
+  if (!Array.isArray(st.pendingSignals)) st.pendingSignals = [];
   const dup = st.nearMisses.find((m) => m.address === s.token.address && Date.now() - m.ts < 600_000);
   if (dup) return;
+  const ts = Date.now();
   st.nearMisses.unshift({
-    ts: Date.now(),
+    ts,
     symbol: s.token.symbol,
     address: s.token.address,
     chainId: s.token.chainId,
@@ -1322,6 +1539,22 @@ function recordNearMiss(userId, s, reason) {
     reason,
   });
   if (st.nearMisses.length > 30) st.nearMisses.length = 30;
+  // Track the skipped signal's outcome too, so the audit can answer "was
+  // skipping this a good decision?" — the honest counterweight to a high skip
+  // rate. Recorded with kind 'nearMiss' so it never pollutes the accuracy of
+  // signals we actually acted on.
+  st.pendingSignals.unshift({
+    ts,
+    symbol: s.token.symbol,
+    address: s.token.address,
+    chainId: s.token.chainId,
+    signal: s.verdict.signal,
+    confidence: s.verdict.confidence,
+    entryPrice: s.verdict.entryPrice,
+    kind: 'nearMiss',
+    reason,
+  });
+  if (st.pendingSignals.length > 500) st.pendingSignals.length = 500;
 }
 
 /**

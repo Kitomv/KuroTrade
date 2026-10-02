@@ -27,16 +27,34 @@ export function MemoryInspector({ ap }: { ap: AutopilotConfig }) {
         </span>
       </div>
 
-      {/* Calibration strip from signalAccuracy */}
+      {/* Calibration strip from signalAccuracy. Reads the incremental aggregate
+          (not the rolling display buffer), so these numbers are real — before
+          the fix the buffer rotated in ~3 minutes while outcomes are measured
+          at 1h/24h, and this strip showed "—" forever. */}
       {acc && (acc.acc1h !== null || acc.acc24h !== null) && (
-        <div style={{ padding: '10px 20px', borderBottom: '1px solid var(--border)', fontSize: 12, color: 'var(--muted)', lineHeight: 1.6 }}>
-          <strong>Kalibrasi sinyal (1h):</strong> {acc.acc1h !== null ? `${acc.acc1h}% (${acc.win1h}/${acc.n1h})` : '—'}
-          {' | '}
-          <strong>24h:</strong> {acc.acc24h !== null ? `${acc.acc24h}% (${acc.win24h}/${acc.n24h})` : '—'}
+        <div style={{ padding: '10px 20px', borderBottom: '1px solid var(--border)', fontSize: 12, color: 'var(--muted)', lineHeight: 1.8 }}>
+          <div>
+            <strong>Kalibrasi sinyal (1h):</strong> {acc.acc1h !== null ? `${acc.acc1h}% (${acc.win1h}/${acc.n1h})` : '—'}
+            {' | '}
+            <strong>24h:</strong> {acc.acc24h !== null ? `${acc.acc24h}% (${acc.win24h}/${acc.n24h})` : '—'}
+          </div>
           {acc.bySignal && Object.keys(acc.bySignal).length > 0 && (
-            <span style={{ marginLeft: 10 }}>
-              Per sinyal: {Object.entries(acc.bySignal).map(([k, v]) => `${k.replace('_', ' ')} ${Math.round((v.win1h / v.n1h) * 100)}% (n=${v.n1h})`).join('; ')}
-            </span>
+            <div style={{ marginTop: 2 }}>
+              Per sinyal: {Object.entries(acc.bySignal)
+                // Guard n1h === 0: a bucket can exist with only a 24h outcome,
+                // and 0/0 rendered as "NaN%".
+                .filter(([, v]) => v.n1h > 0)
+                .map(([k, v]) => `${k.replace(/_/g, ' ')} ${Math.round((v.win1h / v.n1h) * 100)}% (n=${v.n1h})`)
+                .join('; ') || '—'}
+            </div>
+          )}
+          {acc.byChain && Object.keys(acc.byChain).length > 0 && (
+            <div style={{ marginTop: 2 }}>
+              Per chain: {Object.entries(acc.byChain)
+                .filter(([, v]) => v.n1h > 0)
+                .map(([k, v]) => `${k} ${Math.round((v.win1h / v.n1h) * 100)}% (n=${v.n1h})`)
+                .join('; ') || '—'}
+            </div>
           )}
         </div>
       )}
@@ -110,6 +128,25 @@ export function MemoryInspector({ ap }: { ap: AutopilotConfig }) {
               </tbody>
             </table>
           </div>
+          {/* The honest counterweight to a high skip rate: of the signals we
+              skipped, how many would have won? Tracked with the same 1h/24h
+              pipeline as executed signals, bucketed under NEAR_MISS:<signal>
+              so it never inflates the accuracy of signals we acted on. */}
+          {acc?.bySignal && Object.entries(acc.bySignal).some(([k]) => k.startsWith('NEAR_MISS:')) && (
+            <div style={{ padding: '10px 20px', borderTop: '1px solid var(--border)', fontSize: 12, color: 'var(--muted)', lineHeight: 1.6 }}>
+              <strong>Hasil sinyal yang di-skip:</strong>{' '}
+              {Object.entries(acc.bySignal)
+                .filter(([k, v]) => k.startsWith('NEAR_MISS:') && v.n1h > 0)
+                .map(([k, v]) => {
+                  const won = v.win1h;
+                  const pct = Math.round((won / v.n1h) * 100);
+                  return `${k.replace('NEAR_MISS:', '').replace(/_/g, ' ')} ${pct}% menang (${won}/${v.n1h})`;
+                })
+                .join('; ')}
+              {' — '}
+              <span style={{ color: 'var(--accent)' }}>makin tinggi = makin banyak peluang terlewat.</span>
+            </div>
+          )}
         </>
       )}
 

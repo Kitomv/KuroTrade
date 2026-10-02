@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { api, AgentReport, AutopilotConfig, LLMConfig } from '../api/client';
 import { usePolling } from '../hooks/usePolling';
 import { EquityChart } from '../components/EquityChart';
-import { IconBot, IconBolt, IconChartBar, IconChartLine, IconGear, IconKey, IconLock, IconPower, IconRocket, IconShield, IconSparkles, IconTrendingDown, IconTrendingUp } from '../components/Icons';
+import { IconAlert, IconBot, IconBolt, IconChartBar, IconChartLine, IconGear, IconKey, IconLock, IconPower, IconRocket, IconShield, IconSparkles, IconTrendingDown, IconTrendingUp } from '../components/Icons';
 import { fmt } from '../lib/format';
 import { Modal } from '../components/Modal';
 import { LlmConfigModal } from '../components/LlmConfigModal';
@@ -620,6 +620,29 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
                           <div style={{ marginTop: 3 }}>
                             <span className="chip" style={{ fontSize: 9.5, padding: '1px 6px', background: 'var(--accent-dim)', color: 'var(--accent)', border: '1px solid rgba(232, 163, 61, .4)' }}>
                               <IconRocket size={12} /> Moonbag 50%
+                            </span>
+                          </div>
+                        )}
+                        {/* A STALE position has no market data (delisted/rugged).
+                            It is surfaced rather than auto-sold, and no longer
+                            blocks a slot. */}
+                        {p.stale && (
+                          <div style={{ marginTop: 3 }}>
+                            <span className="chip" style={{ fontSize: 9.5, padding: '1px 6px', background: 'var(--down-bg)', color: 'var(--down)', border: '1px solid rgba(239,68,68,.4)' }}>
+                              <IconAlert size={12} /> STALE — tidak ada data pasar
+                            </span>
+                          </div>
+                        )}
+                        {/* The stop did not hold: drawdown blew past the configured
+                            SL. The realized risk is larger than the sizing assumed. */}
+                        {p.riskBreach && !p.stale && (
+                          <div style={{ marginTop: 3 }}>
+                            <span
+                              className="chip"
+                              style={{ fontSize: 9.5, padding: '1px 6px', background: 'var(--down-bg)', color: 'var(--down)', border: '1px solid rgba(239,68,68,.4)' }}
+                              title="Drawdown menembus stop loss — risiko nyata lebih besar dari setelan"
+                            >
+                              <IconAlert size={12} /> SL tembus {p.drawdownPct?.toFixed(0)}%
                             </span>
                           </div>
                         )}

@@ -61,14 +61,50 @@ export function buildAccuracyBlock(st) {
   return `\n\nRecent signal calibration: ${parts.join('; ')}. Adjust confidence accordingly — do not repeat setups that recently failed.`;
 }
 
-/** Aggregate accuracy stats from signal history. */
+/**
+ * Aggregate accuracy stats, read from the INCREMENTAL aggregate (`signalStats`)
+ * rather than by scanning a buffer.
+ *
+ * The old implementation walked `signalHistory`, which is a 200-entry rolling
+ * DISPLAY buffer that turns over in ~3 minutes. Outcomes are measured at 1h and
+ * 24h, so every entry was evicted before it could be scored: measured on the
+ * live account, 0 of 200 entries had a price and this function always returned
+ * n1h: 0 — the calibration block was permanently empty and the agents never
+ * learned anything.
+ *
+ * The aggregate is written by `recordSignalOutcome` (aiAgent.js) as each
+ * outcome completes, persists across restarts, and does not grow unbounded.
+ * Falls back to scanning the buffer when no aggregate exists yet (an account
+ * that has never completed an outcome), so the shape stays backward compatible.
+ */
 export function computeSignalAccuracy(st) {
-  const hist = (st.signalHistory ?? []).filter((h) => h.entryPrice > 0);
+  const stats = st?.signalStats;
+  if (stats?.totals) {
+    const bySignal = {};
+    for (const [sig, v] of Object.entries(stats.bySignal ?? {})) {
+      bySignal[sig] = { n: v.n1h + v.n24h, win1h: v.win1h, n1h: v.n1h, win24h: v.win24h, n24h: v.n24h };
+    }
+    const t = stats.totals;
+    return {
+      total: (t.n1h ?? 0) + (t.n24h ?? 0),
+      win1h: t.win1h ?? 0,
+      n1h: t.n1h ?? 0,
+      win24h: t.win24h ?? 0,
+      n24h: t.n24h ?? 0,
+      acc1h: (t.n1h ?? 0) > 0 ? Math.round((t.win1h / t.n1h) * 100) : null,
+      acc24h: (t.n24h ?? 0) > 0 ? Math.round((t.win24h / t.n24h) * 100) : null,
+      bySignal,
+      byChain: stats.byChain ?? {},
+    };
+  }
+
+  // Legacy path: no aggregate yet. Scan whatever the buffer happens to hold.
+  const hist = (st?.signalHistory ?? []).filter((h) => h.entryPrice > 0);
   const isWin = (h, price) => {
     if (!price) return null;
     return h.signal.includes('BUY') ? price > h.entryPrice : h.signal === 'SELL' ? price < h.entryPrice : null;
   };
-  const acc = { total: hist.length, win1h: 0, n1h: 0, win24h: 0, n24h: 0, bySignal: {} };
+  const acc = { total: hist.length, win1h: 0, n1h: 0, win24h: 0, n24h: 0, bySignal: {}, byChain: {} };
   for (const h of hist) {
     const key = h.signal;
     acc.bySignal[key] = acc.bySignal[key] ?? { n: 0, win1h: 0, n1h: 0 };

@@ -216,12 +216,21 @@ export interface AutopilotGuardedPosition {
   avgBuyPrice: number;
   currentPrice: number;
   highestPrice?: number;
+  /** Worst price seen while held — the realized-risk counterpart to the peak. */
+  lowestPrice?: number;
+  /** Worst drawdown from entry, as a percentage (negative). */
+  drawdownPct?: number;
+  /** True when the drawdown blew past the configured stop — the stop did not hold. */
+  riskBreach?: boolean;
+  /** No market data for ~6 minutes: delisted or rugged. Does not block slots. */
+  stale?: boolean;
+  missingTicks?: number;
   tp1Hit?: boolean;
   pnlUsd: number;
   pnlPct: number;
   tpPrice: number;
   slPrice: number;
-  status: 'GUARDED' | 'TP_TRIGGER' | 'SL_TRIGGER' | 'TRAILING_ACTIVE' | 'MOONBAG_RUNNER';
+  status: 'GUARDED' | 'TP_TRIGGER' | 'SL_TRIGGER' | 'TRAILING_ACTIVE' | 'MOONBAG_RUNNER' | 'STALE';
 }
 
 export interface AutopilotLog {
@@ -313,7 +322,10 @@ export interface SignalAccuracy {
   n24h: number;
   acc1h: number | null;
   acc24h: number | null;
-  bySignal: Record<string, { n: number; win1h: number; n1h: number }>;
+  /** Keyed by signal ('STRONG_BUY', …). Near-misses are keyed 'NEAR_MISS:<sig>'. */
+  bySignal: Record<string, { n: number; win1h: number; n1h: number; win24h?: number; n24h?: number }>;
+  /** Per-chain accuracy — which network the signals actually work on. */
+  byChain?: Record<string, { n1h: number; win1h: number; n24h: number; win24h: number }>;
 }
 
 /** One closed-trade memory entry (agents learn from these). */

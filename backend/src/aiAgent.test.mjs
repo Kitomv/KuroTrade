@@ -29,8 +29,9 @@ delete process.env.OPENAI_API_KEY;
 
 const {
   analyzeToken, setAutopilot, getAutopilot, initAutopilot, recordRealized,
-  clearAutopilotLogs,
+  clearAutopilotLogs, recordSignalOutcome,
 } = await import('./aiAgent.js');
+const { computeSignalAccuracy, buildAccuracyBlock } = await import('./memory.js');
 const { resetWallet } = await import('./wallet.js');
 
 const ADDR = '0x1111111111111111111111111111111111111111';
@@ -253,4 +254,96 @@ test('clearing the log stream empties it without touching the config', () => {
   const st = getAutopilot(u);
   assert.equal(st.logs.length, 0);
   assert.equal(st.takeProfitPct, 33, 'config is not a log');
+});
+
+/* ---------------- signal accuracy pipeline ---------------- */
+
+// The regression this guards: accuracy used to be computed by scanning
+// `signalHistory`, a 200-entry buffer that turns over in ~3 minutes while
+// outcomes are measured at 1h/24h. Measured live: 0 of 200 entries ever had a
+// price, so the agents' calibration block was permanently empty.
+
+test('a completed outcome folds into the aggregate, not the display buffer', () => {
+  const u = freshUser();
+  const st = getAutopilot(u);
+  const entry = {
+    ts: Date.now(), symbol: 'AAA', address: ADDR, chainId: 'base',
+    signal: 'STRONG_BUY', confidence: 82, entryPrice: 1, kind: 'signal',
+    price1h: 1.1, price24h: 1.2,
+  };
+  recordSignalOutcome(st, entry);
+  const acc = computeSignalAccuracy(st);
+  assert.equal(acc.n1h, 1, 'the 1h outcome is counted');
+  assert.equal(acc.win1h, 1, 'price rose after a BUY → a win');
+  assert.equal(acc.acc1h, 100);
+  assert.equal(acc.n24h, 1);
+  assert.equal(acc.bySignal.STRONG_BUY.n1h, 1, 'per-signal bucket is written');
+  assert.equal(acc.byChain.base.n1h, 1, 'per-chain bucket is written');
+});
+
+test('a SELL call is a win when the price falls, and a loss when it rises', () => {
+  const u = freshUser();
+  const st = getAutopilot(u);
+  recordSignalOutcome(st, { ts: 1, chainId: 'base', signal: 'SELL', entryPrice: 1, kind: 'signal', price1h: 0.9 });
+  recordSignalOutcome(st, { ts: 2, chainId: 'base', signal: 'SELL', entryPrice: 1, kind: 'signal', price1h: 1.1 });
+  const acc = computeSignalAccuracy(st);
+  assert.equal(acc.n1h, 2);
+  assert.equal(acc.win1h, 1, 'one right, one wrong');
+});
+
+test('folding the same outcome twice does not double-count', () => {
+  const u = freshUser();
+  const st = getAutopilot(u);
+  const entry = { ts: 1, chainId: 'base', signal: 'BUY', entryPrice: 1, kind: 'signal', price1h: 1.5 };
+  recordSignalOutcome(st, entry);
+  recordSignalOutcome(st, entry);
+  assert.equal(computeSignalAccuracy(st).n1h, 1, 'the fold is idempotent per entry');
+});
+
+test('a near-miss is bucketed separately so it never inflates signal accuracy', () => {
+  const u = freshUser();
+  const st = getAutopilot(u);
+  recordSignalOutcome(st, {
+    ts: 1, chainId: 'base', signal: 'STRONG_BUY', entryPrice: 1,
+    kind: 'nearMiss', reason: 'SL_COOLDOWN', price1h: 1.5,
+  });
+  const acc = computeSignalAccuracy(st);
+  assert.equal(acc.bySignal['NEAR_MISS:STRONG_BUY'].n1h, 1, 'tracked under its own key');
+  assert.equal(acc.bySignal.STRONG_BUY, undefined, 'the acted-on signal bucket stays clean');
+});
+
+test('an unpriceable entry is ignored rather than counted as a loss', () => {
+  const u = freshUser();
+  const st = getAutopilot(u);
+  recordSignalOutcome(st, { ts: 1, chainId: 'base', signal: 'BUY', entryPrice: 0, kind: 'signal', price1h: 5 });
+  recordSignalOutcome(st, { ts: 2, chainId: 'base', signal: 'BUY', entryPrice: 1, kind: 'signal' });
+  assert.equal(computeSignalAccuracy(st).n1h, 0, 'no entry price / no outcome price → not counted');
+});
+
+test('accuracy survives a display-buffer rotation (the actual bug)', () => {
+  const u = freshUser();
+  const st = getAutopilot(u);
+  // Record an outcome, then simulate the display buffer turning over many
+  // times — the old implementation would have lost the outcome entirely.
+  recordSignalOutcome(st, { ts: 1, chainId: 'base', signal: 'BUY', entryPrice: 1, kind: 'signal', price1h: 1.2 });
+  st.signalHistory = Array.from({ length: 200 }, (_, i) => ({ ts: i, signal: 'HOLD', entryPrice: 1 }));
+  const acc = computeSignalAccuracy(st);
+  assert.equal(acc.n1h, 1, 'the aggregate is independent of the rolling buffer');
+  assert.ok(buildAccuracyBlock(st).includes('BUY 100% @1h'), 'the agents get the calibration line');
+});
+
+test('the calibration block stays empty until an outcome exists', () => {
+  const u = freshUser();
+  const st = getAutopilot(u);
+  assert.equal(buildAccuracyBlock(st), '', 'no data → no misleading instruction');
+});
+
+test('an account hydrated without the new fields gets them repaired', () => {
+  // A save from before the split lacks pendingSignals/signalStats. Loading it
+  // must not leave undefined in place of the aggregate.
+  const u = freshUser();
+  initAutopilot(u);
+  const st = getAutopilot(u);
+  assert.ok(Array.isArray(st.pendingSignals), 'pendingSignals exists');
+  assert.ok(st.signalStats && st.signalStats.totals, 'signalStats exists with totals');
 });

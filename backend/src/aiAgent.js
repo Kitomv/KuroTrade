@@ -677,21 +677,25 @@ export async function runAutopilotTick(userId) {
   const wallet = getWallet(userId);
 
   // Equity curve must track the ACTIVE wallet, not always the virtual one.
-  //   - Real mode + bound MetaMask → on-chain value (native + ERC-20, in USD).
+  //   - Real mode + bound MetaMask → on-chain value across every supported
+  //     chain (native + ERC-20, in USD).
   //   - Otherwise → the virtual paper ledger (historical behaviour).
   const tickTs = Date.now();
   let recordedReal = false;
   if (isRealMode(userId)) {
     try {
-      const { getEvmTotalValue, getBoundEvmAddress } = await import('./evmWallet.js');
+      const { getEvmPortfolioValue, groupTokensByChain, getBoundEvmAddress } = await import('./evmWallet.js');
       const address = getBoundEvmAddress(userId);
-      const realTotal = address
-        ? await getEvmTotalValue(address, 'base', { tokens: positions.map((p) => p.tokenAddress) })
-        : null;
-      if (Number.isFinite(realTotal)) {
-        st.pnlHistory.push({ ts: tickTs, totalValue: Math.round(realTotal * 100) / 100 });
-        if (st.pnlHistory.length > 60) st.pnlHistory.shift();
-        recordedReal = true;
+      if (address) {
+        const portfolio = await getEvmPortfolioValue(address, { tokensByChain: groupTokensByChain(positions) });
+        // pricedChains === 0 means every RPC failed: the value is UNKNOWN, not
+        // $0. Recording it would draw a false zero into the equity curve on a
+        // transient outage; fall through to the virtual ledger instead.
+        if (portfolio.pricedChains > 0) {
+          st.pnlHistory.push({ ts: tickTs, totalValue: Math.round(portfolio.totalUsd * 100) / 100 });
+          if (st.pnlHistory.length > 60) st.pnlHistory.shift();
+          recordedReal = true;
+        }
       }
     } catch {
       // fall through to virtual value — equity curve must never break a tick
@@ -958,19 +962,27 @@ async function runScoutPhase(userId, st, { markets, positions, wallet }) {
   // on-chain value, not the virtual paper ledger — otherwise a drained wallet
   // keeps getting buy intents that fail, or an over-exposed wallet is let
   // through because the virtual balance never falls.
+  //
+  // Read EVERY supported chain, not just base: a wallet funded on BSC read as
+  // $0 through a base-only query, and the scout stopped with "Nilai wallet
+  // $0.00 < $5" while the money sat on a chain the gate never looked at.
   let realTotalUsd = null;
   let realTokenUsd = null;
   let boundAddress = null;
   if (isRealMode(userId)) {
     try {
-      const { getEvmTotalValue, getEvmTokenValue, getBoundEvmAddress } = await import('./evmWallet.js');
+      const { getEvmPortfolioValue, groupTokensByChain, getBoundEvmAddress } = await import('./evmWallet.js');
       boundAddress = getBoundEvmAddress(userId);
       if (boundAddress) {
-        const tokens = getPositions(userId).map((p) => p.tokenAddress);
-        realTotalUsd = await getEvmTotalValue(boundAddress, 'base', { tokens });
-        // exposureUsd, NOT valueUsd: USDT is undeployed cash, so a wallet
-        // funded with USDT must not read as 100% exposure and block every buy.
-        realTokenUsd = (await getEvmTokenValue(boundAddress, 'base', tokens)).exposureUsd;
+        const portfolio = await getEvmPortfolioValue(boundAddress, {
+          tokensByChain: groupTokensByChain(getPositions(userId)),
+        });
+        if (portfolio.pricedChains > 0) {
+          realTotalUsd = portfolio.totalUsd;
+          // exposureUsd, NOT valueUsd: USDT is undeployed cash, so a wallet
+          // funded with USDT must not read as 100% exposure and block every buy.
+          realTokenUsd = portfolio.exposureUsd;
+        }
       }
     } catch {
       // keep null → gates fall back to virtual (never break the tick)
@@ -979,9 +991,10 @@ async function runScoutPhase(userId, st, { markets, positions, wallet }) {
 
   // LOW_BALANCE: below MIN_TRADEABLE_USD there is nothing worth buying into and
   // no room to cover fees, so stop scouting and let TP/SL drain the book. Real
-  // mode reads the bound wallet's on-chain USD value (native + ERC-20); virtual
-  // mode reads the paper ledger. The gas reserve itself is enforced in
-  // checkEvmAffordability (EVM_FEE_RESERVE_NATIVE), not here.
+  // mode reads the bound wallet's on-chain USD value (native + ERC-20) across
+  // all supported chains; virtual mode reads the paper ledger. The gas reserve
+  // itself is enforced in checkEvmAffordability (EVM_FEE_RESERVE_NATIVE), not
+  // here.
   const MIN_TRADEABLE_USD = 5;
   const totalForBalance = isRealMode(userId) && realTotalUsd !== null ? realTotalUsd : wallet.balance;
   if (totalForBalance < MIN_TRADEABLE_USD) {

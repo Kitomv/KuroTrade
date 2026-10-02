@@ -411,6 +411,135 @@ export async function getEvmTotalValue(address, chain = 'base', { nativeUsd = nu
   return Math.round((nativeHuman * price + valueUsd) * 100) / 100;
 }
 
+// --- Multi-chain portfolio --------------------------------------------------
+
+/**
+ * Group a position list into { chain: [tokenAddress] }.
+ *
+ * An address is only meaningful on the chain the position was opened on —
+ * contracts are chain-local, so valuing a BSC token through the Base RPC reads
+ * a stranger's contract (or reverts). A position without a chainId is legacy;
+ * wallet.js defaults those to base, and valuation must read the same chain
+ * they were recorded on. A position on a chain we do not support is DROPPED:
+ * there is no RPC that could read it, and guessing another chain would
+ * misvalue it.
+ */
+export function groupTokensByChain(positions = []) {
+  const out = {};
+  for (const p of positions ?? []) {
+    const addr = typeof p?.tokenAddress === 'string' ? p.tokenAddress : null;
+    if (!addr) continue;
+    const chain = p.chainId == null ? 'base' : String(p.chainId);
+    if (!isSupportedChain(chain)) continue;
+    (out[chain] ??= []).push(addr);
+  }
+  return out;
+}
+
+const PORTFOLIO_CACHE_TTL_MS = 60_000;
+const portfolioCache = new Map(); // cacheKey -> { at, value }
+
+/** Reject after `ms`, so one dead endpoint cannot stall the autopilot tick. */
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`timeout setelah ${ms}ms`)), ms);
+    promise.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); },
+    );
+  });
+}
+
+function portfolioCacheKey(owner, tokensByChain) {
+  const parts = Object.keys(tokensByChain).sort().map(
+    (c) => `${c}:${[...tokensByChain[c]].map((a) => String(a).toLowerCase()).sort().join(',')}`,
+  );
+  return `${owner.toLowerCase()}|${parts.join('|')}`;
+}
+
+/** Native balance in human units, with the provider destroyed afterwards. */
+async function nativeBalanceHuman(address, chain, timeoutMs) {
+  const provider = getProvider(chain);
+  try {
+    const wei = await withTimeout(provider.getBalance(address), timeoutMs);
+    return Number(ethers.formatEther(wei));
+  } finally {
+    // A failed call leaves ethers retrying network detection in the background
+    // once a second, forever. destroy() is what stops that loop.
+    provider.destroy();
+  }
+}
+
+/**
+ * Wallet value across EVERY supported chain, in USD.
+ *
+ * The autopilot's balance gates used to read `base` only, so a wallet funded
+ * on BSC (or any other chain) read as $0 and the scout stopped with
+ * "Nilai wallet $0.00 < $5" while the money sat on a chain the gate never
+ * looked at. This sweeps every supported chain instead.
+ *
+ * Returns { totalUsd, exposureUsd, perChain, pricedChains }:
+ *  - totalUsd    native + ERC-20 (USDT included), summed over chains
+ *  - exposureUsd positions at risk only — USDT and the native coin are cash,
+ *                not exposure (see getEvmTokenValue for the full rationale)
+ *  - perChain    per-chain breakdown, for diagnostics
+ *
+ * Cached for a minute: the autopilot tick runs every 5s per user and a 7-chain
+ * RPC sweep per tick would hammer public endpoints. Chains that fail (dead
+ * RPC, timeout) are skipped; an all-failed result is NOT cached, so a
+ * transient outage retries on the next call instead of freezing a false zero.
+ */
+export async function getEvmPortfolioValue(address, { tokensByChain = {}, timeoutMs = 6_000 } = {}) {
+  const owner = assertAddress(address, 'address');
+  const key = portfolioCacheKey(owner, tokensByChain);
+  const hit = portfolioCache.get(key);
+  if (hit && Date.now() - hit.at < PORTFOLIO_CACHE_TTL_MS) return hit.value;
+
+  const perChain = {};
+  let totalUsd = 0;
+  let exposureUsd = 0;
+  await Promise.all(Object.keys(CHAINS).map(async (chain) => {
+    const tokens = tokensByChain[chain] ?? [];
+    try {
+      // The native leg throws when the chain cannot be read at all — that is
+      // the signal to skip the whole chain (including its token calls, which
+      // would otherwise create more doomed providers).
+      const nativeHuman = await nativeBalanceHuman(owner, chain, timeoutMs);
+      const nativePrice = await getNativeUsdPrice(chain).catch(() => null);
+      const nativeUsd = nativePrice ? nativeHuman * nativePrice : 0;
+      // Token leg is best-effort even on a live chain: a chain with an
+      // unpriceable native coin still contributes its token value.
+      const tokenPart = await withTimeout(
+        getEvmTokenValue(owner, chain, tokens), timeoutMs,
+      ).catch(() => ({ valueUsd: 0, exposureUsd: 0, holdings: [] }));
+      perChain[chain] = {
+        nativeUsd: Math.round(nativeUsd * 100) / 100,
+        valueUsd: Math.round((nativeUsd + tokenPart.valueUsd) * 100) / 100,
+        exposureUsd: tokenPart.exposureUsd,
+      };
+      totalUsd += nativeUsd + tokenPart.valueUsd;
+      exposureUsd += tokenPart.exposureUsd;
+    } catch {
+      // Chain unavailable — skipped, never fatal.
+    }
+  }));
+
+  const value = {
+    totalUsd: Math.round(totalUsd * 100) / 100,
+    exposureUsd: Math.round(exposureUsd * 100) / 100,
+    perChain,
+    pricedChains: Object.keys(perChain).length,
+  };
+  if (value.pricedChains > 0) {
+    if (portfolioCache.size >= 200) {
+      const oldest = portfolioCache.keys().next().value;
+      if (oldest !== undefined) portfolioCache.delete(oldest);
+    }
+    portfolioCache.set(key, { at: Date.now(), value });
+  }
+  return value;
+}
+
 // --- Pricing ---------------------------------------------------------------
 
 const nativePriceCache = new Map(); // chain -> { at, price }

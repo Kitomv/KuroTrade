@@ -1081,16 +1081,11 @@ async function runScoutPhase(userId, st, { markets, positions, wallet }) {
           return { executed: false, reason: 'PENDING_BUY_INTENT' };
         }
 
-        // Never interpret a USD budget as a native-coin amount. Convert via the
-        // live native/USD spot price; refuse to emit when unknown (the swap-tx
-        // builder cannot work out a safe amount without it).
-        const { getNativeUsdPrice, checkTradeSize, checkEvmAffordability } = await import('./evmWallet.js');
-        const nativeUsd = await getNativeUsdPrice(token.chainId);
-        if (!nativeUsd || nativeUsd <= 0) {
-          addLog(userId, 'WARN', `⛔ [${verdict.signal} REAL] ${token.symbol}: harga ${getChainConfig(token.chainId).native} tidak tersedia — buy intent dibatalkan (mencegah salah unit)`, { usdAmount });
-          st.status = 'IDLE';
-          return { executed: false, reason: 'NO_NATIVE_PRICE' };
-        }
+        // Funding selection: prefer USDT when it covers the buy and the native
+        // reserve is intact, else fall back to native. A wallet holding USDT
+        // but little native used to be unable to trade at all, because the buy
+        // path was native-only.
+        const { getNativeUsdPrice, checkTradeSize, pickBuyFunding } = await import('./evmWallet.js');
         if (!boundAddress) {
           addLog(userId, 'WARN', `⛔ [${verdict.signal} REAL] ${token.symbol}: wallet belum di-bind — bind MetaMask dulu di Settings`, { usdAmount });
           st.status = 'IDLE';
@@ -1110,17 +1105,37 @@ async function runScoutPhase(userId, st, { markets, positions, wallet }) {
         // only real number. Downsize to what is actually spendable after the
         // gas reserve, else skip — a doomed intent would otherwise sit 'open'
         // and block this token's dedup until it expires.
-        const afford = await checkEvmAffordability(boundAddress, effectiveUsd, { nativeUsd, chain: token.chainId });
-        if (!afford.ok) {
-          addLog(userId, 'WARN', `⛔ [${verdict.signal} REAL] ${token.symbol}: wallet tidak sanggup beli $${effectiveUsd} (${afford.reason}) — skip`, { balanceNative: afford.balanceNative, reason: afford.reason });
+        const fundingPick = await pickBuyFunding(boundAddress, effectiveUsd, token.chainId);
+        if (!fundingPick.funding) {
+          const native = getChainConfig(token.chainId).native;
+          addLog(userId, 'WARN', `⛔ [${verdict.signal} REAL] ${token.symbol}: wallet tidak sanggup beli $${effectiveUsd} (${fundingPick.reason}) — USDT ${fundingPick.usdtBalance === null ? 'n/a' : fundingPick.usdtBalance.toFixed(2)}, ${native} ${Number(fundingPick.nativeBalance || 0).toFixed(6)} (reserve ${fundingPick.gasReserve})`, { usdAmount, reason: fundingPick.reason });
           st.status = 'IDLE';
-          return { executed: false, reason: afford.reason };
+          return { executed: false, reason: fundingPick.reason };
         }
-        if (afford.buyUsd < effectiveUsd) {
-          effectiveUsd = Math.round(afford.buyUsd * 100) / 100;
-          addLog(userId, 'WARN', `⚠️ [${verdict.signal} REAL] ${token.symbol}: ukuran diturunkan ke $${effectiveUsd} agar muat wallet (${afford.balanceNative.toFixed(4)} ${getChainConfig(token.chainId).native}, ±${afford.reserveNative.toFixed(4)} dicadangkan fee)`, { balanceNative: afford.balanceNative, buyUsd: effectiveUsd });
+        const fundingToken = fundingPick.funding; // 'usdt' | 'native'
+        const nativeUsd = await getNativeUsdPrice(token.chainId);
+        // A native-funded buy is sized in native units, so it cannot proceed
+        // without a native price (converting a USD budget at a guessed rate is
+        // how you buy 1000x the intended amount). A USDT-funded buy needs no
+        // native price: the budget IS the funding amount at $1.
+        if (fundingToken === 'native' && (!nativeUsd || nativeUsd <= 0)) {
+          addLog(userId, 'WARN', `⛔ [${verdict.signal} REAL] ${token.symbol}: harga ${getChainConfig(token.chainId).native} tidak tersedia — buy intent dibatalkan (mencegah salah unit)`, { usdAmount });
+          st.status = 'IDLE';
+          return { executed: false, reason: 'NO_NATIVE_PRICE' };
         }
-        const amountWei = Math.round((effectiveUsd / nativeUsd) * 1e18);
+        // Downsize a native buy to what is actually spendable after the gas
+        // reserve. A USDT buy is not downsized here: the USDT leg was already
+        // verified to cover `effectiveUsd` in full.
+        if (fundingToken === 'native') {
+          const spendableUsd = Math.max(0, (fundingPick.nativeBalance || 0) - fundingPick.gasReserve) * nativeUsd;
+          if (spendableUsd < effectiveUsd) {
+            effectiveUsd = Math.round(spendableUsd * 100) / 100;
+            addLog(userId, 'WARN', `⚠️ [${verdict.signal} REAL] ${token.symbol}: ukuran diturunkan ke $${effectiveUsd} agar muat wallet (${Number(fundingPick.nativeBalance || 0).toFixed(6)} ${getChainConfig(token.chainId).native}, ±${fundingPick.gasReserve} dicadangkan fee)`, { nativeBalance: fundingPick.nativeBalance, buyUsd: effectiveUsd });
+          }
+        }
+        const amountWei = fundingToken === 'native'
+          ? Math.round((effectiveUsd / nativeUsd) * 1e18)
+          : null;
         const intent = addRealIntent(userId, {
           symbol: token.symbol,
           tokenAddress: token.address,
@@ -1128,7 +1143,11 @@ async function runScoutPhase(userId, st, { markets, positions, wallet }) {
           side: 'buy',
           source: verdict.signal, // 'STRONG_BUY' | 'BUY'
           amountUsd: effectiveUsd,
-          amountWei,
+          // Funding: 'usdt' means the swap pays with the chain's USDT contract
+          // and `amountUsd` is the funding amount (USDT is $1 throughout the
+          // codebase). Absent on old intents → 'native'.
+          fundingToken,
+          ...(amountWei !== null ? { amountWei } : {}),
           estTokens: verdict.recommendedTokens,
           intentPrice: verdict.entryPrice,
           // Agent/LLM provenance — the UI must show WHY this is worth approving,
@@ -1138,7 +1157,11 @@ async function runScoutPhase(userId, st, { markets, positions, wallet }) {
           bullScore: topBuy.agents?.bull ?? null,
           bearScore: topBuy.agents?.bear ?? null,
         });
-        addLog(userId, 'BUY', `☝️ [${verdict.signal} REAL] ${token.symbol} → intent ${intent.id} ($${effectiveUsd} ≈ ${(amountWei / 1e18).toFixed(6)} ${getChainConfig(token.chainId).native}) menunggu approve di MetaMask @ $${verdict.entryPrice}`, intent);
+        const fundingLabel = fundingToken === 'usdt' ? 'USDT' : getChainConfig(token.chainId).native;
+        const sizeLabel = fundingToken === 'usdt'
+          ? `$${effectiveUsd} USDT`
+          : `$${effectiveUsd} ≈ ${(amountWei / 1e18).toFixed(6)} ${fundingLabel}`;
+        addLog(userId, 'BUY', `☝️ [${verdict.signal} REAL] ${token.symbol} → intent ${intent.id} (${sizeLabel}) menunggu approve di MetaMask @ $${verdict.entryPrice}`, intent);
         st.status = 'IDLE';
         // Emitted, not executed: the user signs in MetaMask. The position is
         // mirrored by realIntent.js when this intent reaches 'done'.

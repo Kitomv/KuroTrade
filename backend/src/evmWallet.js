@@ -13,8 +13,19 @@ import { getBoundWallet } from './realIntent.js';
 import { dexscreener } from './dexscreener.js';
 
 // --- Chain config -----------------------------------------------------------
-// Per-chain: rpc, 1inch endpoint, native symbol, explorer. Nothing else in the
-// execution path is chain-specific, so adding a chain is one entry here.
+// Per-chain: rpc, 1inch endpoint, native symbol, explorer, gas reserve.
+// Nothing else in the execution path is chain-specific, so adding a chain is
+// one entry here.
+//
+// `gasReserveNative` is the native balance that must stay untouched for gas.
+// It is per-chain because the same flat number is wrong everywhere: measured
+// live, a 300k-gas swap costs 0.0000018 ETH on Base, 0.000014 BNB on BSC and
+// 0.0015 AVAX on Avalanche. The old shared constant (0.005) was ~300x too
+// large on cheap chains and too small on Avalanche — a wallet with 0.0000168
+// BNB read as "cannot afford" while sitting on $7.70 of USDT.
+//
+// Each value covers an approve + swap (measured 280,819 gas on BSC) with
+// headroom for a several-fold gas-price rise from today's level.
 export const CHAINS = {
   base: {
     chainId: 8453,
@@ -22,6 +33,7 @@ export const CHAINS = {
     native: 'ETH',
     explorer: 'https://basescan.org/tx/',
     inch: 'https://api.1inch.dev/swap/v6.0/8453',
+    gasReserveNative: 0.00005,
   },
   ethereum: {
     chainId: 1,
@@ -29,6 +41,7 @@ export const CHAINS = {
     native: 'ETH',
     explorer: 'https://etherscan.io/tx/',
     inch: 'https://api.1inch.dev/swap/v6.0/1',
+    gasReserveNative: 0.0005,
   },
   arbitrum: {
     chainId: 42161,
@@ -36,6 +49,7 @@ export const CHAINS = {
     native: 'ETH',
     explorer: 'https://arbiscan.io/tx/',
     inch: 'https://api.1inch.dev/swap/v6.0/42161',
+    gasReserveNative: 0.0001,
   },
   bsc: {
     chainId: 56,
@@ -43,6 +57,7 @@ export const CHAINS = {
     native: 'BNB',
     explorer: 'https://bscscan.com/tx/',
     inch: 'https://api.1inch.dev/swap/v6.0/56',
+    gasReserveNative: 0.0003,
   },
   optimism: {
     chainId: 10,
@@ -50,6 +65,7 @@ export const CHAINS = {
     native: 'ETH',
     explorer: 'https://optimistic.etherscan.io/tx/',
     inch: 'https://api.1inch.dev/swap/v6.0/10',
+    gasReserveNative: 0.00005,
   },
   polygon: {
     chainId: 137,
@@ -57,6 +73,7 @@ export const CHAINS = {
     native: 'POL',
     explorer: 'https://polygonscan.com/tx/',
     inch: 'https://api.1inch.dev/swap/v6.0/137',
+    gasReserveNative: 0.02,
   },
   avalanche: {
     chainId: 43114,
@@ -64,6 +81,7 @@ export const CHAINS = {
     native: 'AVAX',
     explorer: 'https://snowtrace.io/tx/',
     inch: 'https://api.1inch.dev/swap/v6.0/43114',
+    gasReserveNative: 0.02,
   },
 };
 
@@ -164,6 +182,17 @@ export function getChainConfig(chain = 'base') {
 }
 
 /**
+ * Native balance to keep untouched for gas on `chain`.
+ *
+ * Per-chain because one flat number is wrong on every chain (see the CHAINS
+ * comment for the measurements). Unknown chains fall back to the legacy flat
+ * constant, which stays exported so nothing that referenced it breaks.
+ */
+export function getGasReserve(chain = 'base') {
+  return CHAINS[chain]?.gasReserveNative ?? EVM_FEE_RESERVE_NATIVE;
+}
+
+/**
  * RPC provider for `chain`.
  *
  * The network is declared up front (`new Network(name, chainId)` +
@@ -244,27 +273,66 @@ export async function evmQuote({ src, dst, amount, chain = 'base' }) {
 }
 
 /**
+ * Normalize the `tx.value` field of a 1inch swap response to hex.
+ *
+ * 1inch v6 returns `value` as a DECIMAL string — `"1000000000000000"` for a
+ * native swap, `"0"` for an ERC-20 one — while `eth_sendTransaction` wants hex.
+ * The previous code fed the raw value straight into a hex regex, so every
+ * build failed with "field tidak valid" (both native and ERC-20 paths: no
+ * intent has ever reached 'done' through this function).
+ *
+ * Accepts: null/undefined (→ 0x0), a decimal string, a number, or an already
+ * hex `0x…` string. Throws on anything else so a malformed upstream response
+ * still fails loudly.
+ */
+export function normalizeTxValue(value) {
+  if (value === null || value === undefined || value === '') return '0x0';
+  const s = String(value).trim();
+  if (HEX_RE.test(s)) return s;
+  if (!/^\d+$/.test(s)) {
+    throw new Error(`tx.value tidak valid: ${String(value).slice(0, 40)}`);
+  }
+  const n = BigInt(s);
+  return `0x${n.toString(16)}`;
+}
+
+/**
+ * Clamp a slippage value. 1inch v6 takes slippage IN PERCENT (verified live:
+ * the API rejects >50 with SLIPPAGE_TOO_HIGH, and dstAmount is identical
+ * across 0.1–5, so the scale is percent, not bps). The old code passed 100
+ * intending "1%" — that is 100%, refused outright.
+ */
+export function clampSlippage(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 1;
+  return Math.min(50, Math.max(0.01, n));
+}
+
+/**
  * Build the UNSIGNED swap transaction for MetaMask to sign.
  *
  * This is the whole point of the refactor: the server asks 1inch what to do,
  * hands the calldata to the browser, and a human approves it in MetaMask.
  * Nothing here broadcasts and nothing here holds a key.
+ *
+ * `slippage` is PERCENT (1 = 1%), capped at 50 by the API.
  */
-export async function buildSwapTx({ src, dst, amount, chain = 'base', from, slippage = 100 }) {
+export async function buildSwapTx({ src, dst, amount, chain = 'base', from, slippage = 1 }) {
   assertAddress(src, 'src');
   assertAddress(dst, 'dst');
   assertAddress(from, 'from');
   const amt = assertAtomicAmount(amount);
-  const slip = Math.min(500, Math.max(1, Math.floor(Number(slippage) || 100)));
+  const slip = clampSlippage(slippage);
   const params = new URLSearchParams({
     src, dst, amount: amt, from, slippage: String(slip), disableEstimate: 'true',
   });
   const swapResp = await inchFetch(`/swap?${params}`, chain);
   const tx = swapResp?.tx;
   if (!tx?.to || !tx?.data) throw new Error('1inch tidak mengembalikan data transaksi swap');
-  if (!HEX_RE.test(String(tx.data)) || !HEX_RE.test(String(tx.value ?? '0x0'))) {
+  if (!HEX_RE.test(String(tx.data))) {
     throw new Error('1inch mengembalikan tx dengan field tidak valid');
   }
+  const value = normalizeTxValue(tx.value);
   // The router is the one address we will ask the user to approve. Refuse to
   // hand back a tx aimed anywhere else — a spoofed aggregator response must
   // never become a MetaMask signature request.
@@ -276,14 +344,17 @@ export async function buildSwapTx({ src, dst, amount, chain = 'base', from, slip
     chainId: getChainConfig(chain).chainId,
     to: tx.to,
     data: tx.data,
-    value: String(tx.value ?? '0x0'),
+    value,
     gas: tx.gas ? String(tx.gas) : null,
     // Frontend approves this router for exactly `amount` when src is an ERC-20.
-    // Native swaps need no approval.
+    // Native swaps need no approval. `approveToken` is the ERC-20 whose
+    // allowance is needed (= src), so the client never has to guess — for a
+    // USDT-funded buy that is the USDT contract, not the traded token.
     needsApproval: !isNative(src),
     approveSpender: isNative(src) ? null : tx.to,
     approveAmount: isNative(src) ? null : amt,
-    slippageBps: slip,
+    approveToken: isNative(src) ? null : src,
+    slippagePercent: slip,
   };
 }
 
@@ -626,6 +697,10 @@ export async function getNativeUsdPrice(chain = 'base') {
  * Native coin that must stay UNSPENT so the exit swap can still pay its own
  * gas. A wallet that spends its last wei on the entry swap can never sell —
  * the position becomes a stuck bag.
+ *
+ * LEGACY fallback only: per-chain reserves live in CHAINS.gasReserveNative and
+ * are read through getGasReserve(). Kept exported because it is referenced by
+ * comments and older call sites; new code should use getGasReserve(chain).
  */
 export const EVM_FEE_RESERVE_NATIVE = 0.005;
 
@@ -640,31 +715,141 @@ export function checkTradeSize(usdAmount) {
 }
 
 /**
- * Can the wallet actually pay for a BUY of `usdAmount` on `chain` and still
- * keep a gas reserve for the eventual exit?
+ * Can the wallet actually pay for a BUY of `usdAmount` on `chain` with its
+ * NATIVE coin and still keep a gas reserve for the eventual exit?
  *
  * The paper ledger says "plenty"; the MetaMask balance is the only real number.
+ * The reserve is per-chain (getGasReserve) — the flat legacy constant was
+ * ~300x too large on cheap chains.
  * Returns { ok, balanceNative, buyUsd, reserveNative, reason }.
  */
 export async function checkEvmAffordability(address, usdAmount, { nativeUsd = null, chain = 'base' } = {}) {
+  const reserve = getGasReserve(chain);
   const price = Number(nativeUsd) > 0 ? Number(nativeUsd) : await getNativeUsdPrice(chain);
   const balanceNative = await getEvmBalanceNative(address, chain).catch(() => null);
   if (balanceNative === null) {
-    return { ok: false, balanceNative: 0, buyUsd: 0, reserveNative: EVM_FEE_RESERVE_NATIVE, reason: 'NO_BALANCE' };
+    return { ok: false, balanceNative: 0, buyUsd: 0, reserveNative: reserve, reason: 'NO_BALANCE' };
   }
   if (!price) {
-    return { ok: false, balanceNative, buyUsd: 0, reserveNative: EVM_FEE_RESERVE_NATIVE, reason: 'NO_PRICE' };
+    return { ok: false, balanceNative, buyUsd: 0, reserveNative: reserve, reason: 'NO_PRICE' };
   }
   const wanted = Number(usdAmount);
   if (!Number.isFinite(wanted) || wanted <= 0) {
-    return { ok: false, balanceNative, buyUsd: 0, reserveNative: EVM_FEE_RESERVE_NATIVE, reason: 'BAD_AMOUNT' };
+    return { ok: false, balanceNative, buyUsd: 0, reserveNative: reserve, reason: 'BAD_AMOUNT' };
   }
-  const spendableUsd = Math.max(0, balanceNative - EVM_FEE_RESERVE_NATIVE) * price;
+  const spendableUsd = Math.max(0, balanceNative - reserve) * price;
   if (spendableUsd <= 0) {
-    return { ok: false, balanceNative, buyUsd: 0, reserveNative: EVM_FEE_RESERVE_NATIVE, reason: 'NO_SPENDABLE' };
+    return { ok: false, balanceNative, buyUsd: 0, reserveNative: reserve, reason: 'NO_SPENDABLE' };
   }
   if (wanted > spendableUsd) {
-    return { ok: false, balanceNative, buyUsd: spendableUsd, reserveNative: EVM_FEE_RESERVE_NATIVE, reason: 'LOW_BALANCE' };
+    return { ok: false, balanceNative, buyUsd: spendableUsd, reserveNative: reserve, reason: 'LOW_BALANCE' };
   }
-  return { ok: true, balanceNative, buyUsd: wanted, reserveNative: EVM_FEE_RESERVE_NATIVE, reason: 'OK' };
+  return { ok: true, balanceNative, buyUsd: wanted, reserveNative: reserve, reason: 'OK' };
+}
+
+/**
+ * Pure funding decision: which asset should pay for a buy of `usdAmount`?
+ *
+ * USDT first — it is the app's funding currency and the reason a wallet can
+ * hold $7.70 of value and still read as unable to trade. Native gas must
+ * survive either way, so USDT only wins when the native reserve is intact.
+ *
+ * `usdtBalance` is in USDT units (BSC uses 18 decimals, others 6 — the caller
+ * converts; this function compares human units). `nativeBalance` is native.
+ * Kept pure so the decision is unit-testable without any RPC.
+ */
+export function decideBuyFunding({ usdAmount, usdtBalance, nativeBalance, nativeUsdPrice, gasReserve }) {
+  const wanted = Number(usdAmount);
+  if (!Number.isFinite(wanted) || wanted <= 0) {
+    return { funding: null, reason: 'BAD_AMOUNT' };
+  }
+  const gasOk = Number.isFinite(nativeBalance) && nativeBalance >= gasReserve;
+  // USDT leg: the balance must cover the buy, and gas must still be payable.
+  if (usdtBalance !== null && usdtBalance !== undefined && Number(usdtBalance) >= wanted && gasOk) {
+    return { funding: 'usdt', reason: 'OK' };
+  }
+  // Native leg: balance must cover the buy AND the reserve on top.
+  const price = Number(nativeUsdPrice);
+  if (Number.isFinite(price) && price > 0) {
+    const spendableUsd = Math.max(0, (Number(nativeBalance) || 0) - gasReserve) * price;
+    if (spendableUsd >= wanted) return { funding: 'native', reason: 'OK' };
+    return {
+      funding: null,
+      reason: usdtBalance === null || usdtBalance === undefined ? 'NO_USDT_ON_CHAIN' : 'INSUFFICIENT',
+    };
+  }
+  // No native price → cannot size a native buy, but a USDT buy does not need
+  // one. If USDT covers it and gas is fine, still prefer that.
+  if (usdtBalance !== null && usdtBalance !== undefined && Number(usdtBalance) >= wanted && gasOk) {
+    return { funding: 'usdt', reason: 'OK' };
+  }
+  return { funding: null, reason: 'NO_NATIVE_PRICE' };
+}
+
+/**
+ * Which asset pays for a buy on `chain`, reading live balances.
+ *
+ * Returns { funding: 'usdt'|'native'|null, usdtBalance, nativeBalance,
+ * gasReserve, reason }. `usdtBalance` is null when the chain has no known
+ * USDT or the read failed — the caller must NOT treat that as zero.
+ */
+export async function pickBuyFunding(address, usdAmount, chain = 'base') {
+  const gasReserve = getGasReserve(chain);
+  const [nativeBalance, usdtBalance] = await Promise.all([
+    getEvmBalanceNative(address, chain).catch(() => null),
+    (async () => {
+      const usdt = USDT_BY_CHAIN[chain];
+      if (!usdt) return null;
+      const atomic = await getEvmTokenBalance(address, usdt, chain).catch(() => null);
+      if (atomic === null) return null;
+      const decimals = await resolveTokenDecimals(usdt, chain).catch(() => null);
+      if (decimals === null) return null;
+      return Number(ethers.formatUnits(atomic, decimals));
+    })(),
+  ]);
+  const nativeUsdPrice = await getNativeUsdPrice(chain).catch(() => null);
+  const decision = decideBuyFunding({
+    usdAmount,
+    usdtBalance,
+    nativeBalance: nativeBalance === null ? NaN : nativeBalance,
+    nativeUsdPrice,
+    gasReserve,
+  });
+  return { ...decision, usdtBalance, nativeBalance, gasReserve };
+}
+
+// --- Intent → swap parameters -----------------------------------------------
+
+/**
+ * The swap legs for a stored intent, as a PURE decision.
+ *
+ * Buy: funding 'usdt' pays with the chain's USDT contract (amount = the USD
+ * budget at $1, decimals resolved by the caller), 'native' pays with the
+ * chain's coin (amount = the intent's precomputed amountWei). Absent
+ * `fundingToken` on an old intent means 'native'.
+ *
+ * Sell: target USDT when the chain has one, so proceeds return to the funding
+ * currency. A token whose address IS that chain's USDT falls back to native —
+ * a USDT→USDT swap is invalid and 1inch would reject it.
+ *
+ * Returns { src, dst, amountKind } where amountKind tells the caller how to
+ * resolve the atomic amount ('nativeWei' | 'usd' | 'tokenUnits'), keeping the
+ * on-chain decimals read out of this pure function.
+ */
+export function resolveSwapParams(intent, chain, usdtByChain = USDT_BY_CHAIN) {
+  const NATIVE = ZERO_ADDRESS;
+  const usdt = usdtByChain[chain] ?? null;
+  if (intent.side === 'buy') {
+    const funding = intent.fundingToken ?? 'native';
+    if (funding === 'usdt') {
+      if (!usdt) throw new Error(`Chain "${chain}" tidak punya USDT — funding USDT tidak mungkin`);
+      return { src: usdt, dst: intent.tokenAddress, amountKind: 'usd' };
+    }
+    return { src: NATIVE, dst: intent.tokenAddress, amountKind: 'nativeWei' };
+  }
+  // sell
+  const dst = usdt && String(intent.tokenAddress).toLowerCase() !== usdt.toLowerCase()
+    ? usdt
+    : NATIVE;
+  return { src: intent.tokenAddress, dst, amountKind: 'tokenUnits' };
 }

@@ -36,7 +36,7 @@ import { flushAll, cleanupTempFiles, DATA_DIR } from './persistence.js';
 import { securityHeaders, redact, sanitizeError, ipRateLimit, userRateLimit, isSafeBaseUrl } from './security.js';
 import {
   listEvmChains, isSupportedChain, getChainConfig, getEvmBalanceNative,
-  getEvmTokenValue, getNativeUsdPrice, evmQuote, buildSwapTx,
+  getEvmTokenValue, getNativeUsdPrice, evmQuote, buildSwapTx, resolveSwapParams,
   resolveTokenDecimals, isAllowedRouter, getBoundEvmAddress,
 } from './evmWallet.js';
 
@@ -319,7 +319,7 @@ app.get('/api/real/evm/decimals', rateLimit('quote', 60), wrap(async (req, res) 
 
 app.post('/api/real/swap-tx', rateLimit('quote', 20), wrap(async (req, res) => {
   // Intent-bound swap: the server rebuilds the swap from the STORED intent
-  // (side, token, amount, slippage ≤ 1%) — the client cannot control what gets
+  // (side, token, amount, slippage) — the client cannot control what gets
   // signed. The manual path additionally requires a bound wallet.
   const { intentId, from } = req.body ?? {};
   const chain = resolveChain(res, req.body?.chain);
@@ -332,21 +332,44 @@ app.post('/api/real/swap-tx', rateLimit('quote', 20), wrap(async (req, res) => {
   if (!intent) return res.status(404).json({ error: 'Intent tidak ditemukan' });
   if (intent.status !== 'active') return res.status(409).json({ error: 'Intent tidak aktif / sudah diklaim sesi lain' });
 
-  const NATIVE = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
   const intentChain = String(intent.chainId ?? chain).toLowerCase();
   if (!isSupportedChain(intentChain)) {
     return res.status(400).json({ error: `Intent dibuat untuk chain "${intentChain}" yang tidak didukung` });
   }
 
-  let src, dst, amount;
-  if (intent.side === 'buy') {
+  // Which assets move. Pure decision (see resolveSwapParams): buys pay with
+  // USDT when the intent says so, sells target USDT so proceeds return to the
+  // funding currency.
+  let legs;
+  try {
+    legs = resolveSwapParams(intent, intentChain);
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+  const { src, dst, amountKind } = legs;
+
+  let amount;
+  if (amountKind === 'nativeWei') {
     const wei = String(intent.amountWei ?? '');
     // Never fall back to treating a USD budget as native. An intent without a
     // resolved wei amount predates the EVM migration and is unsafe to fill.
     if (!/^\d+$/.test(wei) || wei === '0') {
       return res.status(400).json({ error: 'Intent buy tanpa amountWei — buat ulang intent (unit lama tidak aman)' });
     }
-    src = NATIVE; dst = intent.tokenAddress; amount = wei;
+    amount = wei;
+  } else if (amountKind === 'usd') {
+    // USDT is $1 throughout the codebase, so the USD budget IS the funding
+    // amount. Decimals are resolved ON-CHAIN per chain — BSC USDT has 18,
+    // every other chain's has 6, and assuming either would be off by 1e12.
+    const decimals = await resolveTokenDecimals(src, intentChain);
+    if (decimals === null) {
+      return res.status(400).json({ error: 'Gagal resolve desimal USDT — buy ditolak (mencegah salah unit)' });
+    }
+    // toFixed before parseUnits: amountUsd is a JS float and String(0.1+0.2)
+    // is "0.30000000000000004", which parseUnits rejects as too many decimals.
+    const atomic = ethers.parseUnits(Number(intent.amountUsd).toFixed(decimals), decimals);
+    if (atomic <= 0n) return res.status(400).json({ error: 'Jumlah buy USDT tidak valid' });
+    amount = atomic.toString();
   } else {
     const decimals = await resolveTokenDecimals(intent.tokenAddress, intentChain);
     if (decimals === null) {
@@ -354,12 +377,12 @@ app.post('/api/real/swap-tx', rateLimit('quote', 20), wrap(async (req, res) => {
     }
     const atomic = ethers.parseUnits(String(intent.estTokens), decimals);
     if (atomic <= 0n) return res.status(400).json({ error: 'Jumlah sell tidak valid' });
-    src = intent.tokenAddress; dst = NATIVE; amount = atomic.toString();
+    amount = atomic.toString();
   }
 
-  // Slippage is capped server-side at 1% — the intent path is never allowed to
-  // widen it, regardless of what the client asks for.
-  const built = await buildSwapTx({ src, dst, amount, chain: intentChain, from, slippage: 100 });
+  // Slippage: 1 percent, fixed server-side — the intent path never lets the
+  // client widen it. (1inch v6 takes percent, not bps.)
+  const built = await buildSwapTx({ src, dst, amount, chain: intentChain, from, slippage: 1 });
   res.json({ ...built, intentId });
 }));
 
@@ -399,21 +422,29 @@ app.post('/api/real/manual-intent', rateLimit('quote', 20), wrap(async (req, res
   const intent = { symbol: String(symbol ?? 'UNKNOWN').slice(0, 40), tokenAddress, chainId: chain, side, source: 'MANUAL', amountUsd: usd, estTokens: tokens, intentPrice: price };
 
   if (side === 'buy') {
-    const { getNativeUsdPrice, checkTradeSize, checkEvmAffordability } = await import('./evmWallet.js');
-    const nativeUsd = await getNativeUsdPrice(chain);
-    if (!nativeUsd || nativeUsd <= 0) {
-      return res.status(400).json({ error: `Harga ${getChainConfig(chain).native} tidak tersedia — coba lagi` });
-    }
+    const { getNativeUsdPrice, checkTradeSize, pickBuyFunding } = await import('./evmWallet.js');
     const capped = checkTradeSize(usd);
     const effectiveUsd = capped.ok ? usd : capped.cap;
-    const afford = await checkEvmAffordability(address, effectiveUsd, { nativeUsd, chain });
-    if (!afford.ok) {
+    // Same funding preference as the autopilot: USDT when it covers the buy
+    // and the native gas reserve survives, else native.
+    const pick = await pickBuyFunding(address, effectiveUsd, chain);
+    if (!pick.funding) {
+      const native = getChainConfig(chain).native;
       return res.status(400).json({
-        error: `Wallet tidak sanggup beli $${effectiveUsd} (${afford.reason}). Saldo ${afford.balanceNative.toFixed(4)}, cadangan gas ${afford.reserveNative} ${getChainConfig(chain).native}`,
+        error: `Wallet tidak sanggup beli $${effectiveUsd} (${pick.reason}). USDT ${pick.usdtBalance === null ? 'n/a' : pick.usdtBalance.toFixed(2)}, ${native} ${Number(pick.nativeBalance || 0).toFixed(6)} (cadangan gas ${pick.gasReserve})`,
       });
     }
-    intent.amountUsd = Math.round(afford.buyUsd * 100) / 100;
-    intent.amountWei = Math.round((intent.amountUsd / nativeUsd) * 1e18);
+    intent.fundingToken = pick.funding;
+    intent.amountUsd = Math.round(effectiveUsd * 100) / 100;
+    if (pick.funding === 'native') {
+      const nativeUsd = await getNativeUsdPrice(chain);
+      if (!nativeUsd || nativeUsd <= 0) {
+        return res.status(400).json({ error: `Harga ${getChainConfig(chain).native} tidak tersedia — coba lagi` });
+      }
+      intent.amountWei = Math.round((intent.amountUsd / nativeUsd) * 1e18);
+    }
+    // USDT funding needs no amountWei: the swap-tx builder converts amountUsd
+    // at the USDT contract's own decimals (18 on BSC, 6 elsewhere).
   } else {
     // Cost basis snapshot for the realized-PnL booking at confirmation time.
     const { getPositions } = await import('./wallet.js');

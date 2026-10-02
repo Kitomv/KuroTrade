@@ -125,10 +125,10 @@ export function RealTradePanel() {
           <>
             <div className="grid-2" style={{ marginBottom: 14 }}>
               <button type="button" className="btn" style={{ background: side === 'buy' ? 'var(--up)' : 'var(--panel-2)', color: side === 'buy' ? '#000' : 'var(--text)', fontWeight: 700 }} onClick={() => { setSide('buy'); setCreated(null); setAmount(''); }}>
-                <IconArrowUp size={13} /> BUY (ETH → token)
+                <IconArrowUp size={13} /> BUY (USDT/native → token)
               </button>
               <button type="button" className="btn" style={{ background: side === 'sell' ? 'var(--down)' : 'var(--panel-2)', color: side === 'sell' ? '#fff' : 'var(--text)', fontWeight: 700 }} onClick={() => { setSide('sell'); setCreated(null); setAmount(''); }}>
-                <IconArrowDown size={13} /> SELL (token → ETH)
+                <IconArrowDown size={13} /> SELL (token → USDT/native)
               </button>
             </div>
 
@@ -238,6 +238,9 @@ export function PendingIntents({
                 {' '}{i.symbol} · ${Number(i.amountUsd).toFixed(2)} · {i.chainId}
               </div>
               <div style={{ color: 'var(--muted)', fontSize: 11 }}>
+                {i.side === 'buy'
+                  ? `bayar pakai ${i.fundingToken === 'usdt' ? 'USDT' : 'native'} · `
+                  : 'hasil ke USDT · '}
                 sumber {i.source}
                 {i.confidence != null && ` · confidence ${i.confidence}%`}
                 {i.llmPowered && ' · LLM'}

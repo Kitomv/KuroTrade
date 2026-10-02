@@ -334,10 +334,15 @@ export function EvmWalletProvider({ children }: { children: React.ReactNode }) {
       // ERC-20 input needs an allowance. Approve the EXACT amount, never an
       // unlimited grant: a compromised router must not be able to drain the
       // token balance long after this trade.
+      //
+      // The allowance target is the FUNDING token, which is not always
+      // `intent.tokenAddress`: a USDT-funded buy approves the USDT contract,
+      // not the token being bought. The server names it in `approveToken`;
+      // the fallback keeps older responses (sells) working.
       if (built.needsApproval && built.approveSpender && built.approveAmount) {
         const approveHash = await sendTransaction({
           from: address,
-          to: intent.tokenAddress,
+          to: built.approveToken ?? intent.tokenAddress,
           data: encodeApprove(built.approveSpender, built.approveAmount),
         });
         const receipt = await waitForReceipt(approveHash);

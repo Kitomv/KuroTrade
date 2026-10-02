@@ -268,6 +268,12 @@ export interface RealIntent {
   status: 'open' | 'active' | 'done' | 'cancelled';
   createdAt: number;
   resolvedAt?: number;
+  /**
+   * What pays for a buy. 'usdt' → the swap spends the chain's USDT contract
+   * and `amountUsd` IS the funding amount (USDT = $1). Absent on older intents
+   * → 'native'.
+   */
+  fundingToken?: 'native' | 'usdt';
   /** Agent/LLM provenance so the UI can show WHY a trade is proposed. */
   confidence?: number;
   llmPowered?: boolean;
@@ -289,7 +295,13 @@ export interface BuiltSwapTx {
   approveSpender: string | null;
   /** Exact atomic amount to approve — never an unlimited grant. */
   approveAmount: string | null;
-  slippageBps: number;
+  /**
+   * ERC-20 whose allowance is required (= `src`). Not always the intent's
+   * token: a USDT-funded buy approves the USDT contract.
+   */
+  approveToken: string | null;
+  /** 1inch slippage, IN PERCENT (1 = 1%), capped at 50 by the API. */
+  slippagePercent: number;
   intentId?: string;
 }
 

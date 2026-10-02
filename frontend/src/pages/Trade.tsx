@@ -192,8 +192,8 @@ export function Trade({ prefill }: Props) {
               <strong style={{ color: 'var(--text)', display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}><IconInfo size={15} /> Cara Kerja Real Trading:</strong>
               • <strong>Buat intent</strong> → approve di MetaMask → tx dikirim on-chain (dibangun 1inch, ditandatangani wallet kamu).<br />
               • <strong>Limit order &amp; TP/SL otomatis</strong> hanya tersedia di mode virtual (paper).<br />
-              • <strong>BUY</strong> memakai ETH (sisakan ~0.005 ETH untuk gas); <strong>SELL</strong> memakai jumlah token dari wallet.<br />
-              • Slippage dikunci server-side maksimum 1% untuk intent otomatis.
+              • <strong>BUY</strong> memakai USDT bila saldonya cukup (native coin disisakan untuk gas, ~0.0003 BNB di BSC); <strong>SELL</strong> mengembalikan hasil ke USDT.<br />
+              • Slippage dikunci server-side 1% untuk intent otomatis.
             </div>
           </div>
         </div>

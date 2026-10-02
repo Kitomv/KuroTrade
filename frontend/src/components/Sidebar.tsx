@@ -120,29 +120,32 @@ export function Sidebar({ page, onNavigate, username }: {
           <span>{label}</span>
         </button>
       ))}
+      {/* The wallet control is NOT gated on username: it is the only entry to
+          the Real Wallet modal, and a wallet-only account has no username
+          (`/api/me` returns ''), so gating it here made the panel unreachable
+          after a refresh. It renders whenever the sidebar does. */}
+      <RealWalletControl />
       {username && (
-        <>
-          <RealWalletControl />
-          <div className="sidebar-user">
-            <div style={{ fontSize: 11, color: 'var(--muted)', padding: '6px 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              <span className="dot" style={{ width: 8, height: 8, marginRight: 6 }} />{username}
-            </div>
-            <button className="btn" style={{ width: '100%', minHeight: 34, padding: '4px 8px', fontSize: 12 }} onClick={() => onNavigate('settings')}>
-              Akun &amp; Pengaturan
-            </button>
+        <div className="sidebar-user">
+          <div style={{ fontSize: 11, color: 'var(--muted)', padding: '6px 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <span className="dot" style={{ width: 8, height: 8, marginRight: 6 }} />{username}
           </div>
-        </>
+          <button className="btn" style={{ width: '100%', minHeight: 34, padding: '4px 8px', fontSize: 12 }} onClick={() => onNavigate('settings')}>
+            Akun &amp; Pengaturan
+          </button>
+        </div>
       )}
-      {username && (
-        <button type="button" className="nav-item nav-more-btn" onClick={() => setShowMore(true)} aria-label="Menu lainnya" aria-haspopup="dialog">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round">
-            <circle cx="5" cy="12" r="1.6" />
-            <circle cx="12" cy="12" r="1.6" />
-            <circle cx="19" cy="12" r="1.6" />
-          </svg>
-          <span>Lainnya</span>
-        </button>
-      )}
+      {/* Not gated on username either: this is the only route to the secondary
+          pages on mobile (they are hidden in the bottom bar), so hiding it for
+          an account without a username loses navigation, not just a label. */}
+      <button type="button" className="nav-item nav-more-btn" onClick={() => setShowMore(true)} aria-label="Menu lainnya" aria-haspopup="dialog">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round">
+          <circle cx="5" cy="12" r="1.6" />
+          <circle cx="12" cy="12" r="1.6" />
+          <circle cx="19" cy="12" r="1.6" />
+        </svg>
+        <span>Lainnya</span>
+      </button>
 
       {showMore && (
         <Modal title="Menu Lainnya" onClose={() => setShowMore(false)} maxWidth={360}>

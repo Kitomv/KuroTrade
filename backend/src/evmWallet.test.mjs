@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { ethers } from 'ethers';
 import {
   isAllowedRouter, isSupportedChain, checkTradeSize, listEvmChains,
-  USDT_BY_CHAIN, knownSymbol,
+  USDT_BY_CHAIN, knownSymbol, groupTokensByChain,
 } from './evmWallet.js';
 
 const ROUTER = '0x111111125421cA6dc452d289314280a0f8842A65';
@@ -88,4 +88,42 @@ test('knownSymbol is chain-scoped: a USDT address on the wrong chain is not USDT
   assert.equal(knownSymbol('unknown-chain', baseUsdt), null);
   assert.equal(knownSymbol('base', '0x00000000000000000000000000000000deadbeef'), null);
   assert.equal(knownSymbol('base', null), null);
+});
+
+test('groupTokensByChain buckets positions by the chain they were opened on', () => {
+  const grouped = groupTokensByChain([
+    { tokenAddress: '0xAAA0000000000000000000000000000000000001', chainId: 'bsc' },
+    { tokenAddress: '0xBBB0000000000000000000000000000000000002', chainId: 'bsc' },
+    { tokenAddress: '0xCCC0000000000000000000000000000000000003', chainId: 'base' },
+  ]);
+  assert.deepEqual(grouped, {
+    bsc: ['0xAAA0000000000000000000000000000000000001', '0xBBB0000000000000000000000000000000000002'],
+    base: ['0xCCC0000000000000000000000000000000000003'],
+  });
+});
+
+test('groupTokensByChain defaults a legacy position with no chainId to base', () => {
+  // wallet.js records old positions with a base default; valuation must read
+  // the chain they were actually recorded on, not guess another one.
+  const grouped = groupTokensByChain([{ tokenAddress: '0xDDD0000000000000000000000000000000000004' }]);
+  assert.deepEqual(grouped, { base: ['0xDDD0000000000000000000000000000000000004'] });
+});
+
+test('groupTokensByChain drops positions it cannot safely read', () => {
+  const grouped = groupTokensByChain([
+    { tokenAddress: '0xEEE0000000000000000000000000000000000005', chainId: 'solana' }, // unsupported chain
+    { tokenAddress: '', chainId: 'base' },        // no address
+    { chainId: 'base' },                          // no address
+    null,
+    { tokenAddress: '0xFFF0000000000000000000000000000000000006', chainId: 'ethereum' }, // kept
+  ]);
+  // A dropped position is deliberate: there is no RPC that could read it, and
+  // guessing a chain would value a stranger's contract at that address.
+  assert.deepEqual(grouped, { ethereum: ['0xFFF0000000000000000000000000000000000006'] });
+});
+
+test('groupTokensByChain handles an empty or absent list', () => {
+  assert.deepEqual(groupTokensByChain([]), {});
+  assert.deepEqual(groupTokensByChain(undefined), {});
+  assert.deepEqual(groupTokensByChain(null), {});
 });

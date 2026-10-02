@@ -36,7 +36,7 @@ import { flushAll, cleanupTempFiles, DATA_DIR } from './persistence.js';
 import { securityHeaders, redact, sanitizeError, ipRateLimit, userRateLimit, isSafeBaseUrl } from './security.js';
 import {
   listEvmChains, isSupportedChain, getChainConfig, getEvmBalanceNative,
-  getEvmTokenValue, getEvmTotalValue, getNativeUsdPrice, evmQuote, buildSwapTx,
+  getEvmTokenValue, getNativeUsdPrice, evmQuote, buildSwapTx,
   resolveTokenDecimals, isAllowedRouter, getBoundEvmAddress,
 } from './evmWallet.js';
 
@@ -661,19 +661,26 @@ app.get('/api/overview', wrap(async (req, res) => {
   const positions = getPositions(req.userId);
 
   // Real-wallet on-chain total, valued server-side from the bound MetaMask
-  // address. The Portfolio page used to derive the native leg itself by
-  // scanning `markets` for the native mint — but `markets` is watchlist + a few
-  // hardcoded hot tokens and the mint is not guaranteed to be there, so the
-  // total rendered as "—". Server-side pricing is the fix.
+  // address across EVERY supported chain. The Portfolio page used to derive
+  // the native leg itself by scanning `markets` for the native mint — but
+  // `markets` is watchlist + a few hardcoded hot tokens and the mint is not
+  // guaranteed to be there, so the total rendered as "—". Server-side pricing
+  // is the fix. A base-only query was a second bug: a wallet funded on BSC
+  // read as $0.
   let realWalletTotalUsd = null;
   if (isRealMode(req.userId)) {
     try {
       const address = getBoundEvmAddress(req.userId);
-      const { getPositions: livePositions } = await import('./wallet.js');
-      const tokens = [...new Set(livePositions(req.userId).map((p) => p.tokenAddress))];
-      realWalletTotalUsd = address
-        ? await getEvmTotalValue(address, 'base', { tokens })
-        : null;
+      if (address) {
+        const { getEvmPortfolioValue, groupTokensByChain } = await import('./evmWallet.js');
+        const { getPositions: livePositions } = await import('./wallet.js');
+        const portfolio = await getEvmPortfolioValue(address, {
+          tokensByChain: groupTokensByChain(livePositions(req.userId)),
+        });
+        // Unknown (all RPCs failed) must stay null — the UI shows "—", never a
+        // false $0.00.
+        realWalletTotalUsd = portfolio.pricedChains > 0 ? portfolio.totalUsd : null;
+      }
     } catch {}
   }
 

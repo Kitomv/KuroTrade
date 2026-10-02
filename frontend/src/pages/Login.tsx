@@ -5,9 +5,9 @@
 // The wallet path talks to window.ethereum directly through lib/evm.ts, which
 // is context-free — so this page needs no EvmWalletProvider (that one is
 // mounted only after login and is not available here).
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { AUTH } from '../api/client';
-import { hasInjectedWallet, requestAccounts, personalSign } from '../lib/evm';
+import { hasInjectedWallet, requestAccounts, personalSign, subscribeProviders } from '../lib/evm';
 import { IconKey } from '../components/Icons';
 import { CardNeon } from '../components/CardNeon';
 
@@ -17,7 +17,11 @@ export function Login({ onLogin }: { onLogin: (username: string) => void }) {
   const [showPw, setShowPw] = useState(false);
   const [busy, setBusy] = useState<'password' | 'wallet' | null>(null);
   const [err, setErr] = useState('');
-  const walletAvailable = hasInjectedWallet();
+  // Re-check on announce: the extension can be installed or enabled after this
+  // page mounted, and a button stuck on "not detected" until a reload is a
+  // dead end for the user.
+  const [walletAvailable, setWalletAvailable] = useState(() => hasInjectedWallet());
+  useEffect(() => subscribeProviders(() => setWalletAvailable(hasInjectedWallet())), []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -60,7 +64,12 @@ export function Login({ onLogin }: { onLogin: (username: string) => void }) {
       setErr(
         /user rejected|user denied|rejected the request/i.test(raw)
           ? 'Signature dibatalkan di MetaMask'
-          : raw || 'Login wallet gagal',
+          // MetaMask's generic failure. Its usual cause is several wallet
+          // extensions competing for window.ethereum, which sends it down an
+          // extension-selection path that dies without naming the reason.
+          : /unexpected error/i.test(raw)
+            ? 'MetaMask gagal connect. Nonaktifkan ekstensi wallet lain (Rabby/Coinbase/Trust), lalu reload halaman ini.'
+            : raw || 'Login wallet gagal',
       );
     } finally {
       setBusy(null);

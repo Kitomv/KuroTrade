@@ -9,7 +9,7 @@
 import { Modal } from './Modal';
 import { useEvmWallet } from './EvmWalletContext';
 import { useConfirm } from './ConfirmDialog';
-import { shortAddr } from '../lib/evm';
+import { shortAddr, chainNameFromId } from '../lib/evm';
 import { IconAlert, IconCheck, IconGear, IconLock, IconShield } from './Icons';
 
 /** MetaMask reports the chain as a 0x-prefixed id. */
@@ -26,14 +26,14 @@ const CHAIN_LABEL: Record<string, string> = {
 export default function RealWalletModal({ onClose }: { onClose: () => void }) {
   const {
     connected, isBound, realMode, binding, bindError, setRealMode, bindWallet,
-    boundWallet, chainId, address, connect, available,
+    boundWallet, chainId, address, connect, available, chainMismatch, switchToChain,
   } = useEvmWallet();
   const confirmAction = useConfirm();
 
   const network = chainId ? (CHAIN_LABEL[chainId] ?? `Chain ${chainId}`) : 'Tidak terhubung';
   // Base is the default execution path; other chains work too, so this is a
   // hint rather than a hard block.
-  const chainMismatch = Boolean(chainId && chainId !== '0x2105');
+  const offBase = Boolean(chainId && chainId !== '0x2105');
 
   const StepBadge = ({ done }: { done: boolean }) =>
     done ? (
@@ -150,6 +150,21 @@ export default function RealWalletModal({ onClose }: { onClose: () => void }) {
           </span>
         </div>
         {chainMismatch && (
+          <div style={{ margin: '10px 0 0', padding: 10, borderRadius: 8, background: 'var(--down-bg)', border: '1px solid rgba(239,68,68,.35)' }}>
+            <p style={{ margin: 0, fontSize: 11.5, color: 'var(--down)', lineHeight: 1.5 }}>
+              <IconAlert size={12} /> Swap terakhir ditolak: wallet kamu di {network}, transaksinya untuk chain {chainNameFromId(chainMismatch.wanted) ?? chainMismatch.wanted}.
+            </p>
+            <button
+              type="button"
+              className="btn primary"
+              style={{ marginTop: 8, fontSize: 12, minHeight: 32 }}
+              onClick={() => { switchToChain(chainMismatch.wanted).catch(() => {}); }}
+            >
+              Ganti ke {chainNameFromId(chainMismatch.wanted) ?? `chain ${chainMismatch.wanted}`}
+            </button>
+          </div>
+        )}
+        {offBase && !chainMismatch && (
           <p style={{ margin: '10px 0 0', fontSize: 11, color: 'var(--down)', lineHeight: 1.5 }}>
             Wallet kamu di {network}. Ganti ke Base di MetaMask agar swap memakai likuiditas paling dalam.
           </p>

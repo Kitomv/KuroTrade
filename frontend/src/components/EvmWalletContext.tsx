@@ -11,13 +11,38 @@ import React, {
 } from 'react';
 import { api, RealIntent } from '../api/client';
 import {
-  getAccounts, getChainIdHex, hasInjectedWallet, personalSign, requestAccounts,
-  sendTransaction, waitForReceipt, switchChain,
+  chainNameFromId, currentChainIdHex, getAccounts, getChainIdHex, getInjectedProvider, personalSign,
+  requestAccounts, sendTransaction, subscribeProviders, toHexChainId, waitForReceipt, switchChain,
 } from '../lib/evm';
 
 /** 1inch router — must match ONE_INCH_ROUTER in backend/src/evmWallet.js. */
 const ALLOWED_ROUTER = '0x111111125421ca6dc452d289314280a0f8842a65';
 const ERC20_APPROVE_SELECTOR = '0x095ea7b3'; // approve(address,uint256)
+
+/** Display name for a chain id, falling back to the raw value. */
+function chainLabel(chain: string | number | null): string {
+  return chainNameFromId(chain) ?? String(chain ?? 'tidak dikenal');
+}
+
+/**
+ * The wallet is on a different chain than the trade was built for.
+ *
+ * Carries both chain ids so the caller can offer a one-click switch rather
+ * than showing a raw hex number. It is deliberately NOT a user rejection: the
+ * intent is still fine, it just needs the wallet pointed somewhere else first,
+ * so it must not be added to `skippedRef` and forgotten.
+ */
+class ChainMismatchError extends Error {
+  readonly wanted: number;
+  readonly current: string;
+  constructor(wanted: number, current: string) {
+    const where = current === '' ? 'chain yang tidak terbaca' : chainLabel(current);
+    super(`MetaMask di ${where}, transaksi butuh ${chainLabel(wanted)} (chain ${wanted})`);
+    this.name = 'ChainMismatchError';
+    this.wanted = wanted;
+    this.current = current;
+  }
+}
 
 interface EvmWalletState {
   loaded: boolean;
@@ -34,12 +59,15 @@ interface EvmWalletState {
   openIntents: RealIntent[];
   approvingId: string | null;
   approveError: string;
+  /** Non-null when a swap was refused because MetaMask is on another chain. */
+  chainMismatch: { intentId: string; wanted: number; current: string } | null;
   connect: () => Promise<void>;
   setRealMode: (on: boolean) => Promise<void>;
   bindWallet: () => Promise<boolean>;
   approveIntent: (intent: RealIntent) => Promise<void>;
   cancelIntent: (intent: RealIntent) => Promise<void>;
   refreshIntents: () => Promise<void>;
+  switchToChain: (chainId: number) => Promise<void>;
 }
 
 const EvmWalletContext = createContext<EvmWalletState | null>(null);
@@ -66,8 +94,14 @@ export function EvmWalletProvider({ children }: { children: React.ReactNode }) {
   const [intents, setIntents] = useState<RealIntent[]>([]);
   const [approvingId, setApprovingId] = useState<string | null>(null);
   const [approveError, setApproveError] = useState('');
+  // Set when a swap was refused because MetaMask is on another chain. The UI
+  // offers a one-click switch instead of leaving the user to find the network
+  // picker themselves.
+  const [chainMismatch, setChainMismatch] = useState<
+    { intentId: string; wanted: number; current: string } | null
+  >(null);
 
-  const available = hasInjectedWallet();
+  const [available, setAvailable] = useState(false);
   const runningRef = useRef(false);                              // one swap in flight
   const skippedRef = useRef<Set<string>>(new Set());             // user-rejected / permanent-fail ids
   const attemptsRef = useRef<Map<string, number>>(new Map());    // per-intent retry counter (session)
@@ -87,6 +121,8 @@ export function EvmWalletProvider({ children }: { children: React.ReactNode }) {
   // so switching accounts in the extension does not leave a stale address here.
   useEffect(() => {
     let cancelled = false;
+    const provider = getInjectedProvider();
+    setAvailable(provider !== null);
     const sync = async () => {
       try {
         const [accounts, chain] = await Promise.all([getAccounts(), getChainIdHex()]);
@@ -98,18 +134,31 @@ export function EvmWalletProvider({ children }: { children: React.ReactNode }) {
       } catch {}
       if (!cancelled) setLoaded(true);
     };
-    sync();
-    const provider = (globalThis as {
-      ethereum?: { on?: (e: string, h: () => void) => void; removeListener?: (e: string, h: () => void) => void };
-    }).ethereum;
-    const onChange = () => { sync(); };
-    provider?.on?.('accountsChanged', onChange);
-    provider?.on?.('chainChanged', onChange);
-    return () => {
-      cancelled = true;
-      provider?.removeListener?.('accountsChanged', onChange);
-      provider?.removeListener?.('chainChanged', onChange);
-    };
+    // Without MetaMask there is nothing to talk to, and calling into whatever
+    // else claimed window.ethereum is what produced MetaMask's opaque
+    // "Unexpected error". Stay unloaded; the UI shows the install prompt.
+    if (provider) {
+      sync();
+      const onChange = () => { sync(); };
+      provider.on?.('accountsChanged', onChange);
+      provider.on?.('chainChanged', onChange);
+      return () => {
+        cancelled = true;
+        provider.removeListener?.('accountsChanged', onChange);
+        provider.removeListener?.('chainChanged', onChange);
+      };
+    }
+    // MetaMask can be installed or enabled after this page mounted. Pick it up
+    // when it announces rather than requiring a reload.
+    const unsubscribe = subscribeProviders(() => {
+      if (cancelled || getInjectedProvider()) {
+        setAvailable(true);
+        unsubscribe();
+        setLoaded(true);
+      }
+    });
+    setLoaded(true);
+    return () => { cancelled = true; unsubscribe(); };
   }, []);
 
   // Load server-side mode + bind state whenever the active account changes.
@@ -165,6 +214,28 @@ export function EvmWalletProvider({ children }: { children: React.ReactNode }) {
     setChainId((await getChainIdHex()) || null);
   }, []);
 
+  /**
+   * Point the wallet at the chain a pending swap was built for.
+   *
+   * Re-reads `eth_chainId` afterwards rather than assuming the switch landed:
+   * the user can decline the MetaMask prompt, and treating a declined switch as
+   * success would send the tx to the wrong chain — the exact failure the chain
+   * check exists to prevent.
+   */
+  const switchToChain = useCallback(async (chainId: number) => {
+    const hex = toHexChainId(chainId);
+    await switchChain(hex);
+    const now = await currentChainIdHex();
+    if (now !== hex) {
+      throw new Error(`Ganti chain gagal — MetaMask masih di ${chainLabel(now)}`);
+    }
+    if (mountedRef.current) {
+      setChainId(now);
+      setChainMismatch(null);
+      setApproveError('');
+    }
+  }, []);
+
   const setRealMode = useCallback(async (on: boolean) => {
     setRealModeState(on);
     try {
@@ -214,9 +285,6 @@ export function EvmWalletProvider({ children }: { children: React.ReactNode }) {
     let claimed = false;
     let sentHash: string | null = null;
     try {
-      await api.realIntentStatus(intent.id, 'active', claimToken);
-      claimed = true;
-
       const built = await api.realSwapTx({ intentId: intent.id, from: address, chain: intent.chainId });
 
       // The router is the only contract we will ever grant an allowance to.
@@ -224,6 +292,43 @@ export function EvmWalletProvider({ children }: { children: React.ReactNode }) {
       // sign anything — this is the client half of the server's allow-list.
       if (String(built.to).toLowerCase() !== ALLOWED_ROUTER) {
         throw new Error('Router swap tidak dikenal — eksekusi dibatalkan demi keamanan');
+      }
+
+      // Chain check BEFORE any signature. 1inch's router is CREATE2-deployed at
+      // the same address on every chain, so the router check above passes even
+      // when the wallet sits on the wrong network — eth_sendTransaction would
+      // then execute on that chain, reverting (gas burned) for a buy or landing
+      // an allowance for a same-address token with different meaning for a sell.
+      // Offer the switch; never silently execute on the wrong chain.
+      //
+      // Fail CLOSED when the chain cannot be read: an unreadable eth_chainId
+      // must refuse the trade, not skip the check. The previous `haveChain &&`
+      // form let an RPC hiccup bypass the guard entirely — the one case where
+      // it matters most, because an unreadable chain is also the state where
+      // the wallet may be anywhere.
+      const wantChain = toHexChainId(built.chainId);
+      let haveChain: string;
+      try {
+        haveChain = await currentChainIdHex();
+      } catch {
+        haveChain = '';
+      }
+      if (!haveChain || haveChain !== wantChain) {
+        throw new ChainMismatchError(built.chainId, haveChain);
+      }
+
+      await api.realIntentStatus(intent.id, 'active', claimToken);
+      claimed = true;
+
+      // Re-read the active account after the await chain above: the user can
+      // switch accounts in MetaMask while the request is in flight, and sending
+      // `from` with a stale address either makes MetaMask refuse the tx or, on
+      // a provider that does not enforce `from`, signs from the wrong account.
+      const liveAccounts = await getAccounts();
+      const liveAddress = liveAccounts[0] ?? null;
+      if (!liveAddress || liveAddress.toLowerCase() !== address.toLowerCase()) {
+        if (claimed) { try { await api.realIntentStatus(intent.id, 'open', claimToken); } catch {} }
+        throw new Error('Akun MetaMask berubah di tengah transaksi — intent dibuka kembali, ulangi dengan akun yang benar');
       }
 
       // ERC-20 input needs an allowance. Approve the EXACT amount, never an
@@ -262,7 +367,15 @@ export function EvmWalletProvider({ children }: { children: React.ReactNode }) {
       skippedRef.current.delete(intent.id);
     } catch (e: unknown) {
       const msg = String((e as { message?: string })?.message ?? e);
-      if (/user rejected|user denied|rejected the request/i.test(msg)) {
+      if (e instanceof ChainMismatchError) {
+        // Not a rejection and not permanent — the intent is untouched (the
+        // claim happens after this check), so offer the switch and stop. The
+        // user retries once the wallet is on the right network.
+        if (mountedRef.current) {
+          setChainMismatch({ intentId: intent.id, wanted: e.wanted, current: e.current });
+          setApproveError(e.message);
+        }
+      } else if (/user rejected|user denied|rejected the request/i.test(msg)) {
         // The user said no. Reopen so they can retry later, but do not nag.
         skippedRef.current.add(intent.id);
         if (claimed) { try { await api.realIntentStatus(intent.id, 'open', claimToken); } catch {} }
@@ -328,13 +441,13 @@ export function EvmWalletProvider({ children }: { children: React.ReactNode }) {
   const value = useMemo<EvmWalletState>(() => ({
     loaded, available, connected, address, chainId,
     realMode, boundWallet, isBound, binding, bindError,
-    intents, openIntents, approvingId, approveError,
-    connect, setRealMode, bindWallet, approveIntent, cancelIntent, refreshIntents,
+    intents, openIntents, approvingId, approveError, chainMismatch,
+    connect, setRealMode, bindWallet, approveIntent, cancelIntent, refreshIntents, switchToChain,
   }), [
     loaded, available, connected, address, chainId,
     realMode, boundWallet, isBound, binding, bindError,
-    intents, openIntents, approvingId, approveError,
-    connect, setRealMode, bindWallet, approveIntent, cancelIntent, refreshIntents,
+    intents, openIntents, approvingId, approveError, chainMismatch,
+    connect, setRealMode, bindWallet, approveIntent, cancelIntent, refreshIntents, switchToChain,
   ]);
 
   return <EvmWalletContext.Provider value={value}>{children}</EvmWalletContext.Provider>;

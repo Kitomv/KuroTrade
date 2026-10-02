@@ -965,7 +965,9 @@ async function runScoutPhase(userId, st, { markets, positions, wallet }) {
       if (boundAddress) {
         const tokens = getPositions(userId).map((p) => p.tokenAddress);
         realTotalUsd = await getEvmTotalValue(boundAddress, 'base', { tokens });
-        realTokenUsd = (await getEvmTokenValue(boundAddress, 'base', tokens)).valueUsd;
+        // exposureUsd, NOT valueUsd: USDT is undeployed cash, so a wallet
+        // funded with USDT must not read as 100% exposure and block every buy.
+        realTokenUsd = (await getEvmTokenValue(boundAddress, 'base', tokens)).exposureUsd;
       }
     } catch {
       // keep null → gates fall back to virtual (never break the tick)

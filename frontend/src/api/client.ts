@@ -626,6 +626,6 @@ export const api = {
     req<{
       address: string; chain: string; native: number; nativeUsd: number | null;
       tokenValueUsd: number; totalUsd: number | null;
-      holdings: { token: string; amount: number; decimals: number; priceUsd: number | null; valueUsd: number | null }[];
+      holdings: { token: string; symbol: string | null; amount: number; decimals: number; priceUsd: number | null; valueUsd: number | null }[];
     }>(`/api/real/portfolio?chain=${encodeURIComponent(chain)}`),
 };

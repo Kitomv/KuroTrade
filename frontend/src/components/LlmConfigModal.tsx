@@ -66,7 +66,11 @@ function entriesFromConfig(cfg: LLMConfig | null): Entry[] {
 export function LlmConfigModal({ onClose }: Props) {
   const toast = useToast();
   const [cfg, setCfg] = useState<LLMConfig | null>(null);
-  const [entries, setEntries] = useState<Entry[]>(() => entriesFromConfig(null));
+  // Start with `null` (not the placeholder default) so the form stays hidden
+  // until the real config loads. Rendering the form first with placeholder
+  // values and then overwriting them caused the "modal resets my input" bug:
+  // if the user typed quickly, the fetch resolve would stomp their draft.
+  const [entries, setEntries] = useState<Entry[] | null>(null);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState('');
   // Per-row: fetched model list (datalist) + last connection-test result.
@@ -74,22 +78,23 @@ export function LlmConfigModal({ onClose }: Props) {
   const [busy, setBusy] = useState<Record<number, 'models' | 'test' | undefined>>({});
   const [testResult, setTestResult] = useState<Record<number, { ok: boolean; text: string } | undefined>>({});
 
-  // Load the stored stack once, so the form opens on the user's real config
-  // rather than the placeholder default.
+  // Load the stored stack once. Only set `entries` here — never again — so a
+  // slow network response cannot stomp what the user has already started typing.
   useEffect(() => {
     let cancelled = false;
     api.getLLMConfig()
       .then((c) => { if (!cancelled) { setCfg(c); setEntries(entriesFromConfig(c)); } })
-      .catch(() => {});
+      .catch(() => { if (!cancelled) setEntries(entriesFromConfig(null)); });
     return () => { cancelled = true; };
   }, []);
 
   const patch = useCallback((idx: number, change: Partial<Entry>) => {
-    setEntries((prev) => prev.map((x, i) => (i === idx ? { ...x, ...change } : x)));
+    setEntries((prev) => prev ? prev.map((x, i) => (i === idx ? { ...x, ...change } : x)) : prev);
   }, []);
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!entries) return;
     setSaving(true);
     setErr('');
     try {
@@ -116,7 +121,7 @@ export function LlmConfigModal({ onClose }: Props) {
 
   /** Fetch /v1/models for one row (the 9router-style combo). */
   const handleLoadModels = async (idx: number) => {
-    const entry = entries[idx];
+    const entry = entries?.[idx];
     if (!entry) return;
     setBusy((b) => ({ ...b, [idx]: 'models' }));
     setTestResult((r) => ({ ...r, [idx]: undefined }));
@@ -136,7 +141,7 @@ export function LlmConfigModal({ onClose }: Props) {
 
   /** Probe the connection (models first, chat ping fallback) — show the message verbatim. */
   const handleTest = async (idx: number) => {
-    const entry = entries[idx];
+    const entry = entries?.[idx];
     if (!entry) return;
     setBusy((b) => ({ ...b, [idx]: 'test' }));
     try {
@@ -171,6 +176,15 @@ export function LlmConfigModal({ onClose }: Props) {
 
       {err && <div className="error" style={{ marginBottom: 12 }}>{err}</div>}
 
+      {/* Hold the form until the stored config arrives, so the first render
+          never shows placeholder values that a late fetch would overwrite. */}
+      {!entries && (
+        <div style={{ padding: '28px 0', textAlign: 'center', color: 'var(--muted)', fontSize: 13 }}>
+          Memuat konfigurasi…
+        </div>
+      )}
+
+      {entries && (
       <form onSubmit={handleSave}>
         {entries.map((entry, idx) => (
           <div key={idx} style={{ border: '1px solid var(--border)', borderRadius: 10, padding: 12, marginBottom: 12 }}>
@@ -183,7 +197,7 @@ export function LlmConfigModal({ onClose }: Props) {
                   type="button"
                   className="btn icon"
                   style={{ minHeight: 26, minWidth: 26, padding: 2, fontSize: 11 }}
-                  onClick={() => setEntries((prev) => prev.filter((_, i) => i !== idx))}
+                  onClick={() => setEntries((prev) => prev ? prev.filter((_, i) => i !== idx) : prev)}
                   aria-label={`Hapus provider ${idx}`}
                 >
                   ✕
@@ -297,7 +311,7 @@ export function LlmConfigModal({ onClose }: Props) {
           type="button"
           className="btn"
           style={{ width: '100%', marginBottom: 14, fontSize: 12, minHeight: 36 }}
-          onClick={() => setEntries((prev) => [...prev, { ...NEW_ENTRY }])}
+          onClick={() => setEntries((prev) => [...(prev ?? []), { ...NEW_ENTRY }])}
         >
           + Tambah Provider (Fallback / Role)
         </button>
@@ -309,6 +323,7 @@ export function LlmConfigModal({ onClose }: Props) {
           </button>
         </div>
       </form>
+      )}
     </Modal>
   );
 }

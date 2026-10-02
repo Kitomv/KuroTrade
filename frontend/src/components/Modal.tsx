@@ -15,15 +15,24 @@ interface Props {
 
 export function Modal({ title, onClose, children, actions, maxWidth = 480 }: Props) {
   const dialogRef = useRef<HTMLDivElement>(null);
+  // onClose inline di caller (= identitas baru tiap render parent / tiap poll
+  // 4s). Effect di bawah harus jalan sekali saat mount, bukan tiap onClose
+  // ganti — kalau tidak, cleanup prev?.focus() + first?.focus() narik kursor
+  // keluar field ke tombol close setiap tick.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
-  // Esc to close + focus restore to the opener.
+  // Mount-once. onClose inline ganti identitas tiap poll 4s — deps [onClose]
+  // bikin effect rerun + focus ditarik ke tombol X tiap tick.
   useEffect(() => {
     const prev = document.activeElement as HTMLElement | null;
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onCloseRef.current(); };
     const prevOverflow = document.body.style.overflow;
     document.body.style.overflow = 'hidden'; // lock scroll behind the modal
     const focusable = 'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
-    const first = dialogRef.current?.querySelector<HTMLElement>(focusable);
+    // Prefer field form, bukan tombol X di header.
+    const body = dialogRef.current?.querySelector<HTMLElement>('.modal-body');
+    const first = body?.querySelector<HTMLElement>('input, select, textarea') ?? dialogRef.current?.querySelector<HTMLElement>(focusable);
     first?.focus();
 
     // Guard against recursive refocus: `first.focus()` dispatches a new

@@ -75,7 +75,6 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
   // Real-wallet auto-approve was removed (autopilot + hot wallet execute now).
   // No local realAuto state needed — realMode only.
 
-  const logsEndRef = useRef<HTMLDivElement>(null);
   const logScrollRef = useRef<HTMLDivElement>(null);
 
   // Re-engage follow mode once the reader scrolls back to the bottom.
@@ -91,24 +90,33 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
     }
   }, [followLogs]);
 
+  // Seed the Guardian drawer ONCE per open, from the latest server config.
+  //
+  // The previous version synced on every 4s poll: a poll landing while the
+  // user was still typing overwrote the field with the stored value — the
+  // "config resets itself before I hit save" bug. Now the effect only seeds
+  // on open (and again when the first payload arrives if it was not there
+  // yet); after that, the server poll never touches the form.
+  const configSeededRef = useRef(false);
   useEffect(() => {
-    if (autopilot) {
-      setTakeProfit(autopilot.takeProfitPct ?? 15);
-      setStopLoss(autopilot.stopLossPct ?? 7);
-      setTrailingStop(autopilot.trailingStopPct ?? 4);
-      setTrailingTrigger(autopilot.trailingTriggerPct ?? 6);
-      setMoonbagX(autopilot.moonbagX ?? 2);
-      setMaxPositions(autopilot.maxOpenPositions ?? 3);
-      setRiskLevel(autopilot.riskLevel ?? 'medium');
-      setMinConf(autopilot.minConfidence ?? 75);
-      setRotateAfterHours(autopilot.rotateAfterHours ?? 24);
-      setMaxExposurePct(autopilot.maxExposurePct ?? 80);
-      setAgentMode(autopilot.agentMode ?? 'blend');
-      setLlmTimeoutMs(autopilot.llmTimeoutMs ?? 30000);
-      setScanConcurrency(autopilot.scanConcurrency ?? 3);
-      setEnableLeadSynthesis(autopilot.enableLeadSynthesis !== false);
-    }
-  }, [autopilot]);
+    if (!showConfig) { configSeededRef.current = false; return; }
+    if (configSeededRef.current || !autopilot) return;
+    configSeededRef.current = true;
+    setTakeProfit(autopilot.takeProfitPct ?? 15);
+    setStopLoss(autopilot.stopLossPct ?? 7);
+    setTrailingStop(autopilot.trailingStopPct ?? 4);
+    setTrailingTrigger(autopilot.trailingTriggerPct ?? 6);
+    setMoonbagX(autopilot.moonbagX ?? 2);
+    setMaxPositions(autopilot.maxOpenPositions ?? 3);
+    setRiskLevel(autopilot.riskLevel ?? 'medium');
+    setMinConf(autopilot.minConfidence ?? 75);
+    setRotateAfterHours(autopilot.rotateAfterHours ?? 24);
+    setMaxExposurePct(autopilot.maxExposurePct ?? 80);
+    setAgentMode(autopilot.agentMode ?? 'blend');
+    setLlmTimeoutMs(autopilot.llmTimeoutMs ?? 30000);
+    setScanConcurrency(autopilot.scanConcurrency ?? 3);
+    setEnableLeadSynthesis(autopilot.enableLeadSynthesis !== false);
+  }, [showConfig, autopilot]);
 
   // Oldest first, newest at the BOTTOM — like a real terminal/console. The
   // backend unshifts (newest at index 0) and caps the buffer with pop(), so
@@ -163,7 +171,12 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
   const seenCountRef = useRef(0);
   useEffect(() => {
     if (followLogs) {
-      logsEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      // Scroll ONLY the log container. `scrollIntoView` walks every scrollable
+      // ancestor, so each 4s poll yanked the whole PAGE down to the log's
+      // bottom edge — right above the Equity chart. Anyone reading the page
+      // below the terminal was dragged back every tick.
+      const el = logScrollRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
       seenCountRef.current = rawLogCount;
       setUnseenLogs(0);
     } else {
@@ -743,7 +756,6 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
                     : '[Terminal Ready] Menunggu sinyal Auto-Pilot...'}
               </div>
             )}
-            <div ref={logsEndRef} />
           </div>
 
           {/* Resumes following the tail after the reader scrolled away. */}

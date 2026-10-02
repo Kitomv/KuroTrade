@@ -171,6 +171,9 @@ export function RealTradeForm() {
                 <span>
                   <strong style={{ color: i.side === 'buy' ? 'var(--up)' : 'var(--down)' }}>{i.side.toUpperCase()}</strong>
                   {' '}{i.symbol} · ${Number(i.amountUsd).toFixed(2)}
+                  <span style={{ color: 'var(--muted)' }}>
+                    {' · '}{i.side === 'buy' ? `bayar ${i.fundingToken === 'usdt' ? 'USDT' : 'native'}` : 'hasil ke USDT'}
+                  </span>
                 </span>
                 <span style={{ display: 'flex', gap: 6 }}>
                   <button type="button" className="btn" style={{ fontSize: 11, minHeight: 28 }} disabled={approvingId !== null} onClick={() => cancelIntent(i)}>Batal</button>

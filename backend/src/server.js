@@ -24,6 +24,7 @@ import {
   initAutopilot,
 } from './aiAgent.js';
 import { getLLMConfig, setLLMConfig, listModels, testConnection } from './llmClient.js';
+import { subscribeUser, pushForUser, pushLlmForUser } from './agentStream.js';
 import {
   isRealMode, setRealMode,
   getRealIntents, getRealIntent, setRealIntentStatus, addRealIntent,
@@ -868,12 +869,33 @@ app.get('/api/agents/signals', rateLimit('signals', 30), wrap(async (req, res) =
   res.json(signals);
 }));
 
+// --- Realtime stream for the Agents page ---
+// One long-lived connection replaces the 4s/5s/10s poll trio. Exempt from the
+// signals rate limiter on purpose: it is a single connection, not a request
+// flood, and the per-tick signal fetch it triggers goes through the same
+// scanMarketSignals cache/TLL gate the REST route uses.
+app.get('/api/agents/stream', ipRateLimit({ max: 20, windowMs: 60_000 }), (req, res) => {
+  try {
+    subscribeUser(req.userId, req, res);
+  } catch (e) {
+    console.warn(`[agents-stream] ${req.userId}: ${sanitizeError(e?.message ?? e)}`);
+    if (!res.headersSent) res.status(500).end();
+    else res.end();
+  }
+});
+
 app.get('/api/agents/autopilot', (req, res) => res.json(getAutopilot(req.userId)));
 app.post('/api/agents/autopilot', (req, res) => {
-  res.json(setAutopilot(req.userId, req.body ?? {}));
+  const out = setAutopilot(req.userId, req.body ?? {});
+  // The toggle is the most latency-sensitive action on this page: push the new
+  // status immediately instead of making the client wait out the next tick.
+  pushForUser(req.userId);
+  res.json(out);
 });
 app.post('/api/agents/autopilot/clear-logs', (req, res) => {
-  res.json(clearAutopilotLogs(req.userId));
+  const out = clearAutopilotLogs(req.userId);
+  pushForUser(req.userId);
+  res.json(out);
 });
 
 // --- LLM Cloud Provider Settings (multi-provider per user) ---
@@ -888,6 +910,7 @@ app.post('/api/llm/config', (req, res) => {
     }
   }
   res.json(setLLMConfig(req.userId, body));
+  pushLlmForUser(req.userId);
 });
 
 // Model list for the settings combo box — POST so apiKey is in the body,
@@ -993,6 +1016,10 @@ setInterval(async () => {
       } catch (e) {
         console.warn(`[autopilot] ${userId}: ${sanitizeError(e?.message ?? e)}`);
       }
+      // Push whatever the tick just changed to any open Agents tab. Cheap when
+      // nobody is watching (one map lookup), and it is what makes the guardian
+      // terminal update within a tick instead of up to a poll interval later.
+      pushForUser(userId);
     }
   } finally {
     autopilotTickRunning = false;

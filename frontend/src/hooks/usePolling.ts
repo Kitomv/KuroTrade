@@ -11,6 +11,12 @@
 // backgrounded tab polling /api/agents/signals was still buying Bull/Bear
 // scans. User instruction: "pause semua polling saat tab hidden".
 //
+// `enabled` (default true) switches polling off entirely. The Agents page uses
+// it to run these four pollers ONLY while its SSE stream is down — deps alone
+// cannot do this, because the effect always starts on mount and on any deps
+// change; it never stops. Flipping enabled true fires one immediate tick, so a
+// dropped stream is caught up on the first visible frame.
+//
 // API change for callers: returns `{ data, stale }` (was `data`). Pages do
 // `const p = usePolling(...)` then `p.data` / `p.stale`.
 // Importers/callers: Overview, Trending, Watchlist, Chart, Trade, Portfolio,
@@ -28,6 +34,7 @@ export function usePolling<T>(
   fn: () => Promise<T>,
   intervalMs = 15_000,
   deps: unknown[] = [],
+  enabled = true,
 ): PollingResult<T> {
   const [data, setData] = useState<T>();
   const [stale, setStale] = useState(false);
@@ -40,6 +47,7 @@ export function usePolling<T>(
   const TICK_TIMEOUT_MS = 45_000;
 
   useEffect(() => {
+    if (!enabled) return;
     let cancelled = false;
     let id: ReturnType<typeof setInterval> | null = null;
     const tick = () => {
@@ -81,7 +89,7 @@ export function usePolling<T>(
       document.removeEventListener('visibilitychange', onVisibility);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, deps);
+  }, [enabled, ...deps]);
 
   return { data, stale };
 }

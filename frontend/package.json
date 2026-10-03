@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "check": "node scripts/evmDiscovery.check.mts && node scripts/chainMap.check.mts"
+    "check": "node scripts/evmDiscovery.check.mts && node scripts/chainMap.check.mts && node scripts/agentStream.check.mts"
   },
   "dependencies": {
     "react": "^18.3.1",

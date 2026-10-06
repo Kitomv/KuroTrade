@@ -250,16 +250,17 @@ export interface AutopilotStats {
   winRate: number;
 }
 
-export interface SignalHistoryEntry {
+export interface SignalOutcomeEntry {
   ts: number;
   symbol: string;
   address: string;
+  chainId?: string;
   signal: 'STRONG_BUY' | 'BUY' | 'HOLD' | 'SELL';
   confidence: number;
   entryPrice: number;
-  bull: { score: number; thesis: string[] };
-  bear: { score: number; risks: string[] };
-  llmPowered: boolean;
+  /** 'signal' = acted on; 'nearMiss' = skipped and tracked to audit the skip. */
+  kind?: 'signal' | 'nearMiss';
+  reason?: string;
   price1h?: number;
   price24h?: number;
 }
@@ -385,7 +386,7 @@ export interface AutopilotConfig {
   stats: AutopilotStats;
   logs: AutopilotLog[];
   pnlHistory?: { ts: number; totalValue: number }[];
-  signalHistory?: SignalHistoryEntry[];
+  signalOutcomes?: SignalOutcomeEntry[];
   signalAccuracy?: SignalAccuracy;
   memory?: MemoryEntry[];
   nearMisses?: NearMissEntry[];

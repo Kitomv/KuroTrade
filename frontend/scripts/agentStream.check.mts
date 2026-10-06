@@ -14,7 +14,7 @@
 
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -169,9 +169,9 @@ function drain(chunks: string[]): Array<{ event: string; data: unknown }> {
 
   // Payload size. `getAutopilot` returns ~180 KB; the UI reads a fraction of it.
   // `pendingSignals` (the accuracy pipeline's queue) is never rendered, and only
-  // the top 30 rows of `signalHistory` are drawn.
+  // the top 30 rows of `signalOutcomes` are drawn.
   assert.ok(/pendingSignals:\s*undefined/.test(code), 'the never-rendered pendingSignals queue must not be shipped');
-  assert.ok(/signalHistory:.*slice\(0, SIGNAL_HISTORY_LIMIT\)/.test(code), 'signalHistory must be truncated to what the UI draws');
+  assert.ok(/signalOutcomes:.*slice\(0, SIGNAL_OUTCOMES_LIMIT\)/.test(code), 'signalOutcomes must be truncated to what the UI draws');
   assert.ok(/signalStats:\s*undefined/.test(code) && /slCooldowns:\s*undefined/.test(code));
 
   // Serialize once per push, not once per subscriber: `JSON.stringify` on this
@@ -339,27 +339,16 @@ function drain(chunks: string[]): Array<{ event: string; data: unknown }> {
 
 /* ---------------- change signatures ---------------- */
 
-// Mirror of backend/src/agentStream.js autopilotSignature, exercised through
-// the same field list so a field the UI renders cannot be dropped silently.
-function autopilotSignature(ap: any): string {
-  const logs = ap?.logs ?? [];
-  const last = logs.length ? logs[0] : null;
-  const eq = ap?.pnlHistory ?? [];
-  const lastEq = eq.length ? eq[eq.length - 1] : null;
-  return [
-    ap?.enabled ? 1 : 0,
-    ap?.status ?? '',
-    ap?.lastScanAt ?? 0,
-    logs.length,
-    last ? last.ts : 0,
-    ap?.guardedPositionsCount ?? 0,
-    (ap?.guardedPositions ?? []).map((p: any) => `${p.address}${p.pnlPct}${p.status}${p.missingTicks}`).join(','),
-    eq.length,
-    lastEq ? `${lastEq.ts}:${lastEq.totalValue}` : '',
-    ap?.stats?.totalTrades ?? 0,
-    ap?.stats?.totalProfitUsd ?? 0,
-  ].join('|');
-}
+// The REAL functions, imported from backend/src/changeSignatures.js — which has
+// no imports at all precisely so this import works. The previous version of this
+// file kept a hand-copied mirror and tied the two together with a substring scan
+// over four field names; that arrangement passed with the copy silently diverging
+// (verified by mutation: deleting a field from the real backend signature left
+// this check green). A copy that reports coverage it does not have is worse than
+// no test, so there is no copy here any more.
+const { autopilotSignature, signalsSignature } = await import(
+  pathToFileURL(join(here, '..', '..', 'backend', 'src', 'changeSignatures.js')).href
+);
 
 const base = {
   enabled: true, status: 'GUARDIAN', lastScanAt: 1000,
@@ -374,15 +363,17 @@ const sig0 = autopilotSignature(base);
 for (const [label, mutate] of [
   ['enabled', (o: any) => { o.enabled = false; }],
   ['status', (o: any) => { o.status = 'SCANNING'; }],
-  ['lastScanAt', (o: any) => { o.lastScanAt = 2000; }],
   ['a new log line', (o: any) => { o.logs.unshift({ ts: 11, msg: 'b' }); }],
   ['a guarded PnL move', (o: any) => { o.guardedPositions[0].pnlPct = 9; }],
   ['a guarded status flip', (o: any) => { o.guardedPositions[0].status = 'TP_TRIGGER'; }],
   ['a missing-market tick', (o: any) => { o.guardedPositions[0].missingTicks = 3; }],
   ['a new position', (o: any) => { o.guardedPositions.push({ address: '0x2', pnlPct: 1, status: 'GUARDED', missingTicks: 0 }); o.guardedPositionsCount = 2; }],
   ['an equity point', (o: any) => { o.pnlHistory.push({ ts: 10, totalValue: 110 }); }],
+  ['an equity value move at the same point count', (o: any) => { o.pnlHistory[0].totalValue = 105; }],
   ['realized PnL', (o: any) => { o.stats.totalProfitUsd = 12; }],
   ['a closed trade', (o: any) => { o.stats.totalTrades = 2; }],
+  ['a new signal outcome row', (o: any) => { o.signalOutcomes = [{ address: '0x1', ts: 5, signal: 'BUY', confidence: 80, entryPrice: 1 }]; }],
+  ['a resolved 1h outcome', (o: any) => { o.signalOutcomes = [{ address: '0x1', ts: 5, signal: 'BUY', confidence: 80, entryPrice: 1, price1h: 1.1 }]; }],
 ] as Array<[string, (o: any) => void]>) {
   const next = structuredClone(base);
   mutate(next);
@@ -393,16 +384,106 @@ for (const [label, mutate] of [
 // tick for nothing, which is the cost this feature exists to remove.
 assert.equal(autopilotSignature(structuredClone(base)), sig0, 'an identical snapshot must not re-push');
 
+// THE regression this guards, and the one that made the old signature useless:
+// a field that moves on every tick but that the UI never renders forces a full
+// ~180 KB payload per subscriber per 5s, so the dedupe above never fires and
+// the whole change costs only what it was built to save. `lastScanAt` and
+// `pnlHistory[].ts` were both in that category — nothing in Agents.tsx or
+// EquityChart.tsx reads either. If one of these two assertions has to be
+// deleted to make an edit pass, the edit is wrong, not the assertion.
+{
+  const nextTickOnly = structuredClone(base);
+  nextTickOnly.lastScanAt = 2000;
+  nextTickOnly.pnlHistory[0].ts = 99;
+  assert.equal(
+    autopilotSignature(nextTickOnly),
+    sig0,
+    'lastScanAt and pnlHistory[].ts are unrendered — they must stay out of the signature',
+  );
+}
+
 // Missing fields must not crash the signature (an account hydrated from an old
 // save has no pnlHistory / guardedPositions at all).
 assert.equal(typeof autopilotSignature({ enabled: false }), 'string');
 
-// The backend file must expose exactly these two signature helpers.
+// The radar signature: a price move must count, since the table prints the
+// entry price on every row.
+{
+  const rows = [
+    { token: { address: '0x1' }, verdict: { signal: 'BUY', confidence: 80, entryPrice: 1.5, targetPrice: 1.725 } },
+  ];
+  const sig = signalsSignature(rows);
+  assert.notEqual(sig, 'empty');
+  assert.equal(signalsSignature(structuredClone(rows)), sig);
+  rows[0].verdict.entryPrice = 1.6;
+  assert.notEqual(signalsSignature(rows), sig, 'a price move must re-push the radar');
+  assert.equal(signalsSignature([]), 'empty');
+  assert.equal(signalsSignature(null), 'empty');
+}
+
+// THE regression this guards. `targetPrice` is a RENDERED column (Agents.tsx
+// renders it on every radar row), so omitting it from the signature means the
+// push is skipped and the column silently freezes. It was invisible because
+// targetPrice is derived from entryPrice — the two move together on every price
+// tick, so the dedupe fired as normal and looked healthy. They diverge on
+// exactly one input: the user changing `takeProfitPct` in the Guardian drawer,
+// which rewrites every visible TP while entryPrice stays byte-identical.
+//
+// Verified by mutation: with targetPrice removed from signalsSignature (the
+// pre-fix state), the assertion below fails while every other check in this
+// file still passes.
+{
+  const row = { token: { address: '0x1', symbol: 'AAA', chainId: 'base' }, verdict: { signal: 'BUY', confidence: 80, entryPrice: 1.5, targetPrice: 1.725 } };
+  const sig = signalsSignature([row]);
+  const afterTpChange = structuredClone(row);
+  // priceUsd unchanged, takeProfitPct 15 -> 30: only the target moves.
+  afterTpChange.verdict.targetPrice = 1.95;
+  assert.equal(afterTpChange.verdict.entryPrice, row.verdict.entryPrice, 'the fixture must isolate targetPrice');
+  assert.notEqual(
+    signalsSignature([afterTpChange]),
+    sig,
+    'a takeProfitPct change rewrites every visible Target TP — the radar must re-push or the column freezes',
+  );
+}
+
+// agentStream.js must keep importing these rather than re-defining them, or the
+// function the check exercises is no longer the one the server runs.
 {
   const src = readFileSync(join(here, '..', '..', 'backend', 'src', 'agentStream.js'), 'utf8');
-  for (const field of ['guardedPositionsCount', 'missingTicks', 'pnlHistory', 'totalProfitUsd']) {
-    assert.ok(src.includes(field), `agentStream.js signature must cover ${field}`);
-  }
+  assert.match(src, /from '\.\/changeSignatures\.js'/, 'agentStream.js must use the shared signatures');
+  assert.ok(
+    !/function\s+autopilotSignature|function\s+signalsSignature/.test(src),
+    'the signature definitions must not be duplicated back into agentStream.js',
+  );
+}
+
+/* ---------------- the radar must not depend on the guardian ---------------- */
+
+// THE regression this guards. The autopilot sweep calls pushForUser, and both
+// bail branches (TICK_DEADLINE, TICK_BUSY) used to `continue` BEFORE that call
+// — so a slow tick silently suppressed that round's radar refresh. The radar
+// never needed the guardian: pushSignals dedupes per user and the scan has its
+// own cache, so this coupled the market table's freshness to LLM provider
+// latency. A hanging provider froze a table whose data path never touched it.
+//
+// Asserted structurally because the failure is invisible — the code reads
+// correctly, the table just goes stale, and only a slow provider reveals it.
+// Verified by mutation: moving pushForUser back below the two `continue`s fails
+// this assertion while every other check in this file still passes.
+{
+  const server = readFileSync(join(here, '..', '..', 'backend', 'src', 'server.js'), 'utf8');
+  const sweep = server.slice(server.indexOf('setInterval(async () => {', server.indexOf('AUTOPILOT_TICK_DEADLINE_MS')));
+  const push = sweep.indexOf('pushForUser(');
+  const firstBail = Math.min(...['TICK_DEADLINE', 'TICK_BUSY'].map((s) => {
+    const i = sweep.indexOf(`if (res === ${s})`);
+    return i === -1 ? Number.MAX_SAFE_INTEGER : i;
+  }));
+  assert.ok(push !== -1, 'the autopilot sweep must push state to open Agents tabs');
+  assert.ok(firstBail !== Number.MAX_SAFE_INTEGER, 'the deadline/busy branches must still exist');
+  assert.ok(
+    push < firstBail,
+    'pushForUser must run before the TICK_DEADLINE/TICK_BUSY bails, or a slow tick suppresses the radar',
+  );
 }
 
 console.log('agentStream checks passed');

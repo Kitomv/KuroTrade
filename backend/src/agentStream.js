@@ -28,6 +28,12 @@ import { getAutopilot, scanMarketSignals } from './aiAgent.js';
 import { getLLMConfig } from './llmClient.js';
 import { getUser } from './auth.js';
 import { sanitizeError } from './security.js';
+// The change fingerprints live in a zero-import module so the frontend check
+// script can exercise the REAL functions. Re-exported here because callers of
+// this module already reach for them by this name.
+import { autopilotSignature, signalsSignature } from './changeSignatures.js';
+
+export { autopilotSignature, signalsSignature };
 
 const HEARTBEAT_MS = 15_000;
 const SIGNALS_LIMIT = 6;
@@ -38,9 +44,8 @@ const SIGNALS_LIMIT = 6;
 const MAX_BUFFERED_BYTES = 1_000_000;
 // One page, one stream. A second tab is legitimate; an unbounded loop is not.
 const MAX_STREAMS_PER_USER = 4;
-// The session TTL is 14 days, but a stream opened at login used to live that
-// whole time. Re-check the session on every heartbeat instead.
-const SIGNAL_HISTORY_LIMIT = 30;
+// Top-N rows of the accuracy table. `getAutopilot` projects 50; the UI draws 30.
+const SIGNAL_OUTCOMES_LIMIT = 30;
 
 /** userId -> Set<subscriber>. A subscriber is `{ res, sigs, lastSeq, userId, token }`. */
 const subscribers = new Map();
@@ -52,35 +57,25 @@ const signalsInFlight = new Map();
  * here or the change is never pushed and the page silently freezes — which is
  * the exact failure this module can introduce, so the field list is pinned by
  * frontend/scripts/agentStream.check.mts.
+ *
+ * The other half of that rule: a field the UI does NOT render must stay out.
+ * This function's whole purpose is to make `pushForUser`'s comparison mean
+ * "something on screen changed". A field that moves every tick without being
+ * drawn makes the comparison always false, so every sweep re-serializes the
+ * full autopilot payload for every open tab and the dedupe never fires — a
+ * silent cost regression that still looks like the feature is working.
+ *
+ * `lastScanAt` and `pnlHistory[].ts` were both exactly that: rewritten on
+ * every tick, and rendered nowhere (Agents.tsx shows only the point COUNT and
+ * totalValue). They cost a full payload per subscriber per 5s and bought
+ * nothing.
+ *
+ * DEFINITION LIVES IN changeSignatures.js — see the note there for why. Replaced
+ * here by a re-export; this comment is kept so the reasoning stays next to the
+ * import that exists because of it.
  */
-export function autopilotSignature(ap) {
-  const logs = ap?.logs ?? [];
-  const last = logs.length ? logs[0] : null;
-  const eq = ap?.pnlHistory ?? [];
-  const lastEq = eq.length ? eq[eq.length - 1] : null;
-  return [
-    ap?.enabled ? 1 : 0,
-    ap?.status ?? '',
-    ap?.lastScanAt ?? 0,
-    logs.length,
-    last ? last.ts : 0,
-    ap?.guardedPositionsCount ?? 0,
-    // Price moves change guarded PnL without touching any of the above.
-    (ap?.guardedPositions ?? []).map((p) => `${p.address}${p.pnlPct}${p.status}${p.missingTicks}`).join(','),
-    eq.length,
-    lastEq ? `${lastEq.ts}:${lastEq.totalValue}` : '',
-    ap?.stats?.totalTrades ?? 0,
-    ap?.stats?.totalProfitUsd ?? 0,
-  ].join('|');
-}
 
-/** Fingerprint of the radar list — price moves change the entry price. */
-export function signalsSignature(reports) {
-  if (!Array.isArray(reports) || reports.length === 0) return 'empty';
-  return reports
-    .map((r) => `${r.token.address}:${r.verdict.signal}:${r.verdict.confidence}:${Number(r.verdict.entryPrice ?? 0).toFixed(8)}`)
-    .join('|');
-}
+/** Fingerprint of the radar list — price moves change the entry price. See changeSignatures.js. */
 
 /**
  * Drop a subscriber that can no longer be written to.
@@ -120,9 +115,13 @@ function writeEvent(sub, event, payload) {
  * `getAutopilot` returns the whole guardian state, ~180 KB on a mature account,
  * and the page renders a small fraction of it: `pendingSignals` (89 KB) is the
  * accuracy pipeline's internal queue and is never read by the UI, and only the
- * top 30 rows of `signalHistory` are ever drawn. Shipping the rest means
- * serializing and pushing ~8x more than is displayed, every tick. `getAutopilot`
- * already trims `memory`/`nearMisses` to 20 for the same reason.
+ * top 30 rows of the accuracy table are ever drawn. Shipping the rest means
+ * serializing and pushing ~8x more than is displayed, every tick.
+ * `getAutopilot` already trims `memory`/`nearMisses` to 20 for the same reason.
+ *
+ * The accuracy table reads `signalOutcomes`, which `getAutopilot` projects from
+ * `pendingSignals` — see the note there for why it cannot read `signalHistory`.
+ * The raw 200-entry display buffer is not sent at all: nothing renders it.
  */
 function slimAutopilot(ap) {
   return {
@@ -130,7 +129,8 @@ function slimAutopilot(ap) {
     pendingSignals: undefined,
     signalStats: undefined,
     slCooldowns: undefined,
-    signalHistory: (ap?.signalHistory ?? []).slice(0, SIGNAL_HISTORY_LIMIT),
+    signalHistory: undefined,
+    signalOutcomes: (ap?.signalOutcomes ?? []).slice(0, SIGNAL_OUTCOMES_LIMIT),
   };
 }
 

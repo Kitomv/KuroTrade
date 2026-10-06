@@ -756,6 +756,20 @@ export function getAutopilot(userId) {
     ...st,
     guardedPositionsCount: guarded.length,
     signalAccuracy: computeSignalAccuracy(st),
+    // The accuracy table's source. NOT `signalHistory`, and it cannot be:
+    // that is a 200-entry display buffer turning over in ~3 minutes, while
+    // outcomes land at 1h/24h, so an entry is evicted a dozen times before it
+    // could be scored. `pendingSignals` is age-pruned (25h) precisely so a row
+    // is still present when its outcome arrives.
+    //
+    // Resolved rows sort first so the table fills with measured outcomes
+    // instead of 30 fresh signals that are all still '…'; unresolved rows
+    // follow so a fresh account is not empty. Both halves keep the
+    // newest-first order the unshift built.
+    signalOutcomes: [
+      ...(st.pendingSignals ?? []).filter((h) => h.price1h || h.price24h),
+      ...(st.pendingSignals ?? []).filter((h) => !h.price1h && !h.price24h),
+    ].slice(0, 50),
     memory: (st.memory ?? []).slice(0, 20),
     nearMisses: (st.nearMisses ?? []).slice(0, 20),
   };

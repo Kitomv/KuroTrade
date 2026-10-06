@@ -937,7 +937,7 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
             <span style={{ fontSize: 12, color: 'var(--muted)' }}>
               Akurasi 1h: <b style={{ color: (ap.signalAccuracy.acc1h ?? 0) >= 50 ? 'var(--up)' : 'var(--down)' }}>{ap.signalAccuracy.acc1h === null ? '—' : `${ap.signalAccuracy.acc1h}%`}</b>
               {' · '}24h: <b style={{ color: (ap.signalAccuracy.acc24h ?? 0) >= 50 ? 'var(--up)' : 'var(--down)' }}>{ap.signalAccuracy.acc24h === null ? '—' : `${ap.signalAccuracy.acc24h}%`}</b>
-              {' · '}sinyal: {ap.signalHistory?.length ?? 0}
+              {' · '}sinyal: {ap.signalOutcomes?.length ?? 0}
             </span>
           )}
         </div>
@@ -950,7 +950,7 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
               </tr>
             </thead>
             <tbody>
-              {(ap.signalHistory ?? []).slice(0, 30).map((s, i) => {
+              {(ap.signalOutcomes ?? []).slice(0, 30).map((s, i) => {
                 const pct1 = s.price1h !== undefined && s.entryPrice > 0 ? ((s.price1h - s.entryPrice) / s.entryPrice) * 100 : null;
                 const pct24 = s.price24h !== undefined && s.entryPrice > 0 ? ((s.price24h - s.entryPrice) / s.entryPrice) * 100 : null;
                 return (
@@ -974,7 +974,7 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
             </tbody>
           </table>
         </div>
-        {!(ap.signalHistory?.length) && (
+        {!(ap.signalOutcomes?.length) && (
           <div className="empty" style={{ padding: 24 }}>Belum ada sinyal dicatat — nyalakan Auto-Pilot atau jalankan scan untuk mulai merekam.</div>
         )}
       </div>

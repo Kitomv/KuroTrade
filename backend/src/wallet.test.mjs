@@ -9,7 +9,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
 // Must be set BEFORE the module graph is imported: persistence.js reads
@@ -22,7 +22,7 @@ process.env.PERSIST_DATA_DIR = TEMP_DIR;
 const {
   executeMarketOrder, createLimitOrder, cancelOrder, checkLimitOrders,
   getWallet, getPositions, getOrders, initWallet, resetWallet,
-  updatePositionPrices, addMirroredPosition, reducePositionAmount,
+  updatePositionPrices, addMirroredPosition, reducePositionAmount, getRiskLedger,
 } = await import('./wallet.js');
 const { flushAll } = await import('./persistence.js');
 
@@ -348,4 +348,62 @@ test('a mirrored position with an impossible price or size is refused', () => {
     assert.equal(addMirroredPosition(u, { tokenAddress: ADDR, chainId: 'base', ...bad }), null, `should refuse ${JSON.stringify(bad)}`);
   }
   assert.equal(getPositions(u).length, 0, 'nothing was recorded');
+});
+
+test('the risk ledger records realized PnL and survives a restart', () => {
+  const u = freshUser();
+  executeMarketOrder(u, { side: 'buy', tokenAddress: ADDR, chainId: 'base', symbol: 'TEST', usdAmount: 50, tokenAmount: 0, currentPrice: 0.5 });
+  executeMarketOrder(u, { side: 'sell', tokenAddress: ADDR, chainId: 'base', symbol: 'TEST', tokenAmount: 100, currentPrice: 0.7 });
+
+  const led = getRiskLedger(u);
+  assert.equal(led.length, 1, 'one realized booking, one ledger row');
+  assertMoney(led[0].usd, 20, 'the ledger row matches the booked P&L');
+  assert.equal(Number.isFinite(led[0].ts), true, 'a row without a timestamp can never age out');
+
+  flushAll();
+  initWallet(u);
+  const after = getRiskLedger(u);
+  assert.equal(after.length, 1, 'the ledger must not be lost on restart — the cap would reset');
+  assertMoney(after[0].usd, 20, 'and must not be rewritten');
+});
+
+test('a corrupt ledger row is dropped on load rather than counting forever', () => {
+  const u = freshUser();
+  executeMarketOrder(u, { side: 'buy', tokenAddress: ADDR, chainId: 'base', symbol: 'TEST', usdAmount: 50, tokenAmount: 0, currentPrice: 0.5 });
+  executeMarketOrder(u, { side: 'sell', tokenAddress: ADDR, chainId: 'base', symbol: 'TEST', tokenAmount: 100, currentPrice: 0.7 });
+  flushAll();
+
+  // riskGuard counts an unreadable row as inside the 24h window (fail closed),
+  // so one row with a NaN timestamp would suppress every buy for a full day.
+  const p = join(TEMP_DIR, `${u}.json`);
+  const state = JSON.parse(readFileSync(p, 'utf-8'));
+  state.riskLedger.push({ ts: 'nope', usd: -999 }, { ts: Date.now(), usd: 5 }, null);
+  writeFileSync(p, JSON.stringify(state));
+
+  initWallet(u);
+  const led = getRiskLedger(u);
+  assert.equal(led.length, 2, 'the two well-formed rows survive; the bad ts and the null are dropped');
+  assertMoney(led[0].usd, 20, 'and the real booking is untouched');
+  assertMoney(led[1].usd, 5, 'a second valid row is not over-filtered');
+  assert.equal(led.every((e) => Number.isFinite(e.ts)), true, 'nothing unreadable reaches the cap');
+});
+
+test('getRiskLedger hands out a copy — a reader cannot rewrite the wallet', () => {
+  const u = freshUser();
+  executeMarketOrder(u, { side: 'buy', tokenAddress: ADDR, chainId: 'base', symbol: 'TEST', usdAmount: 50, tokenAmount: 0, currentPrice: 0.5 });
+  executeMarketOrder(u, { side: 'sell', tokenAddress: ADDR, chainId: 'base', symbol: 'TEST', tokenAmount: 100, currentPrice: 0.7 });
+
+  const led = getRiskLedger(u);
+  led[0].usd = -1e6;
+  assertMoney(getRiskLedger(u)[0].usd, 20, 'mutating the returned array must not touch wallet state');
+});
+
+test('the ledger is cleared by a reset, so the loss cap starts clean', () => {
+  const u = freshUser();
+  executeMarketOrder(u, { side: 'buy', tokenAddress: ADDR, chainId: 'base', symbol: 'TEST', usdAmount: 50, tokenAmount: 0, currentPrice: 0.5 });
+  executeMarketOrder(u, { side: 'sell', tokenAddress: ADDR, chainId: 'base', symbol: 'TEST', tokenAmount: 100, currentPrice: 0.7 });
+  assert.equal(getRiskLedger(u).length, 1);
+
+  resetWallet(u, 100);
+  assert.equal(getRiskLedger(u).length, 0, 'a wiped account cannot be permanently loss-blocked');
 });

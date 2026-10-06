@@ -11,17 +11,21 @@ import { IconWallet } from './Icons';
 
 const RealWalletModal = React.lazy(() => import('./RealWalletModal'));
 
-function statusOf({ connected, isBound, realMode }: { connected: boolean; isBound: boolean; realMode: boolean }) {
+function statusOf({ connected, isBound, realMode, autoApprove }: { connected: boolean; isBound: boolean; realMode: boolean; autoApprove: boolean }) {
   if (!connected) return { label: 'Belum terhubung', tone: 'muted' as const };
   if (!isBound) return { label: 'Perlu bind wallet', tone: 'warn' as const };
   if (!realMode) return { label: 'Mode virtual', tone: 'muted' as const };
-  return { label: 'REAL · approve manual', tone: 'danger' as const };
+  // The who-signs distinction belongs on the always-visible chip, not only in
+  // the modal: it decides whether a trade needs the user at all.
+  return autoApprove
+    ? { label: 'REAL · auto-buka MetaMask', tone: 'danger' as const }
+    : { label: 'REAL · approve manual', tone: 'danger' as const };
 }
 
 export function RealWalletControl() {
-  const { connected, isBound, realMode, loaded } = useEvmWallet();
+  const { connected, isBound, realMode, autoApprove, loaded } = useEvmWallet();
   const [open, setOpen] = useState(false);
-  const st = statusOf({ connected, isBound, realMode });
+  const st = statusOf({ connected, isBound, realMode, autoApprove });
 
   return (
     <div className="real-wallet-control">

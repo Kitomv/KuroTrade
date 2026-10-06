@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { api, AgentReport, AutopilotConfig, LLMConfig } from '../api/client';
 import { usePolling } from '../hooks/usePolling';
+import { useAgentStream } from '../hooks/useAgentStream';
 import { EquityChart } from '../components/EquityChart';
 import { IconAlert, IconBot, IconBolt, IconChartBar, IconChartLine, IconGear, IconKey, IconLock, IconPower, IconRocket, IconShield, IconSparkles, IconTrendingDown, IconTrendingUp } from '../components/Icons';
 import { fmt } from '../lib/format';
@@ -44,15 +45,45 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
   const toast = useToast();
   const confirmAction = useConfirm();
 
-  // Fast polling for Real-Time Auto-Pilot Terminal & Guardian (relaxed to 4s to cut CPU/network load)
-  const autopilotP = usePolling(() => api.getAutopilot(), 4_000, []);
-  const watchlistP = usePolling(() => api.watchlist(), 10_000, []);
-  const scannedP = usePolling(() => api.agentSignals(6), 5_000, []);
-  const llmP = usePolling(() => api.getLLMConfig(), 10_000, [llmVersion]);
-  const autopilot = autopilotP.data;
+  // Realtime feed (SSE). The server pushes every state change as it happens,
+  // so the terminal, equity curve and radar are current within a guardian tick
+  // (~5s) rather than up to a poll interval later — and an unchanged page
+  // costs zero requests. The usePolling calls below are the FALLBACK: they only
+  // run while the stream is down, so a dropped connection degrades to the old
+  // polling behaviour instead of freezing the screen.
+  const stream = useAgentStream();
+  // Give the stream a beat to open before the fallback polls engage, otherwise
+  // both run on first paint and the page pays for two of everything.
+  const [streamSettled, setStreamSettled] = useState(false);
+  useEffect(() => {
+    if (stream.connected) { setStreamSettled(true); return; }
+    const id = setTimeout(() => setStreamSettled(true), 2_000);
+    return () => clearTimeout(id);
+  }, [stream.connected]);
+  const streamDown = streamSettled && !stream.connected;
+
+  const autopilotP = usePolling(() => api.getAutopilot(), 4_000, [], streamDown);
+  // NOT gated: the stream carries autopilot/signals/llm only, so gating this one
+  // would leave the watchlist permanently empty while the stream is healthy. It
+  // is a plain read, not an LLM scan — cheap enough to always poll.
+  const watchlistP = usePolling(() => api.watchlist(), 10_000);
+  const scannedP = usePolling(() => api.agentSignals(6), 5_000, [], streamDown);
+  const llmP = usePolling(() => api.getLLMConfig(), 10_000, [llmVersion], streamDown);
+  // Stream wins ONLY while it is connected; otherwise the last polled payload
+  // stands in, so there is no visible gap during a reconnect.
+  //
+  // The `connected` guard is load-bearing, not defensive. The hook deliberately
+  // keeps the last snapshot after a drop (a frozen render beats a blank one), so
+  // once any event has landed, `stream.autopilot` stays non-null forever. A bare
+  // `stream.autopilot ?? autopilotP.data` would then keep preferring that frozen
+  // snapshot over the live fallback: the polls run, buy the same LLM scans the
+  // stream exists to avoid, and have their result discarded — the page sits on
+  // stale numbers while every indicator reports healthy.
+  const live = stream.connected ? stream : null;
+  const autopilot = live?.autopilot ?? autopilotP.data;
   const watchlist = watchlistP.data;
-  const scannedSignals = scannedP.data;
-  const llmInfo = llmP.data;
+  const scannedSignals = live?.signals ?? scannedP.data;
+  const llmInfo = live?.llm ?? llmP.data;
 
   // Form config state
   const [takeProfit, setTakeProfit] = useState(15);
@@ -346,7 +377,9 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
             <h1>AI Trading Desk</h1>
-            <StaleBadge stale={autopilotP.stale || scannedP.stale || llmP.stale} />
+            {/* Realtime when the stream is up, polling fallback when it isn't —
+                stale only if BOTH paths are failing. */}
+            <StaleBadge stale={stream.connected ? false : autopilotP.stale || scannedP.stale || llmP.stale} />
             <span
               className="chip"
               style={{
@@ -904,7 +937,7 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
             <span style={{ fontSize: 12, color: 'var(--muted)' }}>
               Akurasi 1h: <b style={{ color: (ap.signalAccuracy.acc1h ?? 0) >= 50 ? 'var(--up)' : 'var(--down)' }}>{ap.signalAccuracy.acc1h === null ? '—' : `${ap.signalAccuracy.acc1h}%`}</b>
               {' · '}24h: <b style={{ color: (ap.signalAccuracy.acc24h ?? 0) >= 50 ? 'var(--up)' : 'var(--down)' }}>{ap.signalAccuracy.acc24h === null ? '—' : `${ap.signalAccuracy.acc24h}%`}</b>
-              {' · '}sinyal: {ap.signalHistory?.length ?? 0}
+              {' · '}sinyal: {ap.signalOutcomes?.length ?? 0}
             </span>
           )}
         </div>
@@ -917,7 +950,7 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
               </tr>
             </thead>
             <tbody>
-              {(ap.signalHistory ?? []).slice(0, 30).map((s, i) => {
+              {(ap.signalOutcomes ?? []).slice(0, 30).map((s, i) => {
                 const pct1 = s.price1h !== undefined && s.entryPrice > 0 ? ((s.price1h - s.entryPrice) / s.entryPrice) * 100 : null;
                 const pct24 = s.price24h !== undefined && s.entryPrice > 0 ? ((s.price24h - s.entryPrice) / s.entryPrice) * 100 : null;
                 return (
@@ -941,7 +974,7 @@ export function Agents({ onNavigate }: { onNavigate?: (p: Page) => void }) {
             </tbody>
           </table>
         </div>
-        {!(ap.signalHistory?.length) && (
+        {!(ap.signalOutcomes?.length) && (
           <div className="empty" style={{ padding: 24 }}>Belum ada sinyal dicatat — nyalakan Auto-Pilot atau jalankan scan untuk mulai merekam.</div>
         )}
       </div>

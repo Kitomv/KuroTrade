@@ -8,7 +8,7 @@
 // Data schema: LLMProviderEntry[] per user — { key, provider, model, baseUrl, role }
 // User instruction: "setiap server restart peruser harus config llmnya masing masing lagi kah?" → persist LLM config per user
 import { registerStateProvider, loadUserState, touch } from './persistence.js';
-import { isSafeBaseUrl } from './security.js';
+import { isSafeBaseUrl, assertSafeBaseUrl } from './security.js';
 
 const PROVIDERS = [
   '9router', 'anthropic', 'openai', 'deepseek', 'openrouter', 'custom',
@@ -29,6 +29,24 @@ const ENDPOINT_PRESETS = {
   ollama: 'http://localhost:11434/v1',
   bedrock: 'http://localhost:8080/v1', // bedrock-access-gateway / LiteLLM proxy
 };
+
+// An origin that passed the guard can still answer `302 location: http://169.254.169.254/…`,
+// and `fetch` follows that — re-sending the Authorization header to a host the
+// guard never looked at. Every outbound call therefore opts out of redirects;
+// a redirect is just a second, unchecked baseUrl.
+const NO_REDIRECT = { redirect: 'manual' };
+
+// Providers whose endpoint is meant to sit on this machine. They are the only
+// ones `assertEndpointAllowed` lets resolve to loopback — see the note there.
+const LOCAL_PROVIDERS = new Set(['ollama', 'bedrock']);
+
+// The hedge ladder admits the next candidate every `hedgeDelayMs` and abandons
+// none, so one callLLM costs up to ONE PAID REQUEST PER ENTRY. Measured: a
+// 40-entry stack fired 26 concurrent requests for a single analysis. Since
+// POST /api/llm/config takes the array straight from the request body, the
+// stack length is caller-controlled, so it is also a spend multiplier. Four is
+// enough for primary + fallbacks; nothing here needs more.
+const MAX_PROVIDER_STACK = 4;
 
 // Per-user provider config stacks; global default from env.
 // Each entry: { key, provider, model, baseUrl, role?, deepModel? }
@@ -71,7 +89,13 @@ registerStateProvider((userId) => {
 
 export function getLLMConfig(userId = null) {
   ensureLoaded(userId);
-  const cfg = userId && userConfigs.has(userId) ? userConfigs.get(userId) : defaultConfigs;
+  // A user with no saved config falls back to `defaultConfigs`, which is seeded
+  // from the process env. That fallback is for the ANONYMOUS/no-user case only —
+  // handing it to an identified account would let any user who never configured
+  // an LLM spend the operator's key, and hand the UI a masked fragment of it.
+  const isIdentified = Boolean(userId);
+  const cfg = userId && userConfigs.has(userId) ? userConfigs.get(userId)
+    : (isIdentified ? [] : defaultConfigs);
   const activeProviders = cfg.filter((c) => c.key && c.key.trim().length > 3);
   const masked = (k) => (k ? `${k.slice(0, 7)}…${k.slice(-4)}` : '');
   return {
@@ -94,19 +118,44 @@ export function getLLMConfig(userId = null) {
   };
 }
 
+/** The origin a baseUrl names, or '' when it names nothing usable.
+ *  Two edits are the "same endpoint" only when this matches. */
+function originOf(baseUrl) {
+  if (!baseUrl) return '';
+  try { return new URL(baseUrl).origin; } catch { return String(baseUrl); }
+}
+
 /** Set per-user provider stack. Accepts a single object (legacy) or an array (multi-LLM). */
 export function setLLMConfig(userId, value) {
   ensureLoaded(userId);
-  const arr = Array.isArray(value) ? value : [value];
-  const prev = userId && userConfigs.has(userId) ? userConfigs.get(userId) : defaultConfigs;
+  const arr = (Array.isArray(value) ? value : [value]).slice(0, MAX_PROVIDER_STACK);
+  // Blank apiKey means "keep what this user already had" — and what this user
+  // already had is NOTHING. It must not fall back to `defaultConfigs`, or the
+  // first save for an identified account adopts the operator's shared key and
+  // then POSTs it to whatever baseUrl that save named.
+  const prev = userId ? (userConfigs.get(userId) ?? []) : defaultConfigs;
   const configs = arr.map((c, i) => {
-    // Preserve the stored key when this entry sends none (blank = leave existing).
-    const prevKey = prev[i]?.key ?? '';
+    const provider = PROVIDERS.includes(c.provider) ? c.provider : '9router';
+    const baseUrl = c.baseUrl ?? '';
+    // A stored key is carried across an edit only when that edit keeps the SAME
+    // provider AND the same origin. Blank-key-means-keep exists for "I changed
+    // the model", not for "I changed the host": carrying the key across a host
+    // change hands it to whoever named the new host, and the admin password
+    // reset makes that reachable (reset → log in as the account → re-point its
+    // baseUrl with a blank key → the next call sends `Bearer <that key>` to the
+    // attacker's server). GET /api/llm/config only ever showed the key masked,
+    // so that call is what discloses it. Fail closed: any identity change drops
+    // the key and the user must re-enter it.
+    const prevEntry = prev[i];
+    const sameIdentity = Boolean(prevEntry)
+      && (PROVIDERS.includes(prevEntry.provider) ? prevEntry.provider : '9router') === provider
+      && originOf(prevEntry.baseUrl ?? '') === originOf(baseUrl);
+    const prevKey = sameIdentity ? (prevEntry.key ?? '') : '';
     return {
       key: (c.apiKey ?? c.key ?? '').trim() || prevKey,
-      provider: PROVIDERS.includes(c.provider) ? c.provider : '9router',
+      provider,
       model: c.model || 'claude-3-5-sonnet-20241022',
-      baseUrl: c.baseUrl ?? '',
+      baseUrl,
       role: c.role ?? null, // 'bull' | 'bear' | 'lead' | null (default)
     };
   });
@@ -140,19 +189,45 @@ export function endpointFor(provider, baseUrl) {
   return base.endsWith('/chat/completions') ? base : `${base}/chat/completions`;
 }
 
+/**
+ * Same as `endpointFor`, but resolves the hostname first.
+ *
+ * `endpointFor` is sync and only sees the hostname as written, so it cannot
+ * stop `127.0.0.1.nip.io`. Every fetch that carries a Bearer key goes through
+ * THIS one instead — an SSRF that reaches a loopback service would otherwise
+ * hand that host the user's API key in the Authorization header.
+ */
+export async function assertEndpointAllowed(provider, baseUrl) {
+  const endpoint = endpointFor(provider, baseUrl);
+  // The test is whether the CALLER supplied this host, not which provider
+  // name it came under: `ollama` and `bedrock` are preset providers that still
+  // accept a user baseUrl, so keying off the name would skip the very case
+  // (`ollama` + rebound hostname) that needs checking. Keying off `baseUrl`
+  // skips the DNS round trip only when the host is genuinely ours.
+  if (!baseUrl) return endpoint;
+  // These two ARE the local setup (a model runtime and a gateway proxy on the
+  // same box), so loopback is their intended target — the same reason
+  // `isSafeBaseUrl` allows localhost. The exception is the loopback interface
+  // alone: LAN, link-local and cloud metadata stay blocked even for them, or
+  // picking `ollama` would hand an attacker a tunnel to the private network.
+  const allowLoopback = LOCAL_PROVIDERS.has(provider);
+  await assertSafeBaseUrl(endpoint, { allowLoopback });
+  return endpoint;
+}
+
 async function callAnthropic(entry, body) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'x-api-key': entry.key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
     body: JSON.stringify({
       model: entry.model,
-      max_tokens: body.maxTokens ?? 600,
       temperature: body.temperature,
       stream: false,
       system: body.systemPrompt,
       messages: [{ role: 'user', content: body.userPrompt }],
     }),
     signal: AbortSignal.timeout(entry.timeoutMs ?? 30_000),
+    ...NO_REDIRECT,
   });
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
@@ -201,11 +276,19 @@ function parseLLMResponse(text, provider = 'llm') {
       }
     }
   }
-  throw new Error(`${provider}: unparseable response (${raw.slice(0, 200)})`);
+  // The body is NOT echoed. This throw is surfaced to the browser by `wrap`,
+  // and an unparseable body from a baseUrl the caller controls is whatever
+  // that host chose to return — which, before the SSRF guard, could be the
+  // body of a host-local service. Say it failed; keep the detail server-side.
+  throw new Error(`${provider}: unparseable response`);
 }
 
 async function callOpenAICompat(entry, body) {
-  const endpoint = endpointFor(entry.provider, entry.baseUrl);
+  // The async guard, not `endpointFor`: this is the path that attaches
+  // `Authorization: Bearer ${entry.key}`, so it must resolve DNS before the
+  // fetch. Anything that reaches this function with a user-supplied hostname
+  // that points inward must not get the key.
+  const endpoint = await assertEndpointAllowed(entry.provider, entry.baseUrl);
   const timeoutMs = entry.timeoutMs ?? 30_000;
   const res = await fetch(endpoint, {
     method: 'POST',
@@ -228,6 +311,7 @@ async function callOpenAICompat(entry, body) {
       ],
     }),
     signal: AbortSignal.timeout(timeoutMs),
+    ...NO_REDIRECT,
   });
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
@@ -256,7 +340,11 @@ function callLLMProvider(entry, body) {
  */
 export async function callLLM({ systemPrompt, userPrompt, temperature = 0.2, role = null, userId = null, hedgeDelayMs = 8_000, timeoutMs = null }) {
   ensureLoaded(userId);
-  const stack = userId && userConfigs.has(userId) ? userConfigs.get(userId) : defaultConfigs;
+  // Same rule as getLLMConfig: an identified user with no saved stack gets none.
+  // Falling back to the env default here would spend the operator's key on
+  // autopilot scans for an account that never asked for one.
+  const stack = userId && userConfigs.has(userId) ? userConfigs.get(userId)
+    : (userId ? [] : defaultConfigs);
   // `timeoutMs` from the autopilot config overrides each entry's own setting so
   // the UI knob actually takes effect without editing every provider row.
   const candidates = stack
@@ -330,7 +418,8 @@ export async function callLLM({ systemPrompt, userPrompt, temperature = 0.2, rol
  */
 export async function listModels(userId, overrides = {}) {
   ensureLoaded(userId);
-  const stack = userId && userConfigs.has(userId) ? userConfigs.get(userId) : defaultConfigs;
+  const stack = userId && userConfigs.has(userId) ? userConfigs.get(userId)
+    : (userId ? [] : defaultConfigs);
   const stored = stack.find((c) => c.key) ?? stack[0] ?? {};
   const provider = overrides.provider ?? stored.provider ?? '9router';
   const baseUrl = overrides.baseUrl ?? stored.baseUrl ?? '';
@@ -338,11 +427,14 @@ export async function listModels(userId, overrides = {}) {
   if (!apiKey) throw new Error('API key belum diisi');
 
   const base = (baseUrl || ENDPOINT_PRESETS[provider] || 'https://api.openai.com/v1').replace(/\/+$/, '');
-  if (!isSafeBaseUrl(base)) throw new Error('baseUrl tidak diizinkan (SSRF guard)');
+  // Same loopback exception the chat path grants, or "list models" on a local
+  // Ollama would be refused while the chat that follows it succeeds.
+  await assertSafeBaseUrl(base, { allowLoopback: LOCAL_PROVIDERS.has(provider) });
   const url = `${base}/models`;
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${apiKey}` },
     signal: AbortSignal.timeout(15_000),
+    ...NO_REDIRECT,
   });
   const text = await res.text().catch(() => '');
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0, 300)}`);
@@ -361,7 +453,8 @@ export async function listModels(userId, overrides = {}) {
  */
 export async function testConnection(userId, entry = {}) {
   const started = Date.now();
-  const stack = userId && userConfigs.has(userId) ? userConfigs.get(userId) : defaultConfigs;
+  const stack = userId && userConfigs.has(userId) ? userConfigs.get(userId)
+    : (userId ? [] : defaultConfigs);
   const stored = stack.find((c) => c.key) ?? stack[0] ?? {};
   const merged = {
     provider: entry.provider ?? stored.provider ?? '9router',

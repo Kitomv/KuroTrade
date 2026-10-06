@@ -2,17 +2,20 @@
 // Importers/callers: App.tsx. API/data: RealWalletControl consumes the shared
 // RealWalletContext; no sidebar-owned wallet state. User: "taruh di atas akun".
 import { useState } from 'react';
-import { Page as NavPage } from '../api/client';
+import { Page as NavPage, UserRole } from '../api/client';
 import { Modal } from './Modal';
 import { RealWalletControl } from './RealWalletControl';
+import { IconShield } from './Icons';
 
 type Page = NavPage;
+
+type NavEntry = { page: Page; label: string; icon: JSX.Element; secondary?: boolean; adminOnly?: boolean };
 
 // Priority order per user: Portfolio and AI Agents lead the nav, with the Real
 // Wallet control sitting above the account block below. Leaderboard and
 // Pengaturan are deliberately absent — settings is reachable from the account
 // block at the bottom, not from the main nav.
-const nav: { page: Page; label: string; icon: JSX.Element; secondary?: boolean }[] = [
+const nav: NavEntry[] = [
   {
     page: 'portfolio',
     label: 'Portfolio',
@@ -92,16 +95,32 @@ const nav: { page: Page; label: string; icon: JSX.Element; secondary?: boolean }
     ),
     secondary: true,
   },
+  {
+    // Admin last, and secondary: it is a management page, not a trading one.
+    // Secondary also routes mobile through the "Lainnya" modal (the bottom bar
+    // hides secondary items), which is where this entry has to live on a phone.
+    page: 'admin',
+    label: 'Admin',
+    icon: <IconShield />,
+    secondary: true,
+    adminOnly: true,
+  },
 ];
 
-export function Sidebar({ page, onNavigate, username }: {
+export function Sidebar({ page, onNavigate, username, role }: {
   page: Page;
   onNavigate: (p: Page) => void;
   username?: string;
+  role?: UserRole;
 }) {
   // Change Password + Logout live on the Pengaturan page, reached from the
   // account block below — fewer mis-clicks than a top-level nav entry.
   const [showMore, setShowMore] = useState(false);
+
+  // Fail closed: anything that is not exactly 'admin' sees the ordinary nav.
+  // The server re-checks every admin route, so this only decides what is
+  // offered, never what is allowed.
+  const items = role === 'admin' ? nav : nav.filter((n) => !n.adminOnly);
 
   return (
     <nav className="sidebar" aria-label="Main navigation">
@@ -109,7 +128,7 @@ export function Sidebar({ page, onNavigate, username }: {
         <span className="dot" />
         <span>DEX Trade</span>
       </div>
-      {nav.map(({ page: p, label, icon, secondary }) => (
+      {items.map(({ page: p, label, icon, secondary }) => (
         <button
           key={p}
           className={`nav-item${p === page ? ' active' : ''}${secondary ? ' nav-secondary' : ''}`}
@@ -150,7 +169,7 @@ export function Sidebar({ page, onNavigate, username }: {
       {showMore && (
         <Modal title="Menu Lainnya" onClose={() => setShowMore(false)} maxWidth={360}>
           <div className="nav-more-list">
-            {nav.map(({ page: p, label, icon }) => (
+            {items.map(({ page: p, label, icon }) => (
               <button
                 key={p}
                 type="button"

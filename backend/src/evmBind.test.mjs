@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Wallet } from 'ethers';
-import { buildBindMessage, buildLoginMessage, recoverSigner, verifyEvmSignature } from './evmBind.js';
+import { buildBindMessage, recoverSigner, verifyEvmSignature } from './evmBind.js';
 
 const USER = 'user-abc-123';
 const NONCE = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
@@ -76,46 +76,10 @@ test('bind message format is stable across the wallet migration', () => {
   );
 });
 
-test('login message format is stable', () => {
-  // The client signs this string byte-for-byte, so the format is a contract.
-  assert.equal(
-    buildLoginMessage('0xABCdef0000000000000000000000000000000001', 'n1'),
-    'dex-trade-login:0xABCdef0000000000000000000000000000000001:n1',
-  );
-});
-
-test('a login signature recovers the signer', async () => {
-  const wallet = Wallet.createRandom();
-  const message = buildLoginMessage(wallet.address, NONCE);
-  const signature = await wallet.signMessage(message);
-  assert.equal(recoverSigner(message, signature), wallet.address);
-});
-
-test('a login signature cannot be replayed into the bind flow', async () => {
-  // The two messages are different strings on purpose. A login challenge is
-  // pre-auth and has no userId, so if the two formats ever collided, a
-  // signature captured at login could be presented to /api/real/bind.
-  const wallet = Wallet.createRandom();
-  const loginMessage = buildLoginMessage(wallet.address, NONCE);
-  const bindMessage = buildBindMessage('u1', wallet.address, NONCE);
-  assert.notEqual(loginMessage, bindMessage, 'the two message formats must differ');
-
-  const signature = await wallet.signMessage(loginMessage);
-  // recoverSigner never returns null for a well-formed signature: EIP-191
-  // always recovers SOME address. Presenting the login signature as a bind
-  // recovers a different address, which is what the comparison rejects.
-  assert.notEqual(recoverSigner(bindMessage, signature), wallet.address);
-  assert.equal(
-    verifyEvmSignature(wallet.address, bindMessage, signature),
-    false,
-    'the bind verifier must refuse a signature made over the login message',
-  );
-});
-
 test('a signature over an unrelated message recovers to a different signer', async () => {
   const wallet = Wallet.createRandom();
   const signature = await wallet.signMessage('some other message');
-  const loginMessage = buildLoginMessage(wallet.address, NONCE);
-  assert.notEqual(recoverSigner(loginMessage, signature), wallet.address);
-  assert.equal(verifyEvmSignature(wallet.address, loginMessage, signature), false);
+  const bindMessage = buildBindMessage(USER, wallet.address, NONCE);
+  assert.notEqual(recoverSigner(bindMessage, signature), wallet.address);
+  assert.equal(verifyEvmSignature(wallet.address, bindMessage, signature), false);
 });

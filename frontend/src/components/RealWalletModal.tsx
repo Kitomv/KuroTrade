@@ -1,11 +1,13 @@
-// Real Wallet = ACTIVATION ONLY: connect MetaMask, bind it, switch virtual↔real.
-// Trading lives on the Trade page (RealTradeForm) and the autopilot + hot wallet
-// live in Pengaturan — this modal deliberately duplicates neither.
-// Importers/callers: RealWalletControl (lazy). API: useEvmWallet() shared
-// context + useHotWallet() (auto-execute / emergency-pause status).
+// Real Wallet = ACTIVATION ONLY: connect MetaMask, bind it, switch virtual↔real,
+// and choose the approve policy (manual in MetaMask vs. auto-open MetaMask so the
+// user signs each intent without pressing Approve first). Nothing is ever signed
+// server-side — there is no executor and no private key.
+// Trading lives on the Trade page (RealTradeForm) — this modal deliberately
+// duplicates neither.
+// Importers/callers: RealWalletControl (lazy). API: useEvmWallet() shared context.
 // User instruction: "real wallet itu cuma tempat aktifasi pindah dari virtual ke
 // real wallet" → keep it activation-only, but make the 3 steps explicit and show
-// network + hot-wallet state so nothing is ambiguous.
+// network + wallet state so nothing is ambiguous.
 import { Modal } from './Modal';
 import { useEvmWallet } from './EvmWalletContext';
 import { useConfirm } from './ConfirmDialog';
@@ -25,7 +27,7 @@ const CHAIN_LABEL: Record<string, string> = {
 
 export default function RealWalletModal({ onClose }: { onClose: () => void }) {
   const {
-    connected, isBound, realMode, binding, bindError, setRealMode, bindWallet,
+    connected, isBound, realMode, autoApprove, binding, bindError, setRealMode, setAutoApprove, bindWallet,
     boundWallet, chainId, address, connect, available, chainMismatch, switchToChain,
   } = useEvmWallet();
   const confirmAction = useConfirm();
@@ -53,6 +55,29 @@ export default function RealWalletModal({ onClose }: { onClose: () => void }) {
       if (!ok) return;
     }
     await setRealMode(!realMode);
+  };
+
+  /**
+   * Arming auto-approve is a standing grant, not a per-trade setting, so it
+   * gets its own confirmation and states the cost plainly: an ERC-20
+   * allowance survives after real mode is switched off and lives on until it is
+   * explicitly revoked on-chain. Turning real mode off does NOT undo it.
+   *
+   * It does NOT mean the bot signs for you — the server holds no private key.
+   * "Automatic" means the wallet prompt is opened for you on each new intent;
+   * you still press Approve in MetaMask.
+   */
+  const toggleAutoApprove = async () => {
+    if (!autoApprove) {
+      const ok = await confirmAction({
+        title: 'Auto-approve aktifkan?',
+        message: 'Saat ada intent, KuroTrade otomatis membuka MetaMask agar kamu menandatangani. Kamu tetap yang menekan Setujui di MetaMask — KuroTrade tidak pernah memegang private key. Allowance token ERC-20 yang dibuat berlaku sampai dicabut on-chain; mematikan mode real tidak mencabutnya. Allowance dibuat untuk jumlah persis per trade, bukan tanpa batas.',
+        confirmLabel: 'Ya, buka MetaMask otomatis',
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    await setAutoApprove(!autoApprove);
   };
 
   return (
@@ -123,6 +148,34 @@ export default function RealWalletModal({ onClose }: { onClose: () => void }) {
         </div>
       </div>
 
+      {/* 4 · Approve policy. Only meaningful in real mode — the server refuses
+          to arm it otherwise, so the control states that rather than silently
+          doing nothing. */}
+      <div className="rwc-row" style={{ marginTop: 14, flexDirection: 'column', alignItems: 'stretch', gap: 8 }}>
+        <div className="rwc-row" style={{ marginBottom: 0 }}>
+          <span className="rwc-k">4 · Persetujuan otomatis</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 11, color: 'var(--muted)' }}>
+              {!realMode ? 'Perlu mode real' : autoApprove ? 'Otomatis' : 'Manual'}
+            </span>
+            <button
+              type="button"
+              className={`btn${autoApprove ? ' primary' : ''}`}
+              style={{ minHeight: 32, padding: '4px 14px', fontSize: 12 }}
+              disabled={!realMode}
+              onClick={toggleAutoApprove}
+            >
+              {autoApprove ? 'ON' : 'OFF'}
+            </button>
+          </div>
+        </div>
+        <p style={{ margin: 0, fontSize: 11, color: 'var(--muted)', lineHeight: 1.5 }}>
+          {autoApprove
+            ? 'Saat ada intent, MetaMask otomatis dibuka agar kamu tanda tangani. Kamu tetap menekan Setujui — KuroTrade tidak memegang private key.'
+            : 'Setiap approve dan swap kamu tanda tangani sendiri di MetaMask.'}
+        </p>
+      </div>
+
       {/* Status: which chain, and who executes */}
       <div
         style={{
@@ -145,8 +198,8 @@ export default function RealWalletModal({ onClose }: { onClose: () => void }) {
           <span className="rwc-k" style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
             <IconGear size={12} /> Eksekusi
           </span>
-          <span className="rwc-badge" style={{ background: 'var(--panel)', color: 'var(--muted)' }}>
-            Approve manual di MetaMask
+          <span className="rwc-badge" style={{ background: 'var(--panel)', color: autoApprove ? 'var(--down)' : 'var(--muted)' }}>
+            {autoApprove ? 'Buka MetaMask otomatis' : 'Approve manual di MetaMask'}
           </span>
         </div>
         {chainMismatch && (
@@ -170,7 +223,9 @@ export default function RealWalletModal({ onClose }: { onClose: () => void }) {
           </p>
         )}
         <p style={{ margin: '10px 0 0', fontSize: 11, color: 'var(--muted)', lineHeight: 1.5 }}>
-          Backend tidak menyimpan private key. Swap dibangun server, kamu tanda tangani sendiri di MetaMask.
+          {autoApprove
+            ? 'Swap dibangun server. Saat ada intent, MetaMask otomatis dibuka untuk kamu tanda tangani. Allowance ERC-20 aktif sampai dicabut on-chain.'
+            : 'Backend tidak menyimpan private key. Swap dibangun server, kamu tanda tangani sendiri di MetaMask.'}
         </p>
       </div>
 
@@ -180,7 +235,9 @@ export default function RealWalletModal({ onClose }: { onClose: () => void }) {
           : !isBound
             ? 'Bind wallet sekali agar swap dana asli diizinkan.'
             : realMode
-              ? 'Dana asli aktif. Autopilot mengusulkan trade, kamu approve tiap transaksi di MetaMask.'
+              ? autoApprove
+                ? 'Dana asli aktif, approve otomatis. MetaMask terbuka sendiri tiap intent — kamu yang tanda tangani. Matikan switch 4 untuk kembali manual.'
+                : 'Dana asli aktif. Autopilot mengusulkan trade, kamu approve tiap transaksi di MetaMask.'
               : 'Mode virtual aktif. Nyalakan "Mode real" untuk memakai dana asli.'}
       </p>
     </Modal>

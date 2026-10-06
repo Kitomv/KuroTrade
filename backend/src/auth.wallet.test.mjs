@@ -1,14 +1,15 @@
-// Wallet-login tests: the address→account resolution and the challenge rules.
+// Legacy wallet-account tests.
 //
-// The crypto itself is covered in evmBind.test.mjs. What matters here is that
-// an address maps to exactly one account, that a wallet-only record cannot be
-// reached by a password login, and that the guards added alongside wallet login
-// (one address per account, case-insensitive bound comparison) hold.
-// Run: node --test backend/src/auth.test.mjs
+// Wallet LOGIN is gone — an account is now created only by an admin. What
+// remains here is the shape of a wallet-only record that predates that removal
+// (username null, no password material): it must not be reachable through the
+// password login, and binding a wallet to an account must still refuse a wallet
+// that another account already owns.
+// Run: node --test backend/src/auth.wallet.test.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { mkdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
 const TEMP_DIR = join(tmpdir(), `wallet-auth-test-${process.pid}`);
@@ -16,7 +17,7 @@ mkdirSync(TEMP_DIR, { recursive: true });
 process.env.PERSIST_DATA_DIR = TEMP_DIR;
 
 const {
-  createUserWithAddress, findUserByAddress, createUser, verifyUser, listUsers,
+  findUserByAddress, createUser, verifyUser, listUsers,
   createBindChallenge, bindWallet, setBoundWallet, assertBoundWallet, getBoundWallet,
 } = await import('./auth.js').then(async (auth) => ({
   ...auth,
@@ -26,30 +27,35 @@ const {
 const ADDR = '0xAbCdEf0000000000000000000000000000000001';
 let seq = 0;
 const fresh = () => `wlt_${process.pid}_${seq++}`;
-const users = () => JSON.parse(readFileSync(join(TEMP_DIR, 'users.json'), 'utf8'));
+const usersFile = join(TEMP_DIR, 'users.json');
+// The file does not exist until something writes it — a legacy-record test may
+// be the first thing to run, so treat "absent" as "no users yet".
+const users = () => {
+  try { return JSON.parse(readFileSync(usersFile, 'utf8')); } catch { return []; }
+};
 
-/* ---------------- address → account ---------------- */
+/**
+ * Write a wallet-only record the way the removed wallet-login flow did: no
+ * username, no salt, no hash. Tests below pin what must stay true of such a
+ * record now that nothing can create one.
+ */
+const writeLegacyWalletUser = (address) => {
+  const record = { id: `legacy_${fresh()}`, address: String(address).toLowerCase(), username: null, createdAt: Date.now() };
+  writeFileSync(usersFile, JSON.stringify([...users(), record], null, 2), 'utf8');
+  return record;
+};
 
-test('a wallet-only account is created without any password material', () => {
-  const user = createUserWithAddress(ADDR);
-  assert.ok(user.id);
-  assert.equal(user.address, ADDR.toLowerCase(), 'stored in canonical lowercase form');
+/* ---------------- legacy wallet-only records ---------------- */
 
-  const record = users().find((u) => u.id === user.id);
+test('a legacy wallet-only record has no password material to attack', () => {
+  const record = writeLegacyWalletUser(ADDR);
   assert.equal(record.hash, undefined, 'no hash — there is no password to hash');
   assert.equal(record.salt, undefined, 'no salt');
   assert.equal(record.password, undefined, 'no plaintext password field');
 });
 
-test('signing with the same wallet twice returns the SAME account', () => {
-  const first = createUserWithAddress(ADDR);
-  const second = createUserWithAddress(ADDR.toUpperCase().replace('0X', '0x'));
-  assert.equal(second.id, first.id, 'a second sign must not mint a second account');
-  assert.equal(users().filter((u) => u.address === ADDR.toLowerCase()).length, 1, 'exactly one record');
-});
-
 test('findUserByAddress resolves across checksum casings and rejects junk', () => {
-  createUserWithAddress(ADDR);
+  writeLegacyWalletUser(ADDR);
   for (const casing of [ADDR, ADDR.toLowerCase(), ADDR.toUpperCase().replace('0X', '0x')]) {
     assert.ok(findUserByAddress(casing), `should resolve ${casing}`);
     assert.equal(findUserByAddress(casing).address, ADDR.toLowerCase());
@@ -59,18 +65,18 @@ test('findUserByAddress resolves across checksum casings and rejects junk', () =
   }
 });
 
-test('a wallet-only account cannot be reached through password login', () => {
-  createUserWithAddress(ADDR);
+test('a legacy wallet-only record cannot be reached through password login', () => {
+  writeLegacyWalletUser(ADDR);
   // It has no username, so username login has nothing to match — and no hash,
   // so even a guessed username could not authenticate.
-  assert.equal(users().filter((u) => u.address === ADDR.toLowerCase())[0].username ?? null, null);
+  assert.equal(users().find((u) => u.address === ADDR.toLowerCase()).username ?? null, null);
   assert.equal(verifyUser(ADDR, ''), null);
   assert.equal(verifyUser(ADDR.toLowerCase(), 'anything'), null);
 });
 
 test('listUsers exposes the address but never credential material', () => {
-  const u = createUserWithAddress(ADDR);
-  const [row] = listUsers().filter((x) => x.id === u.id);
+  const record = writeLegacyWalletUser(ADDR);
+  const row = listUsers().find((x) => x.id === record.id);
   assert.equal(row.address, ADDR.toLowerCase());
   assert.equal(row.hash, undefined);
   assert.equal(row.salt, undefined);
@@ -83,8 +89,9 @@ test('an address already claimed by another account cannot be bound', async () =
   const wallet = Wallet.createRandom();
   const address = wallet.address;
 
-  // Wallet login provisions the account that owns this address.
-  const owner = createUserWithAddress(address);
+  // A legacy wallet-only record owns this address.
+  writeLegacyWalletUser(address);
+  const owner = findUserByAddress(address);
   // A second, separate account tries to bind the same wallet.
   const otherId = createUser('victim_' + fresh(), 'password12345').id;
   assert.notEqual(owner.id, otherId, 'two distinct accounts');

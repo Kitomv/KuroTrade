@@ -39,6 +39,32 @@ function loadJson(file, fallback) {
   catch { return fallback; }
 }
 
+/**
+ * Load the account store, refusing to treat a damaged file as "no users".
+ *
+ * `loadJson`'s catch-to-fallback is right for caches and wrong here: a
+ * truncated users.json (crash mid-write, full disk, bad hand-edit) would read
+ * as an empty list, and the next write — most likely the admin add-user route —
+ * would overwrite every account with a single record and still report success.
+ * Every per-user state file is keyed by the lost ids, so the loss is silent and
+ * total. A missing file is different: that is a genuine fresh install.
+ *
+ * Throws rather than returning [], so callers fail loudly and the file is left
+ * untouched for recovery.
+ */
+function loadUsers() {
+  if (!existsSync(USERS_FILE)) return [];
+  let parsed;
+  try { parsed = JSON.parse(readFileSync(USERS_FILE, 'utf-8')); }
+  catch (e) {
+    throw new Error(`users.json tidak bisa dibaca (JSON rusak) — perbaiki atau pindahkan file itu dulu: ${e.message}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error('users.json tidak bisa dibaca (bukan array) — perbaiki atau pindahkan file itu dulu');
+  }
+  return parsed;
+}
+
 function atomicWrite(file, data) {
   const tmp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
   try {
@@ -50,50 +76,41 @@ function atomicWrite(file, data) {
   }
 }
 
-function loadUsers() {
-  return loadJson(USERS_FILE, []);
-}
-
 function saveUsers(users) {
   atomicWrite(USERS_FILE, users);
 }
 
+/**
+ * The effective role of a user record.
+ *
+ * Fail closed: only an own 'admin' property grants admin. A missing field
+ * (every record written before roles existed), a typo, or a value inherited
+ * from Object.prototype all read as 'user'. The own-property check is load
+ * bearing — plain `user.role` walks the prototype chain, so a record whose
+ * prototype had been polluted would otherwise grant admin.
+ */
+export function roleOf(user) {
+  if (!user || typeof user !== 'object') return 'user';
+  return Object.hasOwn(user, 'role') && user.role === 'admin' ? 'admin' : 'user';
+}
+
 /** Create a user (idempotent: existing username → false). */
-export function createUser(username, password) {
+export function createUser(username, password, role = 'user') {
+  // Guard the shape here too: this is also the env-seed path, and a non-string
+  // username would be written to disk and then never match a login lookup.
+  if (typeof username !== 'string' || !username) return false;
+  if (typeof password !== 'string' || !password) return false;
   const users = loadUsers();
   if (users.some((u) => u.username === username)) return false;
   const salt = randomBytes(16).toString('hex');
   const user = {
     id: randomUUID(),
     username,
+    // Normalised on write too, so a caller cannot store a role the reader
+    // would not honour (or vice versa).
+    role: roleOf({ role }),
     salt,
     hash: hashPasswordScrypt(password, salt),
-    createdAt: Date.now(),
-  };
-  users.push(user);
-  saveUsers(users);
-  return user;
-}
-
-/**
- * Create a wallet-only account, with no password.
- *
- * Used by the MetaMask login flow: the address has already been proven by an
- * EIP-191 signature, so there is no password to hash — and deliberately no
- * salt/hash fields either, so a wallet-only account can never be the target
- * of a password login. The address is stored lowercased as the canonical form.
- */
-export function createUserWithAddress(address) {
-  const users = loadUsers();
-  const canonical = String(address).toLowerCase();
-  // Wallet login is idempotent by address: signing with a wallet that already
-  // has an account must never mint a second one.
-  const existing = users.find((u) => typeof u.address === 'string' && u.address === canonical);
-  if (existing) return existing;
-  const user = {
-    id: randomUUID(),
-    address: canonical,
-    username: null,
     createdAt: Date.now(),
   };
   users.push(user);
@@ -142,6 +159,29 @@ export function getUserById(id) {
   return loadUsers().find((u) => u.id === id) ?? null;
 }
 
+/** True only for an exact 'admin' role. Absent/unknown roles read as 'user'. */
+export function isAdmin(userId) {
+  return roleOf(getUserById(userId)) === 'admin';
+}
+
+/**
+ * Replace a user's password (admin action).
+ *
+ * Returns false when the id matches nothing, so the route can 404 rather than
+ * reporting success for a no-op. Also (re)writes salt+hash for an account that
+ * had none — a legacy wallet-only record has no password material at all, and
+ * this is the only way to give it one now that wallet login is gone.
+ */
+export function setUserPassword(userId, newPassword) {
+  const users = loadUsers();
+  const idx = users.findIndex((u) => u.id === userId);
+  if (idx === -1) return false;
+  const salt = randomBytes(16).toString('hex');
+  users[idx] = { ...users[idx], salt, hash: hashPasswordScrypt(newPassword, salt) };
+  saveUsers(users);
+  return true;
+}
+
 /** Change own password after verifying the current one. */
 export function changePassword(userId, currentPassword, newPassword) {
   const users = loadUsers();
@@ -155,11 +195,32 @@ export function changePassword(userId, currentPassword, newPassword) {
   return true;
 }
 
-/** Public user list for the leaderboard (no salt/hash). */
+/** Public user list for the leaderboard (no salt/hash, and no role: whether
+ *  someone is an admin is not the leaderboard's business). */
 export function listUsers() {
-  // `address` is included so a wallet-only account (which has no username) can
-  // still be identified in the leaderboard. Still no credential material.
+  // `address` is included so a legacy wallet-only account (which has no
+  // username) can still be identified in the leaderboard. Still no credential
+  // material.
   return loadUsers().map(({ id, username, address, createdAt }) => ({ id, username, address, createdAt }));
+}
+
+/**
+ * Admin view of every account, newest first.
+ *
+ * `hasPassword` is a boolean, never the hash or salt — the admin needs to know
+ * which accounts can actually log in, not what their credentials are.
+ */
+export function listAccounts() {
+  return loadUsers()
+    .map((u) => ({
+      id: u.id,
+      username: u.username ?? null,
+      address: u.address ?? null,
+      role: roleOf(u),
+      hasPassword: typeof u.hash === 'string' && u.hash.length > 0,
+      createdAt: u.createdAt,
+    }))
+    .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
 }
 
 // --- Sessions (persisted to data/sessions.json) ---
@@ -210,15 +271,51 @@ export function destroyOtherSessions(userId, keepToken) {
   if (changed) saveSessions();
 }
 
-/** Add one regular user from env when their username is not present.
- *  Registration is disabled, so this is the manual account-creation path. */
+/**
+ * Seed the operator account from env, and make sure it is an admin.
+ *
+ * This is the only way the FIRST admin comes into existence: there is no
+ * registration, and no endpoint can promote anyone. Two rules keep it safe:
+ *
+ *  - The env account is always an admin. Whoever holds the .env on the server
+ *    already controls the process, so gating this adds no security, and NOT
+ *    doing it is how an install ends up with no admin and no way to get one.
+ *  - Promotion is limited to that env-named account. Nothing else is ever
+ *    promoted, so a second admin cannot appear because a boot happened.
+ *
+ * Idempotent: a second boot finds the account already correct and does nothing.
+ */
 export function seedAdminFromEnv() {
   const username = process.env.USER_USERNAME || process.env.ADMIN_USER;
   const password = process.env.USER_PASSWORD || process.env.ADMIN_PASSWORD;
-  if (!username || !password) {
-    if (loadUsers().length === 0) console.log('\n[!] Belum ada user. Set USER_USERNAME dan USER_PASSWORD lalu restart.\n');
+  // A corrupt store must not be fatal. Failing closed is about refusing the
+  // WRITE; crashing the process here would take down market data and every
+  // other user for one damaged file. Log loudly, leave the file alone, and let
+  // every read/write that actually needs the store throw on its own.
+  let users;
+  try {
+    users = loadUsers();
+  } catch (e) {
+    console.error(`\n[!] users.json rusak — seed admin dilewati. Perbaiki atau pindahkan file itu, lalu restart.\n    ${e.message}\n`);
     return;
   }
-  const user = createUser(username, password);
-  if (user) console.log(`\n[i] Akun manual dibuat dari env: ${user.username}\n`);
+  if (!username || !password) {
+    if (users.length === 0) console.log('\n[!] Belum ada user. Set USER_USERNAME dan USER_PASSWORD lalu restart.\n');
+    return;
+  }
+
+  const existing = users.find((u) => u.username === username);
+  if (!existing) {
+    const user = createUser(username, password, 'admin');
+    if (user) console.log(`\n[i] Admin dibuat dari env: ${user.username}\n`);
+    return;
+  }
+  if (roleOf(existing) !== 'admin') {
+    // Promote only the record this env names. Deliberately loud: this changes
+    // who can create accounts, so it must be visible in the boot log.
+    const rec = users.find((u) => u.id === existing.id);
+    rec.role = 'admin';
+    saveUsers(users);
+    console.log(`\n[i] Akun env dinaikkan menjadi admin: ${rec.username}\n`);
+  }
 }

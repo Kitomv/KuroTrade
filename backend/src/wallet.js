@@ -28,6 +28,7 @@ function walletFor(userId) {
       orders: [],
       nextOrderId: 1,
       realizedPnl: 0, // cumulative, lives here so closing a position cannot erase it
+      riskLedger: [], // timestamped realized PnL — the daily loss cap's only data source
     });
   }
   return wallets.get(userId);
@@ -46,10 +47,24 @@ function uid(w) {
  * KPI read $0 after every complete round trip, and only a partially-sold
  * position ever showed a non-zero total. Realized PnL must outlive the
  * position that produced it.
+ *
+ * Every booking also appends to `riskLedger` — the timestamped history the
+ * rolling daily-loss cap is computed from. `realizedPnl` above is a lifetime
+ * scalar and cannot express "lost $30 today", which is the only question the
+ * cap asks.
  */
 function updateRealizedPnl(w, amount) {
+  const usd = Number(amount);
   const next = (Number(w.realizedPnl) || 0) + Number(amount);
   w.realizedPnl = Number.isFinite(next) ? next : (Number(w.realizedPnl) || 0);
+  // A non-finite amount must not reach the ledger: riskGuard counts an
+  // unreadable entry as a real loss (fail closed), so a NaN here would block
+  // every future buy for no reason.
+  if (!Number.isFinite(usd)) return;
+  w.riskLedger.push({ ts: Date.now(), usd });
+  // Oldest first out — the cap only ever looks back 24h, and an unbounded
+  // array is a per-user memory leak that survives every restart.
+  if (w.riskLedger.length > MAX_RISK_LEDGER) w.riskLedger.splice(0, w.riskLedger.length - MAX_RISK_LEDGER);
 }
 
 /** Load a user's persisted wallet+orders into memory (call once at startup). */
@@ -79,6 +94,12 @@ export function initWallet(userId) {
   w.orders = (Array.isArray(saved.orders) ? saved.orders : [])
     .filter((o) => o && typeof o.id === 'string' && Number.isFinite(Number(o.usdAmount)) && Number(o.usdAmount) >= 0 && Number(o.usdAmount) <= MAX_VIRTUAL_USD)
     .slice(0, MAX_ORDERS);
+  // Only well-formed rows survive: riskGuard treats an unreadable timestamp as
+  // "inside the window", so one corrupt row would count against the loss cap
+  // for the next 24h with no way to age out.
+  w.riskLedger = (Array.isArray(saved.riskLedger) ? saved.riskLedger : [])
+    .filter((e) => e && Number.isFinite(Number(e.ts)) && Number.isFinite(Number(e.usd)))
+    .slice(-MAX_RISK_LEDGER);
   initUserStores(userId, saved);
 }
 
@@ -98,6 +119,7 @@ registerStateProvider((userId) => {
     initialBalance: w.initialBalance,
     nextOrderId: w.nextOrderId,
     realizedPnl: Number(w.realizedPnl) || 0,
+    riskLedger: w.riskLedger,
     positions: [...w.positions.entries()].map(([tokenAddress, p]) => ({ ...p, tokenAddress })),
     orders: w.orders,
   };
@@ -137,6 +159,8 @@ function sanitizePosition(p) {
 }
 
 const MAX_ORDERS = 500;
+/** Rolling realized-PnL history. 500 entries at ~10 trades/day is months of cover. */
+const MAX_RISK_LEDGER = 500;
 
 export function getWallet(userId) {
   const w = walletFor(userId);
@@ -288,9 +312,48 @@ export function resetWallet(userId, newInitialBalance) {
     orders: [],
     nextOrderId: 1,
     realizedPnl: 0, // a reset account has earned nothing yet
+    riskLedger: [], // ...and has lost nothing, so the daily loss cap starts clean
   });
   saveUserState(userId);
   return getWallet(userId);
+}
+
+/**
+ * Timestamped realized-PnL history, oldest first — the daily loss cap's input.
+ *
+ * Returns a copy: the cap runs on the executor's own tick and must not be able
+ * to mutate the wallet by reading it.
+ */
+export function getRiskLedger(userId) {
+  return walletFor(userId).riskLedger.map((e) => ({ ts: e.ts, usd: e.usd }));
+}
+
+/**
+ * Book a REAL exit's P&L into the risk ledger, so the daily-loss cap counts the
+ * losses that actually moved funds.
+ *
+ * `updateRealizedPnl` (above) is the paper path: it also credits the virtual
+ * balance and bumps `realizedPnl`. A real exit must NOT touch either — the
+ * tokens were bought with real money, so the paper ledger's cash and lifetime
+ * P&L are not this trade's to rewrite. But the CAP is a different question: it
+ * asks "how much have we lost in the last 24h", and a real loss is the one that
+ * matters most. Before this existed the ledger was written only by paper sells,
+ * so a user in real mode could lose real money all day and the cap would never
+ * fire — the guard was blind to exactly the losses it exists to stop.
+ *
+ * `realizedPnl` is deliberately left alone: the UI's realized KPI is the paper
+ * book's number, and folding real exits into it would double-count a trade the
+ * mirror already tracks.
+ */
+export function bookRiskLedger(userId, amount) {
+  const w = walletFor(userId);
+  const usd = Number(amount);
+  // Same fail-closed reasoning as updateRealizedPnl: a non-finite amount would
+  // be counted as a real loss by riskGuard and suppress every future buy.
+  if (!Number.isFinite(usd)) return;
+  w.riskLedger.push({ ts: Date.now(), usd });
+  if (w.riskLedger.length > MAX_RISK_LEDGER) w.riskLedger.splice(0, w.riskLedger.length - MAX_RISK_LEDGER);
+  saveUserState(userId);
 }
 
 export function getPositions(userId) {

@@ -102,7 +102,11 @@ export const dexscreener = {
    */
   async token(tokenAddress, chainId = null) {
     const data = await get(
-      `${BASE}/latest/dex/tokens/${tokenAddress}`,
+      // encodeURIComponent, not raw interpolation: an address arriving as
+      // `../..` or with a `?` in it would otherwise reshape the path and the
+      // query. BASE is a fixed constant so the blast radius is DexScreener's
+      // own API, but the request should still mean what it says.
+      `${BASE}/latest/dex/tokens/${encodeURIComponent(String(tokenAddress))}`,
       TTL,
       `tok:${tokenAddress.toLowerCase()}:${chainId ?? '*'}`,
     );

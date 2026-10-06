@@ -96,6 +96,25 @@ function flushUser(userId) {
   }
 }
 
+/**
+ * Flush a user to disk NOW, synchronously, bypassing the debounce.
+ *
+ * `touch` is right for ordinary mutations — a 500 ms window loses nothing that
+ * matters. It is wrong on the execution path: the autonomous executor journals
+ * `stage:'sending'` with the tx nonce before broadcasting, and a crash inside
+ * the debounce would erase the only record that a swap may already be in
+ * flight. Recovery then reads "no exec record" as "nothing was sent" and
+ * re-executes a trade that is already on-chain.
+ *
+ * `flushUser` is already a synchronous write-then-rename, so this is the same
+ * durability guarantee with the delay removed — not a different write path.
+ */
+export function flushUserNow(userId) {
+  const timer = pending.get(userId);
+  if (timer) { clearTimeout(timer); pending.delete(userId); }
+  flushUser(userId);
+}
+
 /** Remove orphaned temp files left by a crashed process (best effort). */
 export function cleanupTempFiles() {
   try {

@@ -453,6 +453,12 @@ export async function getEvmTokenBalance(address, token, chain = 'base') {
  *  - `exposureUsd` — positions at risk only, EXCLUDING USDT. What the
  *    autopilot's exposure gate reads.
  *
+ * Plus `unpricedCount`: how many non-zero holdings were dropped because their
+ * decimals could not be read, so they never entered `valueUsd`. A caller that
+ * presents `valueUsd` as a TOTAL must treat a non-zero count as "not the whole
+ * story" — the money is real, we just could not value it. Without this, a token
+ * dropped on an RPC blip vanishes from the total with nothing to say so.
+ *
  * USDT is cash, not a position: it is the funding currency and the undeployed
  * part of the book. Counting it as exposure reports ~100% on a wallet funded
  * with USDT, which permanently blocks every new buy — the same failure the
@@ -466,16 +472,19 @@ export async function getEvmTokenValue(address, chain = 'base', tokens = []) {
   // autopilot traded, so a wallet funded with USDT showed an empty table.
   const always = USDT_BY_CHAIN[chain] ? [USDT_BY_CHAIN[chain]] : [];
   const all = [...new Set([...always, ...tokens])];
-  if (all.length === 0) return { valueUsd: 0, exposureUsd: 0, holdings: [] };
+  if (all.length === 0) return { valueUsd: 0, exposureUsd: 0, holdings: [], unpricedCount: 0 };
   const markets = await dexscreener.tokens(all).catch(() => new Map());
   let total = 0;
   let exposure = 0;
+  let unpricedCount = 0;
   const holdings = [];
   for (const token of all) {
     const balance = await getEvmTokenBalance(owner, token, chain);
     if (balance === null || balance === 0n) continue;
     const decimals = await resolveTokenDecimals(token, chain);
-    if (decimals === null) continue;
+    // A non-zero balance we cannot convert to a number: real money that will
+    // not reach `valueUsd`. Counted, not silently dropped.
+    if (decimals === null) { unpricedCount += 1; continue; }
     const amount = Number(ethers.formatUnits(balance, decimals));
     const norm = markets.get(String(token).toLowerCase());
     const symbol = knownSymbol(chain, token);
@@ -500,6 +509,7 @@ export async function getEvmTokenValue(address, chain = 'base', tokens = []) {
     valueUsd: Math.round(total * 100) / 100,
     exposureUsd: Math.round(exposure * 100) / 100,
     holdings,
+    unpricedCount,
   };
 }
 

@@ -4,36 +4,31 @@
 // the swap dialog reuses RealTradeForm rather than reimplementing quote → sign.
 // Importers/callers: Portfolio.tsx (when realMode).
 // API/data: GET /api/real/portfolio; RealTradeForm for swaps.
-import { useCallback, useEffect, useState } from 'react';
+//
+// The panel answers one question first — how much real money is here — with a
+// single balance-line figure, then breaks it into the two balances that make it
+// up. It reads `nativeUsd` and prices the gas coin, which the previous version
+// fetched and discarded.
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api/client';
 import { Modal } from './Modal';
 import { RealTradeForm } from './RealTradeForm';
 import { useEvmWallet } from './EvmWalletContext';
-import { IconAlert, IconLock } from './Icons';
+import { IconAlert, IconCheck, IconCopy, IconLock } from './Icons';
 import { shortAddr, chainKeyFromId, chainNameFromId, NATIVE_SYMBOL_BY_CHAIN } from '../lib/evm';
+import { fmt } from '../lib/format';
+import {
+  DISPLAY_SYMBOL, gasState, isReady, onChainTotalUsd, usdtAmount as usdtAmountOf, usdtRow,
+  type GasState, type Holding,
+} from '../lib/walletView';
 
-interface Holding {
-  token: string;
-  /** Known symbol (e.g. USDT), or null when the backend does not recognise it. */
-  symbol: string | null;
-  amount: number;
-  decimals: number;
-  priceUsd: number | null;
-  valueUsd: number | null;
-}
-
-/** Native coin below this cannot pay for an exit swap — the wallet is stuck. */
-const GAS_FLOOR = 0.005;
-
-/**
- * The portfolio table shows USDT ONLY.
- *
- * USDT is the funding currency of this app: it is what the user sends in and
- * what every trade is sized in, so a table of autopilot leftovers answered a
- * question nobody asked. The backend still returns every holding (it needs them
- * for exposure), and this view narrows to the one token the user tracks.
- */
-const DISPLAY_SYMBOL = 'USDT';
+/** Plain-language gas state, so the balance is legible without reading a colour. */
+const GAS_TEXT: Record<GasState, string> = {
+  ok: 'cukup untuk biaya gas',
+  low: 'di bawah biaya gas — sisa untuk swap',
+  empty: 'tidak ada untuk biaya gas',
+  unknown: '…',
+};
 
 export function RealWalletPortfolio() {
   const { connected, isBound, address, chainId } = useEvmWallet();
@@ -45,36 +40,117 @@ export function RealWalletPortfolio() {
   const chainLabel = chainNameFromId(chainId) ?? chainId ?? 'tidak dikenal';
 
   const [native, setNative] = useState<number | null>(null);
+  const [nativeUsd, setNativeUsd] = useState<number | null>(null);
+  // The backend's sum over EVERY priced holding. The headline is called "Total
+  // On-Chain", so it must include positions the panel does not tabulate — using
+  // the USDT row alone would understate the wallet while calling it a total.
+  const [tokenValueUsd, setTokenValueUsd] = useState<number | null>(null);
   const [holdings, setHoldings] = useState<Holding[]>([]);
+  // Holdings the backend dropped before they ever reached us (decimals
+  // unreadable). We cannot see them in `holdings`, so the count must come from
+  // the payload — the client cannot guard against what it never receives.
+  const [droppedHoldings, setDroppedHoldings] = useState(0);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState('');
+  // Kept SEPARATE from `err` on purpose: `err` feeds the `ready` gate, and a
+  // clipboard failure must never blank out balances that loaded fine. One shared
+  // channel meant a denied clipboard permission reverted the whole panel to "…".
+  const [copyErr, setCopyErr] = useState('');
   const [swapOpen, setSwapOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
 
+  const copyTimer = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+  }, []);
+
+  // Only the newest load may write state. `load` is called from the effect AND
+  // directly by Refresh / modal-close, so an effect-scoped flag would misfire;
+  // a request id covers every caller. Without it, switching Base → Ethereum on
+  // a slow connection lets the stale Base response overwrite the Ethereum one.
+  const reqId = useRef(0);
   const load = useCallback(async () => {
+    const id = ++reqId.current;
     if (!connected || !address || !isBound || !chain) {
-      setNative(null); setHoldings([]); setLoading(false);
+      setNative(null); setNativeUsd(null); setTokenValueUsd(null); setHoldings([]);
+      setDroppedHoldings(0);
+      setErr('');
+      setCopyErr(''); // a stale clipboard notice must not outlive the wallet it names
+      setLoading(false);
       return;
     }
     setLoading(true);
     try {
       const snap = await api.realPortfolio(chain);
+      if (id !== reqId.current) return; // a newer load has superseded this one
       setNative(snap.native);
-      setHoldings(snap.holdings.filter((h) => h.symbol === DISPLAY_SYMBOL));
+      setNativeUsd(snap.nativeUsd);
+      setTokenValueUsd(snap.tokenValueUsd);
+      setHoldings(snap.holdings);
+      setDroppedHoldings(snap.unpricedCount ?? 0);
       setErr('');
+      setCopyErr(''); // a fresh load clears a stale copy notice
     } catch (e: unknown) {
+      if (id !== reqId.current) return;
       setErr(String((e as { message?: string })?.message ?? 'Gagal memuat saldo on-chain'));
     } finally {
-      setLoading(false);
+      if (id === reqId.current) setLoading(false);
     }
   }, [connected, address, isBound, chain]);
 
-  const usdt = holdings[0] ?? null;
-  // The backend omits zero-balance tokens, so a missing USDT row means "0
-  // USDT", not "unknown" — show 0 instead of an ellipsis that never resolves.
-  const usdtAmount = usdt?.amount ?? 0;
-  const usdtValue = usdt ? (usdt.valueUsd ?? usdt.amount) : null;
-
   useEffect(() => { load(); }, [load]);
+
+  const usdt = usdtRow(holdings);
+  // The amount comes from the tested helper. An absent row is a real zero ONLY
+  // when the backend dropped nothing: it silently drops non-zero holdings whose
+  // decimals it cannot read, so when it dropped any the USDT may be among them
+  // and the amount is unknown, not zero. The `ready` gate decides whether a
+  // number may be shown at all; this decides what that number is.
+  const usdtAmount = usdtAmountOf(holdings, droppedHoldings);
+  // A known amount can still be un-valued (row present but priceUsd null); USDT
+  // is the app's funding currency and a dollar by definition, so an unpriced row
+  // still values at face — matching the backend's own USDT = $1 rule.
+  const usdtValue = usdt ? (usdt.valueUsd ?? usdt.amount) : null;
+  // Tokens the panel deliberately does not tabulate (the app is USDT-denominated)
+  // — counted only so the headline never hides real money without saying so.
+  const otherHoldings = holdings.filter((h) => h.symbol?.toLowerCase() !== DISPLAY_SYMBOL.toLowerCase());
+  // A holding the backend could not price is skipped from `tokenValueUsd`, so a
+  // total built from that sum would omit real money. Counted so the total can
+  // refuse to be a number instead. USDT is exempt: it is a dollar by definition
+  // (see `usdtValue`), so it is never "unpriced".
+  const unpricedHoldings = useMemo(
+    () => droppedHoldings + holdings.filter((h) => h.valueUsd === null && h.symbol?.toLowerCase() !== DISPLAY_SYMBOL.toLowerCase()).length,
+    [holdings, droppedHoldings],
+  );
+
+  const total = onChainTotalUsd({ native, nativeUsd, tokenValueUsd, unpricedHoldings });
+  const gas = gasState(native);
+  // "Ready" means the balances are actually known — a failed load leaves
+  // `loading` false with the initial empty balances still in place, so the gate
+  // must reject an error too. Every state that is NOT ready shows "…" rather
+  // than asserting "no USDT": we have not looked, which is not the same as zero.
+  const ready = isReady({ loading, err, isBound, chain, address });
+  // NaN passes `!== null` but renders as the literal text "NaN" in the row —
+  // narrow to a finite number so this agrees with gasState. The `typeof` test
+  // is what lets TypeScript narrow `native` for the render below.
+  const nativeNum = ready && typeof native === 'number' && Number.isFinite(native) ? native : null;
+
+  const copyAddress = async () => {
+    if (!address) return;
+    // Only claim success once the write resolves. A rejected write (insecure
+    // origin, denied permission, no async clipboard API) previously still
+    // flashed "Tersalin", and a user who trusts it pastes a stale address.
+    try {
+      await navigator.clipboard.writeText(address);
+      setCopied(true);
+      setCopyErr('');
+      if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+      copyTimer.current = window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // NOT setErr: that feeds the `ready` gate and would blank the balances.
+      setCopyErr('Gagal menyalin alamat — browser menolak akses clipboard.');
+    }
+  };
 
   if (!connected) {
     return (
@@ -87,9 +163,9 @@ export function RealWalletPortfolio() {
   }
 
   return (
-    <div className="card" style={{ marginBottom: 24 }}>
-      <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+    <div className="card" style={{ marginBottom: 24 }} aria-busy={loading}>
+      <div className="wallet-head">
+        <div className="wallet-head-title">
           <strong style={{ fontSize: 14 }}>Wallet On-Chain (Dana Asli)</strong>
           <span className="chip" style={{ background: 'var(--down-bg)', color: 'var(--down)', fontSize: 10, fontWeight: 700, border: '1px solid rgba(239,68,68,.4)' }}>
             REAL
@@ -117,78 +193,101 @@ export function RealWalletPortfolio() {
         </div>
       </div>
 
-      <div style={{ padding: 20 }}>
-        {err && <div className="error" style={{ marginBottom: 14 }}><IconAlert size={13} /> {err}</div>}
-        {!isBound && (
-          <div className="error" style={{ marginBottom: 14, background: 'var(--accent-dim)', color: 'var(--accent)', borderColor: 'rgba(232, 163, 61, .4)' }}>
+      {err && (
+        <div style={{ padding: '14px 20px 0' }}>
+          {/* role=alert so a real-money load failure is announced, not silent. */}
+          <div className="error" role="alert"><IconAlert size={13} /> {err}</div>
+        </div>
+      )}
+      {copyErr && (
+        <div style={{ padding: '14px 20px 0' }}>
+          {/* Its own channel: a clipboard failure must not touch the balances. */}
+          <div className="error" role="alert" style={{ background: 'var(--accent-dim)', color: 'var(--accent)', borderColor: 'rgba(232, 163, 61, .4)' }}>
+            <IconAlert size={13} /> {copyErr}
+          </div>
+        </div>
+      )}
+      {!isBound && (
+        <div style={{ padding: '14px 20px 0' }}>
+          <div className="error" style={{ background: 'var(--accent-dim)', color: 'var(--accent)', borderColor: 'rgba(232, 163, 61, .4)' }}>
             <IconLock size={13} /> Bind wallet dulu (panel Real Wallet di sidebar) sebelum swap dana asli.
           </div>
-        )}
-
-        <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 10, wordBreak: 'break-all' }}>
-          {address ? shortAddr(address, 6) : '—'}
-          {chainId && !chain && (
-            <span style={{ color: 'var(--down)' }}> · chain {chainLabel} belum didukung — saldo tidak dimuat</span>
-          )}
         </div>
-
-        {chainId && !chain && isBound && (
-          <div className="error" style={{ marginBottom: 14 }}>
+      )}
+      {chainId && !chain && isBound && (
+        <div style={{ padding: '14px 20px 0' }}>
+          <div className="error">
             <IconAlert size={13} /> Wallet kamu di {chainLabel}. Chain ini belum didukung backend —
             ganti ke Base di MetaMask untuk melihat saldo dan melakukan swap.
           </div>
-        )}
+        </div>
+      )}
 
-        <div className="kpi-grid">
-          <div className="card kpi">
-            <div className="kpi-label">{nativeSymbol} (gas + trade)</div>
-            <div className="kpi-value">{native === null ? '…' : native.toFixed(4)}</div>
-            <div className="kpi-sub">
-              {native !== null && native < GAS_FLOOR ? '⚠ di bawah biaya gas' : 'siap untuk transaksi'}
-            </div>
-          </div>
-          <div className="card kpi">
-            <div className="kpi-label">USDT</div>
-            <div className="kpi-value">
-              {loading || !isBound ? '…' : usdtAmount.toLocaleString(undefined, { maximumFractionDigits: 2 })}
-            </div>
-            <div className="kpi-sub">
-              {usdtValue === null ? 'belum ada USDT di wallet' : `≈ $${usdtValue.toFixed(2)}`}
-            </div>
+      {/* The balance line: an amber rule over the one number that matters. */}
+      <div className="wallet-total">
+        <div className="wallet-total-rule" />
+        <div className="wallet-total-label">Total On-Chain</div>
+        <div className="wallet-total-value" aria-live="polite">
+          {ready ? fmt.usd(total) : '…'}
+        </div>
+        {ready && unpricedHoldings > 0 && (
+          <p className="wallet-note" style={{ color: 'var(--accent)' }}>
+            {unpricedHoldings} token di wallet ini belum punya harga — total di atas belum termasuk nilainya.
+          </p>
+        )}
+        {ready && unpricedHoldings === 0 && total !== null && otherHoldings.length > 0 && (
+          <p className="wallet-note">
+            +{otherHoldings.length} token lain di wallet ini tidak ditampilkan (panel ini fokus USDT).
+          </p>
+        )}
+      </div>
+
+      <div className="wallet-balances">
+        <div className="wallet-balance">
+          <div className="wallet-balance-label">{nativeSymbol} · gas + trade</div>
+          <div className="wallet-balance-value">{nativeNum === null ? '…' : nativeNum.toFixed(4)}</div>
+          <div
+            className="wallet-balance-sub"
+            style={nativeNum !== null && (gas === 'low' || gas === 'empty') ? { color: 'var(--down)' } : undefined}
+          >
+            {nativeNum !== null && nativeUsd !== null ? `≈ ${fmt.usd(nativeNum * nativeUsd)} · ` : ''}
+            {nativeNum !== null ? GAS_TEXT[gas] : GAS_TEXT.unknown}
           </div>
         </div>
-
-        {holdings.length > 0 && (
-          <div className="table-wrap" style={{ marginTop: 16 }}>
-            <table>
-              <thead>
-                <tr>
-                  <th>Token</th>
-                  <th>Kontrak</th>
-                  <th className="num">Jumlah</th>
-                  <th className="num">Nilai</th>
-                </tr>
-              </thead>
-              <tbody>
-                {holdings.map((t) => (
-                  <tr key={t.token}>
-                    <td><strong>{t.symbol ?? shortAddr(t.token, 4)}</strong></td>
-                    <td style={{ fontSize: 11, color: 'var(--muted)' }}>{shortAddr(t.token, 4)}</td>
-                    <td className="num">{t.amount.toLocaleString(undefined, { maximumFractionDigits: 6 })}</td>
-                    <td className="num">
-                      {t.valueUsd === null ? <span style={{ color: 'var(--muted)' }}>—</span> : `$${t.valueUsd.toFixed(2)}`}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+        <div className="wallet-balance">
+          <div className="wallet-balance-label">USDT · dana trading</div>
+          <div className="wallet-balance-value">
+            {ready && usdtAmount !== null ? usdtAmount.toLocaleString(undefined, { maximumFractionDigits: 2 }) : '…'}
           </div>
-        )}
-
-        {!loading && isBound && holdings.length === 0 && (
-          <div className="empty" style={{ marginTop: 12 }}>
-            Belum ada USDT di wallet ini. Kirim USDT ke alamat di atas — sisakan sedikit {nativeSymbol} untuk biaya gas.
+          <div className="wallet-balance-sub">
+            {!ready
+              ? GAS_TEXT.unknown
+              : usdtAmount === null
+                ? 'jumlah belum bisa dibaca — ada token tanpa harga'
+                : !usdt
+                  ? 'belum ada — kirim USDT ke alamat di bawah'
+                  : `≈ ${fmt.usd(usdtValue)} · ${shortAddr(usdt.token, 4)}`}
           </div>
+        </div>
+      </div>
+
+      <div className="wallet-foot">
+        <span className="wallet-addr">
+          {address ? shortAddr(address, 8) : '—'}
+          {chainId && !chain && (
+            <span style={{ color: 'var(--down)' }}> · chain {chainLabel} belum didukung — saldo tidak dimuat</span>
+          )}
+        </span>
+        {address && (
+          <button
+            type="button"
+            className="wallet-copy"
+            onClick={copyAddress}
+            aria-label={copied ? 'Alamat tersalin' : 'Salin alamat wallet'}
+          >
+            {copied ? <IconCheck size={13} /> : <IconCopy size={13} />}
+            {copied ? 'Tersalin' : 'Salin alamat'}
+          </button>
         )}
       </div>
 

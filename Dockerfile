@@ -16,5 +16,4 @@ COPY backend backend
 COPY --from=build /app/frontend/dist frontend/dist
 ENV PORT=3001
 EXPOSE 3001
-VOLUME ["/app/backend/data"]
 CMD ["npm", "--prefix", "backend", "run", "start"]

@@ -299,6 +299,29 @@ export function chainKeyFromId(chainIdHex: string | null): string | null {
   return CHAIN_KEY_BY_ID[chainIdHex.toLowerCase()] ?? null;
 }
 
+/** Backend chain key → wallet chain id (hex). Inverse of CHAIN_KEY_BY_ID. */
+// `Object.create(null)` base: a plain `{}` from Object.fromEntries inherits
+// Object.prototype, so a key like 'constructor' or '__proto__' would resolve to
+// an inherited value instead of null — and the caller's `!wantChain` fail-closed
+// guard would then pass a non-string downstream.
+const CHAIN_ID_BY_KEY: Record<string, string> = Object.assign(
+  Object.create(null) as Record<string, string>,
+  Object.fromEntries(Object.entries(CHAIN_KEY_BY_ID).map(([hex, key]) => [key, hex])),
+);
+
+/**
+ * Wallet chain id (hex) for a backend chain key, or null when unknown.
+ *
+ * Lets a caller check the wallet's chain against an intent's stored chain
+ * (`intent.chainId` is a key like 'base') BEFORE asking the server to build —
+ * a mismatch is caught without consuming a claim.
+ */
+export function chainIdHexFromKey(chainKey: string | null): string | null {
+  if (!chainKey) return null;
+  const hex = CHAIN_ID_BY_KEY[chainKey.toLowerCase()];
+  return typeof hex === 'string' ? hex : null;
+}
+
 /** Human chain name for display; null when the id is unknown. */
 export const CHAIN_NAME_BY_ID: Record<string, string> = {
   '0x2105': 'Base',

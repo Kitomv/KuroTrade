@@ -555,6 +555,13 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ realMode }),
     }),
+  autoApprove: () => req<{ autoApprove: boolean }>('/api/real/auto-approve'),
+  setAutoApprove: (autoApprove: boolean) =>
+    req<{ autoApprove: boolean }>('/api/real/auto-approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ autoApprove }),
+    }),
 
   // AI Multi-Agent API
   analyzeToken: (tokenAddress: string) =>

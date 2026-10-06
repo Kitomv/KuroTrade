@@ -658,6 +658,10 @@ export const api = {
     req<{
       address: string; chain: string; native: number; nativeUsd: number | null;
       tokenValueUsd: number; totalUsd: number | null;
+      // Non-zero holdings the backend could not price (decimals unreadable).
+      // They are absent from `tokenValueUsd`, so a total must treat this as
+      // "incomplete", not ignore it.
+      unpricedCount: number;
       holdings: { token: string; symbol: string | null; amount: number; decimals: number; priceUsd: number | null; valueUsd: number | null }[];
     }>(`/api/real/portfolio?chain=${encodeURIComponent(chain)}`),
 };

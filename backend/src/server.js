@@ -610,12 +610,15 @@ app.get('/api/real/portfolio', wrap(async (req, res) => {
   const tokens = [...new Set(getPositions(req.userId)
     .filter((p) => p.chainId === chain)
     .map((p) => p.tokenAddress))];
-  const { valueUsd, holdings } = await getEvmTokenValue(address, chain, tokens);
+  const { valueUsd, holdings, unpricedCount } = await getEvmTokenValue(address, chain, tokens);
   const nativeUsd = await getNativeUsdPrice(chain);
   const native = await getEvmBalanceNative(address, chain);
   res.json({
     address, chain, native, nativeUsd,
     tokenValueUsd: valueUsd,
+    // Holdings the backend could not price at all (decimals unreadable). The
+    // panel must treat this as "the total is incomplete", not silently ignore it.
+    unpricedCount,
     totalUsd: nativeUsd ? Math.round((native * nativeUsd + valueUsd) * 100) / 100 : null,
     holdings,
   });

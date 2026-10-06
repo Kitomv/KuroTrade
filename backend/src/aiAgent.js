@@ -15,6 +15,7 @@ import {
   registerAutopilotModule,
 } from './realIntent.js';
 import { getChainConfig, isSupportedChain } from './evmWallet.js';
+import { evaluateBuyGate } from './buyGate.js';
 import {
   runTechnicalAnalysis, runBullThesis, runBearThesis,
   runRiskAssessment, passesPreFilter,
@@ -342,8 +343,13 @@ export async function analyzeToken(userId, queryOrAddress, preFetchedMarket = nu
   let llmUsed = false;
 
   if (llmCfg.hasKey && agentMode !== 'deterministic') {
+    // A token's symbol is chosen by whoever deployed it, so it is untrusted
+    // text sitting inside the prompt. Collapse anything that could read as
+    // structure — a newline alone is enough to start a new "instruction" line
+    // and talk the model past the data it was asked to analyse.
+    const safeSymbol = String(market.symbol ?? '').replace(/[\r\n\t]+/g, ' ').slice(0, 64);
     const marketData = `
-Symbol: ${market.symbol} (${market.chainId})
+Symbol: ${safeSymbol} (${market.chainId})
 Price: $${Number(market.priceUsd).toFixed(6)}
 5m Change: ${tech.priceUsd ? `${Number(market.change5m).toFixed(2)}%` : '—'}
 1h Change: ${Number(market.change1h).toFixed(2)}%
@@ -469,7 +475,10 @@ Risk: Max $${risk.maxUsdPosition} USDC, TP: $${risk.takeProfitPrice.toFixed(6)} 
         userId,
         timeoutMs: st.llmTimeoutMs,
       });
-      if (synthRaw) summaryText = LLM_JSON_PARSE(synthRaw).verdict || null;
+      if (synthRaw) {
+        summaryText = LLM_JSON_PARSE(synthRaw).verdict || null;
+        if (summaryText) llmUsed = true;
+      }
     } catch {}
   }
   if (!summaryText) {
@@ -482,8 +491,15 @@ Risk: Max $${risk.maxUsdPosition} USDC, TP: $${risk.takeProfitPrice.toFixed(6)} 
 
   return {
     timestamp: Date.now(),
-    llmPowered: llmCfg.hasKey,
-    llmProvider: llmCfg.hasKey ? `${llmCfg.provider} / ${llmCfg.model}` : 'Quantitative Engine',
+    // Provenance is "did the LLM contribute", NOT "is a key configured". The
+    // badge at Agents.tsx reads these two and tells the user which engine argued
+    // the verdict — claiming a provider for a report whose every call timed out
+    // is a lie with a logo next to it. `llmUsed` is set on each fulfilled
+    // bull/bear branch and again when lead synthesis returns a verdict, so a
+    // provider outage during a scan silently drops the badge instead of
+    // mislabelling a fully deterministic report.
+    llmPowered: llmUsed,
+    llmProvider: llmUsed ? `${llmCfg.provider} / ${llmCfg.model}` : 'Quantitative Engine',
     token: { address: market.tokenAddress, symbol: market.symbol ?? 'UNKNOWN', name: market.name ?? '', chainId: market.chainId ?? 'base', dexId: market.dexId ?? '', priceUsd: Number(market.priceUsd) || 0, icon: market.icon ?? undefined },
     agents: { technical: tech, bull, bear, risk },
     verdict: {
@@ -1272,6 +1288,30 @@ async function runScoutPhase(userId, st, { markets, positions, wallet }) {
         const amountWei = fundingToken === 'native'
           ? Math.round((effectiveUsd / nativeUsd) * 1e18)
           : null;
+        // Daily-loss cap + token-quality gate, at emit time. This is the only
+        // place the cap can stop a REAL buy: the backend never signs, so the
+        // buy becomes an intent the user approves, and a cap that only ran at
+        // sign time would never run at all. Token metrics come from the signal
+        // report (the same data the verdict was built on), so a honeypot or a
+        // thin pool is refused before an intent exists rather than after the
+        // user has been asked to approve it.
+        const risk = evaluateBuyGate({
+          userId,
+          usdAmount: effectiveUsd,
+          token: {
+            liquidityUsd: topBuy.agents?.technical?.liquidityUsd ?? 0,
+            fdv: topBuy.agents?.technical?.fdv ?? 0,
+            txns24h: {
+              buys: topBuy.agents?.technical?.buys ?? 0,
+              sells: topBuy.agents?.technical?.sells ?? 0,
+            },
+          },
+        });
+        if (!risk.ok) {
+          addLog(userId, 'WARN', `⛔ [${verdict.signal} REAL] ${token.symbol}: ditolak risk guard (${risk.code}) — ${risk.message}`, { tokenAddress: token.address, code: risk.code });
+          st.status = 'IDLE';
+          return { executed: false, reason: `RISK_${String(risk.code).toUpperCase()}` };
+        }
         const intent = addRealIntent(userId, {
           symbol: token.symbol,
           tokenAddress: token.address,

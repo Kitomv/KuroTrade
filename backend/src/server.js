@@ -9,6 +9,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { existsSync, readdirSync } from 'fs';
 import { dexscreener } from './dexscreener.js';
+import { runTickWithDeadline, TICK_DEADLINE, TICK_BUSY } from './tickGuard.js';
 import { recoverSigner, buildLoginMessage } from './evmBind.js';
 import {
   addWatchlist, removeWatchlist, getWatchlist,
@@ -25,6 +26,7 @@ import {
 } from './aiAgent.js';
 import { getLLMConfig, setLLMConfig, listModels, testConnection } from './llmClient.js';
 import { subscribeUser, pushForUser, pushLlmForUser } from './agentStream.js';
+import { evaluateBuyGate } from './buyGate.js';
 import {
   isRealMode, setRealMode,
   getRealIntents, getRealIntent, setRealIntentStatus, addRealIntent,
@@ -437,6 +439,21 @@ app.post('/api/real/manual-intent', rateLimit('quote', 20), wrap(async (req, res
     }
     intent.fundingToken = pick.funding;
     intent.amountUsd = Math.round(effectiveUsd * 100) / 100;
+    // Same pre-quote risk gate the scout runs: the daily-loss cap and the
+    // token-quality checks (honeypot sell ratio, thin liquidity, thin float)
+    // must stop a hand-clicked buy too, not just an autopilot one. Metrics come
+    // from DexScreener; a token with no market data fails closed.
+    const market = await dexscreener.token(tokenAddress, chain).catch(() => null);
+    const gate = evaluateBuyGate({
+      userId: req.userId,
+      usdAmount: intent.amountUsd,
+      token: market
+        ? { liquidityUsd: market.liquidityUsd, fdv: market.fdv, txns24h: market.txns24h }
+        : null,
+    });
+    if (!gate.ok) {
+      return res.status(400).json({ error: `Ditolak risk guard (${gate.code}): ${gate.message}` });
+    }
     if (pick.funding === 'native') {
       const nativeUsd = await getNativeUsdPrice(chain);
       if (!nativeUsd || nativeUsd <= 0) {
@@ -552,6 +569,21 @@ app.post('/api/real/mode', async (req, res) => {
   const { setRealMode } = await import('./realIntent.js');
   const { realMode } = req.body ?? {};
   res.json(setRealMode(req.userId, Boolean(realMode)));
+});
+
+// Whether the executor may send ERC-20 approvals on its own. Per-user and
+// default-off; see isAutoApprove in realIntent.js. Strictly a BOOLEAN here —
+// `setAutoApprove` takes `on === true`, so a truthy string cannot arm spending
+// authority through a sloppy client.
+app.get('/api/real/auto-approve', async (req, res) => {
+  const { isAutoApprove } = await import('./realIntent.js');
+  res.json({ autoApprove: isAutoApprove(req.userId) });
+});
+
+app.post('/api/real/auto-approve', async (req, res) => {
+  const { setAutoApprove } = await import('./realIntent.js');
+  const { autoApprove } = req.body ?? {};
+  res.json(setAutoApprove(req.userId, autoApprove === true));
 });
 
 // Every real trade waits for an explicit signature in MetaMask.
@@ -1004,25 +1036,52 @@ setInterval(async () => {
   }
 }, 5_000);
 
-let autopilotTickRunning = false;
+// One flag per user, not one for the process. A single global boolean meant that
+// any user whose tick was slow suppressed the sweep for everybody — including
+// their stop-loss, which is why the per-user set matters more than the deadline.
+const autopilotTicksRunning = new Set();
+
+// The sweep must never be held hostage by one provider. Inside a tick the
+// scout can spend up to llmTimeoutMs per hedged provider (clamped at 180s), and
+// the guardian's per-position calls stack on top of that; a serial sweep waits
+// for all of it. So each user gets a bounded slice and the rest are served
+// immediately. `ponytail:` the ceiling is generous because a premature cut-off
+// still leaves the tick running to completion — it costs a late push, not an
+// aborted exit. Lower it once tick latency is observable.
+const AUTOPILOT_TICK_DEADLINE_MS = 30_000;
+
 setInterval(async () => {
-  if (autopilotTickRunning) return;
-  autopilotTickRunning = true;
-  try {
-    for (const userId of listUsers()) {
-      try {
-        const res = await runAutopilotTick(userId);
-        if (res?.executed) console.log(`[autopilot] ${userId}: ${res.log ?? 'Executed trade'}`);
-      } catch (e) {
-        console.warn(`[autopilot] ${userId}: ${sanitizeError(e?.message ?? e)}`);
-      }
-      // Push whatever the tick just changed to any open Agents tab. Cheap when
-      // nobody is watching (one map lookup), and it is what makes the guardian
-      // terminal update within a tick instead of up to a poll interval later.
-      pushForUser(userId);
+  for (const userId of listUsers()) {
+    // The deadline abandons the WAIT, not the tick: runTickWithDeadline keeps
+    // this user's slot claimed until the tick really finishes, so no two ever
+    // overlap, while the sweep moves on.
+    const res = await runTickWithDeadline(
+      autopilotTicksRunning,
+      userId,
+      () => runAutopilotTick(userId),
+      AUTOPILOT_TICK_DEADLINE_MS,
+    );
+
+    // Push on EVERY outcome, including the two that bail below. The radar was
+    // reachable without the guardian: pushSignals dedupes per user and the scan
+    // has its own cache, so a slow tick was costing one late refresh and nothing
+    // else. Gating the push on a healthy tick coupled the radar's freshness to
+    // LLM provider latency — a hanging provider froze the market table even
+    // though nothing about the radar depended on the guardian. Node is
+    // single-threaded, so a sync read here cannot interleave with the running
+    // tick's writes; the worst case is one snapshot a beat stale, which the next
+    // sweep corrects.
+    pushForUser(userId);
+
+    if (res === TICK_DEADLINE) {
+      console.warn(`[autopilot] ${userId}: tick exceeded ${AUTOPILOT_TICK_DEADLINE_MS}ms — exits for this user are late this round`);
+      continue;
     }
-  } finally {
-    autopilotTickRunning = false;
+    // Normal for a user whose previous tick overran: it is still finishing. Not
+    // worth a log line every 5s — and it pushes nothing of its own, which is why
+    // the sweep above must.
+    if (res === TICK_BUSY) continue;
+    if (res?.executed) console.log(`[autopilot] ${userId}: ${res.log ?? 'Executed trade'}`);
   }
 }, 5_000);
 

@@ -3,6 +3,7 @@
 // User instruction: "improve keamanan dari hacker" — security headers,
 // safe upstream URL validation, error redaction, and bounded IP rate limits.
 import net from 'node:net';
+import dns from 'node:dns/promises';
 
 const PRIVATE_OR_METADATA_HOSTS = new Set([
   'metadata.google.internal',
@@ -37,7 +38,21 @@ export function securityHeaders(req, res, next) {
 export function redact(value) {
   return String(value ?? '')
     .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, 'Bearer [REDACTED]')
-    .replace(/\b(?:sk|key|token|secret)[-_]?[A-Za-z0-9_-]{8,}\b/gi, '[REDACTED]');
+    // Prefixed keys: the `sk|key|token|secret` stem, plus the vendors this app
+    // actually offers as providers — `AIza…` (Gemini), `xai-…`, and AWS
+    // `AKIA…`/`ASIA…` access-key ids. The stem is matched as a prefix, so a
+    // value with no such prefix is not covered by this rule.
+    .replace(/\b(?:sk|key|token|secret)[-_]?[A-Za-z0-9_-]{8,}\b/gi, '[REDACTED]')
+    .replace(/\bAIza[A-Za-z0-9_-]{20,}/g, '[REDACTED]')
+    .replace(/\bxai-[A-Za-z0-9_-]{8,}\b/gi, '[REDACTED]')
+    .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{12,}\b/g, '[REDACTED]')
+    // A raw hex private key carries no prefix to key off, so it can only be
+    // caught in context. This is deliberately narrow: a 64-hex token is also
+    // what a transaction hash looks like, and redacting every txHash would gut
+    // the executor's crash-recovery logs. Requiring a key-ish word in front
+    // leaves bare hashes readable.
+    .replace(/\b(private\s*key|privatekey|privkey|keys?|secret|mnemonic|seed|passphrase)(\s*[:=]\s*)["']?(?:0x)?[0-9a-fA-F]{64}/gi,
+      '$1$2[REDACTED]');
 }
 
 /** Keep upstream details useful without returning credentials/long internals. */
@@ -74,14 +89,32 @@ function extractMappedIPv4(host) {
   return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
 }
 
+/** Is this address the loopback interface, and nothing wider? */
+function isLoopback(address) {
+  if (address === '::1') return true;
+  const ipVersion = net.isIP(address);
+  if (ipVersion !== 4) return false;
+  const [a] = address.split('.').map(Number);
+  return a === 127;
+}
+
 function hostnameIsBlocked(hostname) {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
   if (PRIVATE_OR_METADATA_HOSTS.has(host) || host.endsWith('.internal')) return true;
   const ipVersion = net.isIP(host);
   if (ipVersion === 4) {
-    const [a, b] = host.split('.').map(Number);
+    const [a, b, c] = host.split('.').map(Number);
     return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254)
-      || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+      || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
+      // Not RFC1918, but still not somewhere a user-supplied baseUrl may point:
+      // CGNAT (100.64/10) sits on carrier and often internal networks; 192.0.0/24
+      // holds IETF protocol assignments (192.0.0.0/29 is localhost on some
+      // stacks); 198.18/15 is the benchmarking block, used for internal test
+      // networks. A public-looking spelling that routes inward is the whole
+      // point of an SSRF guard, so the reachable ranges belong on the list.
+      || (a === 100 && b >= 64 && b <= 127)
+      || (a === 192 && b === 0 && c === 0)
+      || (a === 198 && (b === 18 || b === 19));
   }
   if (ipVersion === 6) {
     const mapped = extractMappedIPv4(host);
@@ -95,6 +128,17 @@ function hostnameIsBlocked(hostname) {
  * Validate a user-supplied OpenAI-compatible endpoint. Localhost is allowed
  * for the configured local 9router/Ollama setup; cloud metadata/private IPs
  * and embedded credentials are not.
+ *
+ * This is a SYNTAX check only — it sees the hostname as written, never what
+ * that hostname resolves to. `127.0.0.1.nip.io` and `10.1.2.3.sslip.io` are
+ * ordinary-looking names that resolve to loopback/private addresses, so a user
+ * could store one as their `baseUrl` and have the server POST their Bearer key
+ * to an address they chose. Blocking the name does not fix it.
+ *
+ * Use `assertSafeBaseUrl` (async, resolves DNS and re-checks every address)
+ * anywhere a request will actually be made. This stays synchronous for the
+ * config-save validation, where rejecting an obviously bad shape early is
+ * still worth doing.
  */
 export function isSafeBaseUrl(value) {
   if (!value || typeof value !== 'string') return false;
@@ -106,6 +150,40 @@ export function isSafeBaseUrl(value) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Resolve the hostname and refuse the URL if ANY address it points at is
+ * private, loopback, link-local or metadata.
+ *
+ * Every address is checked, not just the first: a name with several A records
+ * passes if one is public and fails if any is not, because which one the
+ * connection lands on is not ours to choose. A DNS failure fails closed —
+ * there is no address to prove safe, so the request does not happen.
+ *
+ * `allowLoopback` re-permits exactly the loopback address (::1 / 127.0.0.0/8),
+ * for providers that are local by design. Every other private, link-local and
+ * metadata range stays blocked under that flag — `ollama` must not become a
+ * tunnel to the LAN.
+ */
+export async function assertSafeBaseUrl(value, { allowLoopback = false } = {}) {
+  if (!isSafeBaseUrl(value)) throw new Error('baseUrl tidak diizinkan (SSRF guard)');
+  const host = new URL(value).hostname.replace(/^\[|\]$/g, '');
+  // An IP literal was already checked above; there is nothing left to resolve,
+  // and resolving one would just re-derive the same verdict.
+  if (net.isIP(host)) return new URL(value).origin;
+  let records;
+  try {
+    records = await dns.lookup(host, { all: true });
+  } catch {
+    throw new Error('baseUrl tidak diizinkan (SSRF guard: hostname tidak dapat diresolve)');
+  }
+  for (const { address } of records) {
+    if (!hostnameIsBlocked(address)) continue;
+    if (allowLoopback && isLoopback(address)) continue;
+    throw new Error('baseUrl tidak diizinkan (SSRF guard: hostname menunjuk ke alamat internal)');
+  }
+  return new URL(value).origin;
 }
 
 /** Small in-memory limiter with periodic stale-entry pruning. */

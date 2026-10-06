@@ -1,17 +1,19 @@
-// Verifies the login screen: the two pure helpers that drive its copy, and the
+// Verifies the login screen: the pure helpers that drive its copy, and the
 // structural guarantees the page must keep.
 //
 // The page was rebuilt around the app's own terminal language (warm ink, IBM
-// Plex, one amber accent, hairline rules) instead of a generic centered card.
-// A restyle is exactly the kind of change that quietly drops an accessibility
-// association or a re-check, so those are pinned here.
+// Plex, one amber accent, hairline rules) instead of a generic centered card,
+// and then narrowed to a single entry path: an admin issues the account, so
+// there is no self-registration and no wallet login. Both of those are exactly
+// the kind of change that quietly drops an accessibility association or leaves
+// a dead wallet branch behind, so both are pinned here.
 //
 // Run: npm run check  (from frontend/)
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { vaultLabel, walletLabel, rejectionMessage } from '../src/lib/loginView.ts';
+import { vaultLabel, credentialError } from '../src/lib/loginView.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (rel: string) => readFileSync(join(here, rel), 'utf-8');
@@ -30,56 +32,37 @@ const css = read('../src/styles.css');
 
 /* ---------- vaultLabel ---------- */
 
-check('an idle vault button reads "Masuk"', vaultLabel(null), 'Masuk');
-check('a vault login in flight says so',
-  vaultLabel({ kind: 'password', step: 'login' }), 'Melogin…');
-// The wallet path must never borrow the password label: the two buttons sit on
-// the same screen and a wrong one makes it look like the click went nowhere.
-check('a wallet login never borrows the vault label',
-  vaultLabel({ kind: 'wallet', step: 'sign' }), 'Masuk');
+check('an idle vault button reads "Masuk"', vaultLabel(false), 'Masuk');
+check('a login in flight says so', vaultLabel(true), 'Melogin…');
+// The label is the ONLY feedback that the click landed — the button is disabled
+// while pending, so it must not read "Masuk" during the wait.
+check('a pending vault never reads as idle', vaultLabel(true) === vaultLabel(false), false);
 
-/* ---------- walletLabel ---------- */
+/* ---------- credentialError ---------- */
 
-check('an idle wallet button names the method',
-  walletLabel(null), 'Masuk dengan MetaMask');
-check('opening MetaMask is not called "signing"',
-  walletLabel({ kind: 'wallet', step: 'connect' }), 'Buka MetaMask…');
-check('the signing step is named', walletLabel({ kind: 'wallet', step: 'sign' }), 'Tanda tangani di MetaMask…');
-check('the server check is named', walletLabel({ kind: 'wallet', step: 'verify' }), 'Memverifikasi…');
-// Symmetry with vaultLabel: neither button may wear the other's label.
-check('a vault login never borrows the wallet label',
-  walletLabel({ kind: 'password', step: 'login' }), 'Masuk dengan MetaMask');
-check('the two idle labels differ',
-  vaultLabel(null) === walletLabel(null), false);
+check('an empty username is refused before any request', credentialError('', 'password123'), 'Username wajib diisi');
+check('a whitespace-only username is refused too', credentialError('   ', 'password123'), 'Username wajib diisi');
+check('an empty password is refused', credentialError('someone', ''), 'Password wajib diisi');
+check('a filled form passes the guard', credentialError('someone', 'password123'), null);
+// Username is checked first: telling someone their password is missing when
+// they never typed a username sends them to fix the wrong field.
+check('the username is reported before the password',
+  credentialError('', ''), 'Username wajib diisi');
 
-/* ---------- rejectionMessage ---------- */
-
-check('a MetaMask rejection is translated',
-  rejectionMessage(new Error('User rejected the request.')), 'Signature dibatalkan di MetaMask');
-check('a lowercase "user denied" is translated too',
-  rejectionMessage(new Error('user denied transaction')), 'Signature dibatalkan di MetaMask');
-check('the generic MetaMask failure names the extension conflict',
-  /Nonaktifkan ekstensi wallet lain/.test(
-    rejectionMessage(new Error('Unexpected error'))), true);
-check('an unknown failure passes through verbatim',
-  rejectionMessage(new Error('RPC down')), 'RPC down');
-check('a thrown string still yields a message',
-  rejectionMessage('boom'), 'boom');
-check('a non-Error, non-string throw falls back',
-  rejectionMessage({ weird: true }), 'Login wallet gagal');
-// A rejection must NOT be reported as an extension conflict — that message
-// tells the user to disable their other wallets, which is the wrong fix.
-check('a rejection is not mistaken for the extension conflict',
-  /Nonaktifkan ekstensi/.test(rejectionMessage(new Error('User rejected the request'))), false);
-
-/* ---------- the page keeps its two entry paths ---------- */
+/* ---------- the page has exactly one way in ---------- */
 
 assert('the password form still submits', /onSubmit=\{handleSubmit\}/.test(page),
-  'the vault form lost its submit handler');
-assert('the wallet path is still wired', /onClick=\{handleWalletLogin\}/.test(page),
-  'the MetaMask button lost its handler');
-assert('a wallet installed late is still picked up', /subscribeProviders\(/.test(page),
-  'the page would stay on "not detected" until a reload — a dead end');
+  'the form lost its submit handler');
+assert('the credential guard runs before the request', /credentialError\(username, password\)/.test(page),
+  'the form would fire a request for an empty field');
+// The wallet-login path was removed on purpose: access is granted by an admin,
+// so a wallet must not be able to mint an account by signing a message.
+assert('the wallet login path is gone', !/handleWalletLogin|subscribeProviders|window\.ethereum/.test(page),
+  'a wallet entry point survived the removal — anyone could still self-provision');
+assert('no wallet sign-in affordance survives', !/Masuk dengan MetaMask/.test(page),
+  'the removed wallet button is still offered on the login screen');
+assert('the page says who can create an account', /Akun dibuat oleh admin/.test(page),
+  'the only route to an account is not stated anywhere on the screen');
 
 /* ---------- accessibility the restyle must not drop ---------- */
 
@@ -112,9 +95,15 @@ assert('the brand mark is unchanged', /DEX Trade/.test(page), 'the product name 
 
 /* ---------- the stylesheet carries the design ---------- */
 
-for (const cls of ['login-page', 'login-frame', 'login-halo', 'login-submit', 'login-wallet']) {
+for (const cls of ['login-page', 'login-frame', 'login-halo', 'login-submit']) {
   assert(`styles.css defines .${cls}`, new RegExp(`\\.${cls}\\b`).test(css),
     `no rule for .${cls} — the markup would render unstyled`);
+}
+// Dead rules from the wallet-login era: leaving them is how a removed path
+// quietly comes back as a half-styled button someone wires up again.
+for (const cls of ['login-or', 'login-wallet', 'login-wallet-missing']) {
+  assert(`the retired .${cls} rules are gone`, !new RegExp(`\\.${cls}\\b`).test(css),
+    `.${cls} still has a rule but nothing renders it`);
 }
 // The app's type is the design; a login that silently fell back to a system
 // stack would no longer look like the same product.

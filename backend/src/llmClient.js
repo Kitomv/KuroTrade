@@ -118,6 +118,13 @@ export function getLLMConfig(userId = null) {
   };
 }
 
+/** The origin a baseUrl names, or '' when it names nothing usable.
+ *  Two edits are the "same endpoint" only when this matches. */
+function originOf(baseUrl) {
+  if (!baseUrl) return '';
+  try { return new URL(baseUrl).origin; } catch { return String(baseUrl); }
+}
+
 /** Set per-user provider stack. Accepts a single object (legacy) or an array (multi-LLM). */
 export function setLLMConfig(userId, value) {
   ensureLoaded(userId);
@@ -128,13 +135,27 @@ export function setLLMConfig(userId, value) {
   // then POSTs it to whatever baseUrl that save named.
   const prev = userId ? (userConfigs.get(userId) ?? []) : defaultConfigs;
   const configs = arr.map((c, i) => {
-    // Preserve the stored key when this entry sends none (blank = leave existing).
-    const prevKey = prev[i]?.key ?? '';
+    const provider = PROVIDERS.includes(c.provider) ? c.provider : '9router';
+    const baseUrl = c.baseUrl ?? '';
+    // A stored key is carried across an edit only when that edit keeps the SAME
+    // provider AND the same origin. Blank-key-means-keep exists for "I changed
+    // the model", not for "I changed the host": carrying the key across a host
+    // change hands it to whoever named the new host, and the admin password
+    // reset makes that reachable (reset → log in as the account → re-point its
+    // baseUrl with a blank key → the next call sends `Bearer <that key>` to the
+    // attacker's server). GET /api/llm/config only ever showed the key masked,
+    // so that call is what discloses it. Fail closed: any identity change drops
+    // the key and the user must re-enter it.
+    const prevEntry = prev[i];
+    const sameIdentity = Boolean(prevEntry)
+      && (PROVIDERS.includes(prevEntry.provider) ? prevEntry.provider : '9router') === provider
+      && originOf(prevEntry.baseUrl ?? '') === originOf(baseUrl);
+    const prevKey = sameIdentity ? (prevEntry.key ?? '') : '';
     return {
       key: (c.apiKey ?? c.key ?? '').trim() || prevKey,
-      provider: PROVIDERS.includes(c.provider) ? c.provider : '9router',
+      provider,
       model: c.model || 'claude-3-5-sonnet-20241022',
-      baseUrl: c.baseUrl ?? '',
+      baseUrl,
       role: c.role ?? null, // 'bull' | 'bear' | 'lead' | null (default)
     };
   });

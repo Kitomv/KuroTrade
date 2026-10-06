@@ -4,13 +4,11 @@
 
 import express from 'express';
 import { ethers } from 'ethers';
-import { randomBytes } from 'crypto';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { existsSync, readdirSync } from 'fs';
 import { dexscreener } from './dexscreener.js';
 import { runTickWithDeadline, TICK_DEADLINE, TICK_BUSY } from './tickGuard.js';
-import { recoverSigner, buildLoginMessage } from './evmBind.js';
 import {
   addWatchlist, removeWatchlist, getWatchlist,
   pushHistory, getHistory,
@@ -30,11 +28,11 @@ import { evaluateBuyGate } from './buyGate.js';
 import {
   isRealMode, setRealMode,
   getRealIntents, getRealIntent, setRealIntentStatus, addRealIntent,
-  getBoundWallet, bindWallet, assertBoundWallet, createBindChallenge, setBoundWallet,
+  getBoundWallet, bindWallet, assertBoundWallet, createBindChallenge,
 } from './realIntent.js';
 import { verifyUser, createSession, getUser, destroySession, seedAdminFromEnv,
   changePassword, destroyOtherSessions, listUsers as listAuthUsers, getUserById,
-  findUserByAddress, createUserWithAddress } from './auth.js';
+  roleOf, isAdmin, listAccounts, setUserPassword, createUser } from './auth.js';
 import { flushAll, cleanupTempFiles, DATA_DIR } from './persistence.js';
 import { securityHeaders, redact, sanitizeError, ipRateLimit, userRateLimit, isSafeBaseUrl } from './security.js';
 import {
@@ -69,12 +67,11 @@ app.use((req, res, next) => {
 // --- Auth middleware: resolves req.userId from Bearer token ---
 // Guards ONLY /api/* data routes. Static frontend (/, /assets/*) stays public —
 // the SPA gate handles auth client-side; blocking assets would blank the app.
-// The two wallet-login paths are pre-auth by necessity: a wallet login has no
-// session yet, and the challenge is what mints one.
+// Only password login is pre-auth: there is no self-registration, so /api/login
+// is the single door into the app and the admin routes below are the only way
+// to add anyone.
 const PUBLIC_PATHS = new Set([
   '/api/login',
-  '/api/login/wallet',
-  '/api/login/wallet/challenge',
   '/api/health',
 ]);
 app.use((req, res, next) => {
@@ -151,85 +148,51 @@ app.post('/api/login', loginLimiter, (req, res) => {
   }
   loginAttempts.delete(ip);
   const token = createSession(user.id);
-  res.json({ token, userId: user.id, username: user.username });
+  res.json({ token, userId: user.id, username: user.username, role: roleOf(user) });
 });
 
-// --- Login with a wallet (MetaMask) ---
-// Declared before the routes that use it: `const` is not hoisted, so a route
-// registered above this line would throw a ReferenceError on first request.
-const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+// --- Admin: the only account-creation path ---
+// An admin adds users; nothing else can mint an account. The role is re-read
+// from disk on every request (never trusted from the token), so revoking an
+// admin takes effect on the next call rather than at session expiry.
+function requireAdmin(req, res, next) {
+  if (!isAdmin(req.userId)) return res.status(403).json({ error: 'Khusus admin' });
+  // The account list is an identity table (usernames + addresses). Express sets
+  // an ETag by default and a shared/kiosk browser may retain it, so every admin
+  // response is explicitly uncacheable.
+  res.set('Cache-Control', 'no-store');
+  next();
+}
 
-// The user signs one message; the address recovered from that signature is the
-// identity. Password login above is unaffected — both paths stay open.
-//
-// A challenge is required even though a signature already proves ownership:
-// signing a FIXED string would let a signature captured from any prior session
-// be replayed forever. The nonce makes each challenge single-use and
-// short-lived, so a captured signature buys nothing.
-const WALLOGIN_NONCE_TTL_MS = 5 * 60 * 1000;
-const walletNonces = new Map(); // lowercase address -> { nonce, exp }
-setInterval(() => {
-  const now = Date.now();
-  for (const [addr, rec] of walletNonces) {
-    if (now > rec.exp) walletNonces.delete(addr);
-  }
-}, 60_000).unref?.();
-
-app.get('/api/login/wallet/challenge', loginLimiter, (req, res) => {
-  const address = String(req.query.address ?? '');
-  if (!EVM_ADDRESS_RE.test(address)) {
-    return res.status(400).json({ error: 'address harus 0x + 40 hex' });
-  }
-  const key = address.toLowerCase();
-  const nonce = randomBytes(16).toString('hex');
-  walletNonces.set(key, { nonce, exp: Date.now() + WALLOGIN_NONCE_TTL_MS });
-  res.json({ message: buildLoginMessage(address, nonce) });
+app.get('/api/admin/users', requireAdmin, (req, res) => {
+  res.json({ users: listAccounts() });
 });
 
-app.post('/api/login/wallet', loginLimiter, (req, res) => {
-  const { address, signature } = req.body ?? {};
-  if (!address || !signature) return res.status(400).json({ error: 'address & signature required' });
-  if (!EVM_ADDRESS_RE.test(String(address))) return res.status(400).json({ error: 'address harus 0x + 40 hex' });
-
-  const key = String(address).toLowerCase();
-  const pending = walletNonces.get(key);
-  if (!pending || typeof pending.nonce !== 'string') {
-    return res.status(400).json({ error: 'Login challenge tidak ditemukan — minta ulang' });
+app.post('/api/admin/users', requireAdmin, ipRateLimit({ max: 10, windowMs: 60_000 }), (req, res) => {
+  const { username, password } = req.body ?? {};
+  const name = typeof username === 'string' ? username.trim() : '';
+  if (!name || !password) return res.status(400).json({ error: 'username and password required' });
+  if (name.length < 3 || name.length > 32) return res.status(400).json({ error: 'Username harus 3–32 karakter' });
+  if (!/^[A-Za-z0-9._-]+$/.test(name)) {
+    return res.status(400).json({ error: 'Username hanya boleh huruf, angka, titik, garis bawah, dan strip' });
   }
-  if (Date.now() > pending.exp) {
-    walletNonces.delete(key);
-    return res.status(400).json({ error: 'Login challenge kedaluwarsa — minta ulang' });
+  if (String(password).length < 8) return res.status(400).json({ error: 'Password minimal 8 karakter' });
+  const user = createUser(name, String(password), 'user');
+  if (!user) return res.status(409).json({ error: 'Username sudah dipakai' });
+  res.status(201).json({ id: user.id, username: user.username, role: roleOf(user), createdAt: user.createdAt });
+});
+
+app.post('/api/admin/users/:id/password', requireAdmin, ipRateLimit({ max: 20, windowMs: 60_000 }), (req, res) => {
+  const { password } = req.body ?? {};
+  if (!password) return res.status(400).json({ error: 'password required' });
+  if (String(password).length < 8) return res.status(400).json({ error: 'Password minimal 8 karakter' });
+  if (!setUserPassword(req.params.id, String(password))) {
+    return res.status(404).json({ error: 'User tidak ditemukan' });
   }
-
-  // Identity comes from the recovered signer, never from the request body.
-  const recovered = recoverSigner(buildLoginMessage(address, pending.nonce), String(signature));
-  if (!recovered || recovered.toLowerCase() !== key) {
-    return res.status(401).json({ error: 'Signature wallet tidak valid' });
-  }
-  // Consume the nonce only once the signature is proven, so a mistyped address
-  // does not burn the challenge the user is still working on.
-  walletNonces.delete(key);
-
-  // First sign from this wallet provisions the account. Registration by wallet
-  // is open by design — the same "registration is disabled" stance as env-seeded
-  // accounts does not survive an address being the only credential there is.
-  const existing = findUserByAddress(recovered);
-  const user = existing ?? createUserWithAddress(recovered);
-  const token = createSession(user.id);
-
-  // The signature already proved control of this address, so the bound wallet
-  // is set directly: a wallet-login user can trade real without a second
-  // round trip through Settings. Bound via the public setter, not by poking
-  // realIntent's internals, so persistence stays in one place.
-  setBoundWallet(user.id, recovered);
-
-  res.json({
-    token,
-    userId: user.id,
-    username: user.username ?? null,
-    address: recovered,
-    isNewUser: !existing,
-  });
+  // A reset exists to cut off access — leaving the old sessions alive would
+  // let whoever held the account keep using it until the token expired.
+  destroyOtherSessions(req.params.id, '');
+  res.json({ ok: true });
 });
 
 app.post('/api/logout', (req, res) => {
@@ -243,6 +206,9 @@ app.get('/api/me', (req, res) => {
   res.json({
     userId: req.userId,
     username: user?.username ?? '',
+    // Read from disk, not from the token: a demoted admin loses the Admin page
+    // on the next load instead of keeping it until the session expires.
+    role: roleOf(user),
     address: user?.address ?? getBoundWallet(req.userId),
     wallet: getWallet(req.userId),
   });
@@ -279,6 +245,9 @@ app.get('/api/leaderboard', (req, res) => {
 // --- Real trading: EVM (1inch proxy — the server never signs) ---
 // The backend builds the UNSIGNED tx; MetaMask signs it in the browser via
 // eth_sendTransaction. No private key touches this process.
+
+/** EVM address shape, shared by the quote/swap/bind routes below. */
+const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 
 /** Reject an unknown chain before it reaches 1inch or the RPC layer. */
 function resolveChain(res, value) {
@@ -1091,6 +1060,21 @@ setInterval(async () => {
 // Flush pending writes on shutdown.
 process.on('SIGINT', () => { flushAll(); process.exit(0); });
 process.on('SIGTERM', () => { flushAll(); process.exit(0); });
+
+// Last-resort JSON error handler. Without it an unhandled throw (a disk failure
+// in the account store, a malformed state file) reaches Express's default
+// finalhandler, which renders an HTML page WITH the stack trace whenever
+// NODE_ENV !== 'production' — and this repo never sets NODE_ENV. The API is
+// JSON, so a failed request must answer JSON and leak nothing.
+// Must be registered after every route.
+app.use((err, _req, res, _next) => {
+  console.error('[error]', redact(err?.stack ?? err?.message ?? err));
+  if (res.headersSent) return;
+  const status = Number.isInteger(err?.status) && err.status >= 400 && err.status < 600
+    ? err.status
+    : (err?.code === 'UPSTREAM_ERROR' ? 502 : 500);
+  res.status(status).json({ error: sanitizeError(err?.message ?? err) });
+});
 
 // Last-resort safety net: a stray rejection in a background loop (autopilot
 // tick, LLM hedge, price refresh) must NOT take down every user's server.

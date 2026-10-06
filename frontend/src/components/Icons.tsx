@@ -163,6 +163,13 @@ export const IconPower = (x: IconProps) => <Icon {...x}>
   {p('M12 2v10')}
 </Icon>;
 
+// Admin: add an account (only an admin can mint users now).
+export const IconUserPlus = (x: IconProps) => <Icon {...x}>
+  {p('M15 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2')}
+  <circle cx="8.5" cy="7" r="4" />
+  {p('M19 8v6M16 11h6')}
+</Icon>;
+
 // Aliases used by page imports (clearer names; same paths).
 export const IconBolt = IconZap;
 export const IconChartBar = IconLayout;

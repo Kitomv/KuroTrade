@@ -1172,29 +1172,6 @@ select.input { cursor: pointer; font-family: var(--font-body); }
 
 .login-submit { min-height: 46px; width: 100%; font-weight: 700; }
 
-.login-or {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin: 18px 0;
-  color: var(--muted);
-  font-size: 11px;
-}
-.login-or::before,
-.login-or::after { content: ''; flex: 1; height: 1px; background: var(--rule); }
-
-.login-wallet { min-height: 46px; width: 100%; font-weight: 600; }
-/* Informational, not an error: a missing extension is a fact about this
-   browser, and the vault above still works. Red here made the least important
-   line on the page the loudest thing on screen. */
-.login-wallet-missing {
-  margin: 10px 0 0;
-  color: var(--muted);
-  font-size: 11.5px;
-  line-height: 1.5;
-  text-align: center;
-}
-
 .login-foot {
   margin: 18px 0 0;
   padding-top: 14px;

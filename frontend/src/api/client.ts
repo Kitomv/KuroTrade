@@ -392,7 +392,7 @@ export interface AutopilotConfig {
   nearMisses?: NearMissEntry[];
 }
 
-export type Page = 'overview' | 'trending' | 'watchlist' | 'chart' | 'trade' | 'portfolio' | 'agents' | 'leaderboard' | 'settings';
+export type Page = 'overview' | 'trending' | 'watchlist' | 'chart' | 'trade' | 'portfolio' | 'agents' | 'leaderboard' | 'settings' | 'admin';
 
 export interface HistoryPoint {
   priceUsd: number;
@@ -430,15 +430,12 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 export interface LoginResult {
   token: string;
   userId: string;
-  /** null for a wallet-only account, which has no username. */
-  username: string | null;
+  username: string;
+  /** 'admin' | 'user' — decides whether the Admin page is reachable. */
+  role: UserRole;
 }
 
-export interface WalletLoginResult extends LoginResult {
-  address: string;
-  /** True when this sign provisioned the account (first time this wallet is seen). */
-  isNewUser: boolean;
-}
+export type UserRole = 'admin' | 'user';
 
 export const AUTH = {
   login: (username: string, password: string) =>
@@ -447,18 +444,8 @@ export const AUTH = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
     }),
-  /** Single-use challenge to sign. Pre-auth, so it carries no bearer token. */
-  loginWalletChallenge: (address: string) =>
-    req<{ message: string }>(`/api/login/wallet/challenge?address=${encodeURIComponent(address)}`),
-  /** Exchange a signature over that challenge for a session token. */
-  loginWallet: (address: string, signature: string) =>
-    req<WalletLoginResult>('/api/login/wallet', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ address, signature }),
-    }),
   logout: () => req<{ ok: boolean }>('/api/logout', { method: 'POST' }),
-  me: () => req<{ userId: string; username: string; address?: string; wallet: Wallet }>('/api/me'),
+  me: () => req<{ userId: string; username: string; role: UserRole; address?: string; wallet: Wallet }>('/api/me'),
   changePassword: (currentPassword: string, newPassword: string) =>
     req<{ ok: boolean }>('/api/change-password', {
       method: 'POST',
@@ -473,6 +460,22 @@ export interface LeaderboardRow {
   totalValue: number;
   pnlPct: number;
   positionsCount: number;
+}
+
+/**
+ * One account as the ADMIN sees it (GET /api/admin/users).
+ *
+ * `hasPassword` is a boolean on purpose — the API never returns the hash or
+ * salt, so an account with `hasPassword: false` (a legacy wallet-only record)
+ * is exactly the one that needs a password set before it can log in at all.
+ */
+export interface AdminUserRow {
+  id: string;
+  username: string | null;
+  address: string | null;
+  role: UserRole;
+  hasPassword: boolean;
+  createdAt?: number;
 }
 
 /** One chain the backend can execute on (GET /api/real/evm/chains). */
@@ -606,6 +609,25 @@ export const api = {
 
   // Leaderboard
   leaderboard: () => req<LeaderboardRow[]>('/api/leaderboard'),
+
+  // Admin — the ONLY account-creation path. Every route re-checks the role on
+  // the server (403 for anyone else), so hiding the page client-side is a UX
+  // decision, never the access control itself.
+  adminUsers: () => req<{ users: AdminUserRow[] }>('/api/admin/users'),
+  adminCreateUser: (data: { username: string; password: string }) =>
+    req<{ id: string; username: string; role: UserRole; createdAt: number }>('/api/admin/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }),
+  /** Admin reset. The server also revokes the account's other sessions, so a
+   *  reset actually cuts off whoever was using it. */
+  adminSetPassword: (id: string, password: string) =>
+    req<{ ok: boolean }>(`/api/admin/users/${encodeURIComponent(id)}/password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    }),
 
   // Real trading — EVM via 1inch. The server builds the UNSIGNED tx; MetaMask
   // signs it in the browser. No private key ever reaches the backend.

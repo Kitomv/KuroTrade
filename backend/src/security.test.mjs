@@ -364,6 +364,38 @@ test('a later save still keeps that user\'s own key when the field is blank', ()
   assert.equal(cfg.model, 'y', 'and the rest of the row still updates');
 });
 
+test('a stored key does not follow a baseUrl change to a new host', () => {
+  // Blank-key-means-keep is for "I edited the model", NOT for "I changed the
+  // host". Carrying the key across a host change hands it to whoever named the
+  // new host, and the admin password-reset path makes that reachable: reset a
+  // password, log in as that account, re-point its baseUrl with a blank key,
+  // and the next LLM call sends `Authorization: Bearer <victim key>` to the
+  // attacker's server. GET /api/llm/config only ever showed it masked, so the
+  // proxy is what discloses the full value.
+  const uid = `repoint_${Date.now()}`;
+  setLLMConfig(uid, [{ provider: 'custom', model: 'x', baseUrl: 'https://real.example/v1', apiKey: 'sk-mine-1234567890' }]);
+  const cfg = setLLMConfig(uid, [{ provider: 'custom', model: 'x', baseUrl: 'https://attacker.example/v1' }]);
+  assert.equal(cfg.hasKey, false, 'the key must not be carried to a host its owner did not choose');
+  assert.equal(cfg.maskedKey, '', 'and must not come back as a masked fragment either');
+});
+
+test('a key survives an edit that keeps the same origin', () => {
+  // Same host, different path/version — the legitimate "keep my key" case.
+  const uid = `sameorigin_${Date.now()}`;
+  setLLMConfig(uid, [{ provider: 'custom', model: 'x', baseUrl: 'https://a.example/v1', apiKey: 'sk-mine-1234567890' }]);
+  const cfg = setLLMConfig(uid, [{ provider: 'custom', model: 'x', baseUrl: 'https://a.example/v2' }]);
+  assert.equal(cfg.hasKey, true, 'an origin-preserving edit must still keep the key');
+});
+
+test('a key does not follow a provider change', () => {
+  // Both presets carry an empty baseUrl, so only the provider distinguishes
+  // them — and an OpenAI key must not be re-sent to Anthropic.
+  const uid = `reprov_${Date.now()}`;
+  setLLMConfig(uid, [{ provider: 'openai', model: 'gpt-4o', apiKey: 'sk-mine-1234567890' }]);
+  const cfg = setLLMConfig(uid, [{ provider: 'anthropic', model: 'claude-3-5-sonnet-20241022' }]);
+  assert.equal(cfg.hasKey, false, 'the key must not follow a provider change');
+});
+
 /* ---------------- spend ---------------- */
 
 test('the provider stack is capped — it multiplies every paid request', () => {

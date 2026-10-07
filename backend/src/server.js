@@ -36,6 +36,7 @@ import { verifyUser, createSession, getUser, destroySession, seedAdminFromEnv,
 import { flushAll, cleanupTempFiles, DATA_DIR } from './persistence.js';
 import { securityHeaders, redact, sanitizeError, ipRateLimit, userRateLimit, isSafeBaseUrl } from './security.js';
 import { createCors } from './cors.js';
+import { createLoginGuard } from './loginGuard.js';
 import {
   listEvmChains, isSupportedChain, getChainConfig, getEvmBalanceNative,
   getEvmTokenValue, getNativeUsdPrice, evmQuote, buildSwapTx, resolveSwapParams,
@@ -51,16 +52,22 @@ const PORT = process.env.PORT || 3001;
 app.use(securityHeaders);
 app.use(express.json({ limit: '256kb' }));
 
-// Behind a hosting edge (Railway) the socket peer is the edge, not the client:
-// without this, `req.ip` is one shared address and the per-IP login limiter
-// counts every user against one bucket (20/min total, then everybody is
-// locked out). `1` trusts exactly the one hop the platform guarantees.
-app.set('trust proxy', 1);
+// Behind a hosting edge (Railway) the socket peer is the edge, not the client.
+// Railway delivers `X-Forwarded-For: <client>, <internal hop>` — probed live,
+// the rightmost entry is the same address for unrelated clients (shared
+// infrastructure), so trusting ONE hop resolves `req.ip` to it and ten failed
+// logins from anyone lock the login route for every visitor. Two hops lands on
+// the client the edge observed; the edge strips client-supplied forwarding
+// headers and the app is unreachable except through it, so it cannot be
+// forged. src/trustProxy.test.mjs pins this shape — re-run it if the platform
+// changes.
+app.set('trust proxy', 2);
 
-// CORS — local dev origins are always allowed; the deployed frontend origin
-// (Vercel) is named via ALLOWED_ORIGINS. Malformed entries are reported loudly
-// because the failure they cause — a browser CORS block — never reaches this
-// server, so it leaves no trace in the logs.
+// CORS — localhost dev origins are allowed only when the connection itself
+// came from loopback; the deployed frontend origin (Vercel) is named via
+// ALLOWED_ORIGINS. Malformed entries are reported loudly because the failure
+// they cause — a browser CORS block — never reaches this server, so it leaves
+// no trace in the logs.
 const { corsMiddleware, droppedOrigins } = createCors(process.env.ALLOWED_ORIGINS);
 if (droppedOrigins.length > 0) {
   console.warn(`[cors] ALLOWED_ORIGINS entries diabaikan (bukan origin yang valid): ${droppedOrigins.join(', ')}`);
@@ -115,41 +122,32 @@ const loginLimiter = ipRateLimit({ max: 20, windowMs: 60_000 });
 app.use('/api/real', userRateLimit({ max: 300, windowMs: 60_000 }));
 app.use('/api/llm', ipRateLimit({ max: 30, windowMs: 60_000 }));    // config saves + provider probes
 
-// Simple per-IP brute-force guard: max 10 failed logins per 5 minutes.
-const loginAttempts = new Map(); // ip -> { count, resetAt }
-const LOGIN_WINDOW_MS = 5 * 60 * 1000;
-const LOGIN_MAX_ATTEMPTS = 10;
-
-function loginBlocked(ip) {
-  const rec = loginAttempts.get(ip);
-  if (!rec) return false;
-  if (Date.now() > rec.resetAt) { loginAttempts.delete(ip); return false; }
-  return rec.count >= LOGIN_MAX_ATTEMPTS;
-}
-
-function noteLoginFailure(ip) {
-  const rec = loginAttempts.get(ip);
-  if (rec && Date.now() <= rec.resetAt) { rec.count++; return; }
-  loginAttempts.set(ip, { count: 1, resetAt: Date.now() + LOGIN_WINDOW_MS });
-}
-
-// Periodic map pruning (every 5 min)
-setInterval(() => {
-  const now = Date.now();
-  for (const [ip, rec] of loginAttempts) if (now > rec.resetAt) loginAttempts.delete(ip);
-}, 5 * 60 * 1000).unref?.();
+// Simple brute-force guard: max 10 failed logins per 5 minutes, counted BOTH
+// per client IP (one host hammering the route) and per username (a botnet
+// spraying one account from many IPs — the per-IP counter alone never trips
+// for any single attacker host). A successful login clears both. The window
+// is short on purpose: a locked-out username recovers in minutes.
+const loginIpGuard = createLoginGuard({ max: 10, windowMs: 5 * 60 * 1000 });
+const loginUserGuard = createLoginGuard({ max: 10, windowMs: 5 * 60 * 1000 });
 
 app.post('/api/login', loginLimiter, (req, res) => {
   const ip = req.ip ?? 'unknown';
-  if (loginBlocked(ip)) return res.status(429).json({ error: 'Terlalu banyak percobaan login. Coba lagi nanti.' });
   const { username, password } = req.body ?? {};
+  // Usernames are matched case-sensitively by verifyUser; the guard key
+  // lowercases so casing tricks cannot spread failures across buckets.
+  const userKey = typeof username === 'string' ? username.toLowerCase() : '';
+  if (loginIpGuard.blocked(ip) || loginUserGuard.blocked(userKey)) {
+    return res.status(429).json({ error: 'Terlalu banyak percobaan login. Coba lagi nanti.' });
+  }
   if (!username || !password) return res.status(400).json({ error: 'username and password required' });
   const user = verifyUser(String(username), String(password));
   if (!user) {
-    noteLoginFailure(ip);
+    loginIpGuard.noteFailure(ip);
+    loginUserGuard.noteFailure(userKey);
     return res.status(401).json({ error: 'Invalid credentials' });
   }
-  loginAttempts.delete(ip);
+  loginIpGuard.clear(ip);
+  loginUserGuard.clear(userKey);
   const token = createSession(user.id);
   res.json({ token, userId: user.id, username: user.username, role: roleOf(user) });
 });

@@ -34,22 +34,38 @@ test('a trailing slash is stripped so a pasted URL still matches', () => {
 
 /* ---------------- the allow-list itself ---------------- */
 
-const isAllowed = (origin, envValue) => {
+// The second argument is the raw socket peer. Dev origins require a loopback
+// socket; configured origins do not care. Default to loopback so the dev-rule
+// cases read naturally.
+const isAllowed = (origin, envValue, socket = '127.0.0.1') => {
   const { isOriginAllowed } = createCors(envValue);
-  return isOriginAllowed(origin);
+  return isOriginAllowed(origin, socket);
 };
 
 test('a configured origin is allowed — that is the whole point', () => {
   assert.equal(isAllowed('https://trade.aisrynnn.com', 'https://trade.aisrynnn.com'), true);
 });
 
-test('localhost dev origins are always allowed, with any port', () => {
+test('localhost dev origins are allowed from a loopback connection, with any port', () => {
   for (const origin of [
     'http://localhost:5173', 'http://localhost:3001', 'http://127.0.0.1:5173',
     'http://localhost', 'http://127.0.0.1',
   ]) {
     assert.equal(isAllowed(origin, ''), true, `should allow ${origin}`);
   }
+});
+
+test('a localhost origin arriving from a REMOTE connection is refused', () => {
+  // The dev rule is for a browser on the same machine as the backend. A
+  // deployed instance sees every request through the platform edge, so a
+  // remote request that merely CLAIMS a localhost origin must get nothing —
+  // otherwise any local web server on a visitor's machine (a stray dev
+  // server, a malicious package script) could read API responses cross-origin.
+  assert.equal(isAllowed('http://localhost:5173', '', '10.1.2.3'), false);
+  assert.equal(isAllowed('http://127.0.0.1:5173', 'https://trade.aisrynnn.com', '100.64.0.9'), false);
+  // The socket gate narrows ONLY the dev rule — a configured origin is still
+  // allowed no matter where the request comes from.
+  assert.equal(isAllowed('https://trade.aisrynnn.com', 'https://trade.aisrynnn.com', '10.1.2.3'), true);
 });
 
 test('a localhost-LOOKING origin is not localhost', () => {
@@ -110,6 +126,24 @@ test('the middleware echoes the origin only when allowed', () => {
   assert.equal(refused['Access-Control-Allow-Origin'], undefined, 'a refused origin must not be echoed');
 });
 
+test('the middleware extends the dev rule only to loopback sockets', () => {
+  const { corsMiddleware } = createCors('');
+  const originFor = (remoteAddress) => {
+    const headers = {};
+    corsMiddleware(
+      { method: 'GET', headers: { origin: 'http://localhost:5173' }, socket: { remoteAddress } },
+      { set: (k, v) => { headers[k] = v; }, sendStatus: () => {} },
+      () => {},
+    );
+    return headers['Access-Control-Allow-Origin'];
+  };
+  assert.equal(originFor('127.0.0.1'), 'http://localhost:5173');
+  assert.equal(originFor('::1'), 'http://localhost:5173');
+  assert.equal(originFor('::ffff:127.0.0.1'), 'http://localhost:5173');
+  assert.equal(originFor('10.0.0.5'), undefined, 'a remote socket must not get dev treatment');
+  assert.equal(originFor(undefined), undefined, 'no socket info must not get dev treatment');
+});
+
 test('an OPTIONS preflight short-circuits with 204', () => {
   const { corsMiddleware } = createCors('https://trade.aisrynnn.com');
   let nextCalled = false;
@@ -125,7 +159,7 @@ test('an OPTIONS preflight short-circuits with 204', () => {
 
 test('an empty env value allows only localhost — the local dev default', () => {
   const { isOriginAllowed } = createCors('');
-  assert.equal(isOriginAllowed('http://localhost:5173'), true);
+  assert.equal(isOriginAllowed('http://localhost:5173', '127.0.0.1'), true);
   assert.equal(isOriginAllowed('https://trade.aisrynnn.com'), false,
     'nothing is allowed until the operator names it');
 });

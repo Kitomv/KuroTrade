@@ -14,10 +14,35 @@
 //      frontend origin. Empty by default: nothing is allowed until the operator
 //      names it.
 //   2. http://localhost[:port] and http://127.0.0.1[:port] — the Vite dev
-//      server. Exact host match, never a substring: a rule like
-//      "hostname starts with localhost" would approve localhost.evil.com.
+//      server — but ONLY when the TCP connection itself came from loopback.
+//      Exact host match, never a substring: a rule like "hostname starts with
+//      localhost" would approve localhost.evil.com. The socket requirement is
+//      what keeps this rule from being a production hole: the Origin header is
+//      client-controlled, so without it any remote caller could claim a
+//      localhost origin and be approved. A deployed instance sees every
+//      request through the platform edge, whose socket is never loopback.
 
 const DEV_ORIGIN_HOSTS = new Set(['localhost', '127.0.0.1']);
+
+/**
+ * Is this socket address the loopback interface? The socket peer is ground
+ * truth — unlike req.ip, it cannot be set by the client. Accepts `127.0.0.0/8`
+ * in dotted form, `::1`, and the IPv4-mapped spellings Node hands back on
+ * dual-stack listeners (`::ffff:127.0.0.1`, `::ffff:7f00:1`).
+ */
+function isLoopbackAddress(address) {
+  if (!address || typeof address !== 'string') return false;
+  if (address === '::1') return true;
+  const ipv4 = address.startsWith('::ffff:') ? address.slice(7) : address;
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ipv4)) return true;
+  // Hextet spelling of an IPv4-mapped loopback (::ffff:7f00:1 = 127.0.0.1):
+  // the first hextet's high byte is the first octet.
+  if (address.startsWith('::ffff:')) {
+    const m = ipv4.match(/^([0-9a-f]{1,4}):[0-9a-f]{1,4}$/i);
+    if (m && (parseInt(m[1], 16) >> 8) === 0x7f) return true;
+  }
+  return false;
+}
 
 /**
  * Split ALLOWED_ORIGINS into valid origins, reporting the entries that had to
@@ -57,7 +82,7 @@ export function createCors(envValue) {
   const { origins, dropped } = classifyAllowedOrigins(envValue);
   const allowed = new Set(origins);
 
-  const isOriginAllowed = (origin) => {
+  const isOriginAllowed = (origin, socketAddress) => {
     if (!origin || typeof origin !== 'string') return false;
     let parsed;
     try {
@@ -66,14 +91,18 @@ export function createCors(envValue) {
       return false;
     }
     if (allowed.has(parsed.origin)) return true;
-    return parsed.protocol === 'http:' && DEV_ORIGIN_HOSTS.has(parsed.hostname);
+    return parsed.protocol === 'http:'
+      && DEV_ORIGIN_HOSTS.has(parsed.hostname)
+      && isLoopbackAddress(socketAddress);
   };
 
   const corsMiddleware = (req, res, next) => {
     const origin = req.headers.origin;
     // Echo the origin only when it is allowed; a refused origin gets no
     // allow header, which is what makes the browser block the response.
-    if (isOriginAllowed(origin)) res.set('Access-Control-Allow-Origin', origin);
+    // The socket peer decides dev-rule eligibility — never req.ip, which the
+    // client can influence through forwarding headers.
+    if (isOriginAllowed(origin, req.socket?.remoteAddress)) res.set('Access-Control-Allow-Origin', origin);
     // The response depends on the Origin request header — without Vary, a
     // shared cache could replay an allowed response to a different origin.
     res.set('Vary', 'Origin');

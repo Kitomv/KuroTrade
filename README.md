@@ -181,6 +181,11 @@ Worth knowing if you run this with real money:
   sha256 scheme on login.
 - **Sessions are 14-day bearer tokens** in `backend/data/sessions.json`.
 - **Rate limits** are per-IP on login and LLM config, per-user on `/api/real/*`.
+  Failed logins are additionally capped per username, so a botnet cannot spray
+  one account from many IPs.
+- **CORS** answers only the origins named in `ALLOWED_ORIGINS`; the localhost
+  dev rule applies only when the connection itself came from loopback, so a
+  deployed instance never trusts a remote caller's localhost origin.
 - **SSRF guard** on user-supplied LLM base URLs blocks cloud metadata endpoints
   and private ranges.
 - **The swap router is allow-listed.** 1inch's v6 router is CREATE2-deployed at
@@ -204,7 +209,7 @@ every user's account. Back them up separately and never commit them.
 npm --prefix backend test
 ```
 
-117 tests. The ones that matter most cover the money path: intent state
+275 tests. The ones that matter most cover the money path: intent state
 transitions, claim-token races, idempotent close, bind replay rejection, the
 router allow-list, wallet-login challenge replay, and the SSRF guard.
 

@@ -1,6 +1,8 @@
 // API client + shared types for the trading dashboard & multi-agent trading system.
 // `ponytail:` no runtime validation — backend is our own proxy, types mirror it.
 
+import { apiUrl } from '../lib/apiBase';
+
 export interface Market {
   pairAddress: string;
   chainId: string;
@@ -403,7 +405,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const token = localStorage.getItem('trading_token');
   const headers = new Headers(init?.headers);
   if (token) headers.set('Authorization', `Bearer ${token}`);
-  const res = await fetch(path, { ...init, headers });
+  const res = await fetch(apiUrl(path), { ...init, headers });
   if (res.status === 401) {
     // Session expired/revoked — drop token, let App gate on it.
     localStorage.removeItem('trading_token');
@@ -489,7 +491,7 @@ export interface EvmChain {
 /** Download a CSV export (carries the auth header, unlike a plain <a href>). */
 export async function exportCsv(kind: 'orders' | 'positions'): Promise<void> {
   const token = localStorage.getItem('trading_token');
-  const res = await fetch(`/api/export/${kind}.csv`, {
+  const res = await fetch(apiUrl(`/api/export/${kind}.csv`), {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
   if (!res.ok) throw new Error(`Export gagal: ${res.status}`);

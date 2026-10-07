@@ -35,6 +35,7 @@ import { verifyUser, createSession, getUser, destroySession, seedAdminFromEnv,
   roleOf, isAdmin, listAccounts, setUserPassword, createUser } from './auth.js';
 import { flushAll, cleanupTempFiles, DATA_DIR } from './persistence.js';
 import { securityHeaders, redact, sanitizeError, ipRateLimit, userRateLimit, isSafeBaseUrl } from './security.js';
+import { createCors } from './cors.js';
 import {
   listEvmChains, isSupportedChain, getChainConfig, getEvmBalanceNative,
   getEvmTokenValue, getNativeUsdPrice, evmQuote, buildSwapTx, resolveSwapParams,
@@ -50,19 +51,21 @@ const PORT = process.env.PORT || 3001;
 app.use(securityHeaders);
 app.use(express.json({ limit: '256kb' }));
 
-// CORS — restrict to local dev origins.
-const DEV_ORIGINS = [/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/];
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin) {
-    const allowed = DEV_ORIGINS.some((r) => r.test(origin));
-    if (allowed) res.set('Access-Control-Allow-Origin', origin);
-  }
-  res.set('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
-  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
+// Behind a hosting edge (Railway) the socket peer is the edge, not the client:
+// without this, `req.ip` is one shared address and the per-IP login limiter
+// counts every user against one bucket (20/min total, then everybody is
+// locked out). `1` trusts exactly the one hop the platform guarantees.
+app.set('trust proxy', 1);
+
+// CORS — local dev origins are always allowed; the deployed frontend origin
+// (Vercel) is named via ALLOWED_ORIGINS. Malformed entries are reported loudly
+// because the failure they cause — a browser CORS block — never reaches this
+// server, so it leaves no trace in the logs.
+const { corsMiddleware, droppedOrigins } = createCors(process.env.ALLOWED_ORIGINS);
+if (droppedOrigins.length > 0) {
+  console.warn(`[cors] ALLOWED_ORIGINS entries diabaikan (bukan origin yang valid): ${droppedOrigins.join(', ')}`);
+}
+app.use(corsMiddleware);
 
 // --- Auth middleware: resolves req.userId from Bearer token ---
 // Guards ONLY /api/* data routes. Static frontend (/, /assets/*) stays public —

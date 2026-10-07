@@ -36,7 +36,7 @@ If you want unattended trading, this is deliberately the wrong tool.
 | Signing | MetaMask (EIP-1193) | The key never leaves the browser |
 | Frontend | React 18 + Vite + TypeScript | ~300 kB bundle, no wallet library |
 | Storage | JSON, one file per user | Readable, diffable, trivial to back up |
-| Auth | Wallet signature **or** scrypt + Bearer session | No external dependency |
+| Auth | scrypt + Bearer session | No external dependency |
 
 No database, no ORM, no queue, no Docker required. State is one JSON file per
 user under `backend/data/`.
@@ -56,9 +56,9 @@ cp backend/.env.example backend/.env
 Edit `backend/.env`:
 
 ```bash
-# Optional — creates a username/password account on boot. Add more accounts by
-# changing this and restarting. (You can also just sign in with MetaMask; a
-# wallet that has never been seen before gets its own account automatically.)
+# REQUIRED for the first admin. There is no self-registration: without this,
+# a fresh install has zero accounts and nobody can log in. Add more accounts
+# from the Admin page afterwards.
 USER_USERNAME=yourname
 USER_PASSWORD=a-long-password
 
@@ -83,17 +83,50 @@ agents, and trade the virtual ledger before spending anything.
 
 ---
 
+## Deploying frontend and backend separately
+
+The single-process setup above needs no configuration. If you split them —
+frontend on Vercel, backend on Railway, for example — the browser calls the API
+cross-origin, and two settings are required. Both failures are silent: the
+request that fails either never leaves the static host or never reaches the
+backend, so no server log shows the cause.
+
+**Backend (Railway):**
+
+| Variable | Value |
+|---|---|
+| `USER_USERNAME` / `USER_PASSWORD` | The first admin. Without these there is no account and no way in. |
+| `ALLOWED_ORIGINS` | The frontend origin, e.g. `https://trade.example.com`. Comma-separate several. |
+| `INCH_API_KEY` | For real swaps. |
+
+The backend listens on `PORT` (Railway injects it), and `req.ip` is read
+through the platform's proxy so per-IP rate limits stay per-user. Mount a
+volume at `/app/backend/data` or every deploy resets accounts and state.
+
+**Frontend (Vercel):**
+
+| Variable | Value |
+|---|---|
+| `VITE_API_BASE` | The backend's public origin, e.g. `https://<service>.up.railway.app`. |
+
+`VITE_API_BASE` is read at **build time** — setting it in the dashboard does
+nothing until the site is rebuilt, and it never appears in `backend/.env`.
+With it unset the frontend calls `/api/*` relative, which is correct for local
+dev (Vite proxies to `:3001`) and for the single-process deployment.
+
+Verify: `curl https://<backend>/api/health` must return `{"ok":true}`.
+
+---
+
 ## First run with a real wallet
 
-**Signing in with MetaMask.** The login page has a *Login dengan MetaMask*
-button next to the password form. You sign one message; the address recovered
-from that signature is the identity, and the account is created on the spot if
-that wallet has never been seen. Because the signature already proves the
-address is yours, the wallet is bound in the same step — there is no separate
-bind to do, and you can trade real immediately.
+**Accounts are admin-provisioned.** There is no self-registration and no wallet
+login. The first account comes from `USER_USERNAME`/`USER_PASSWORD` in
+`backend/.env` (see above); every later account is created by an admin on the
+**Admin** page. If you are locked out, set the env values and restart.
 
-**Signing in with a password.** If you use the username/password form, nothing
-about your wallet is proven yet, so one more step is needed:
+**Then bind your wallet.** A password login proves nothing about your wallet,
+so one more step is needed before real trading:
 
 1. **Settings → Connect MetaMask.** Requires the extension; the app talks to
    `window.ethereum` directly.
@@ -105,7 +138,7 @@ about your wallet is proven yet, so one more step is needed:
    on-chain balances instead of the paper ledger.
 4. **Trade → create an intent → approve in MetaMask.**
 
-Either way, every real swap still ends in a MetaMask signature.
+Every real swap ends in a MetaMask signature.
 
 **Start with a small amount.** Swap routing, slippage, and ERC-20 allowances
 are the parts that have not been exercised against live funds.

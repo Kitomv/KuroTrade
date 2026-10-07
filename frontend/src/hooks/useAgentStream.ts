@@ -18,6 +18,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AgentReport, AutopilotConfig, LLMConfig } from '../api/client';
+import { apiUrl } from '../lib/apiBase';
 
 export interface AgentStreamResult {
   autopilot: AutopilotConfig | undefined;
@@ -138,7 +139,7 @@ export function useAgentStream(enabled = true): AgentStreamResult {
     abortRef.current = controller;
     try {
       const token = localStorage.getItem('trading_token');
-      const res = await fetch('/api/agents/stream', {
+      const res = await fetch(apiUrl('/api/agents/stream'), {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
         signal: controller.signal,
       });
